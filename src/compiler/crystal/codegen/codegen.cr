@@ -276,6 +276,11 @@ module Crystal
     @c_malloc_fun : LLVMTypedFunction?
     @c_realloc_fun : LLVMTypedFunction?
 
+    # gcry stack-map spike: emit empty llvm.experimental.stackmap after calls
+    # when CRYSTAL_EMIT_STACKMAP=1 (see docs/STACK_MAPS.md in gcry).
+    @emit_stackmap : Bool
+    @stackmap_next_id : Int64
+
     def initialize(@program : Program, @node : ASTNode,
                    @single_module : Bool = false,
                    @debug = Debug::Default,
@@ -351,6 +356,9 @@ module Crystal
       # Also, we don't need the value of unions returned from calls if they
       # are not going to be used.
       @needs_value = true
+
+      @emit_stackmap = ENV["CRYSTAL_EMIT_STACKMAP"]? == "1"
+      @stackmap_next_id = 1_i64
 
       @unused_fun_defs = [] of FunDef
       @proc_counts = Hash(String, Int32).new(0)

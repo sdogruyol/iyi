@@ -516,6 +516,9 @@ class Crystal::CodeGenVisitor
       @last = call func, call_args
     end
 
+    # gcry stack-map spike: empty live set — proves Crystal→LLVM keeps stackmaps.
+    emit_gcry_stackmap_probe if @emit_stackmap
+
     if target_def.is_a?(External) && (call_convention = target_def.call_convention)
       @last.call_convention = call_convention
     end
@@ -630,5 +633,28 @@ class Crystal::CodeGenVisitor
 
   def sret?(abi_info)
     abi_info.return_type.attr == LLVM::Attribute::StructRet
+  end
+
+  # gcry spike: llvm.experimental.stackmap(i64 id, i32 shadow, ...) with empty lives.
+  # Gated by CRYSTAL_EMIT_STACKMAP=1. Must not clobber @last (call return value).
+  private def emit_gcry_stackmap_probe : Nil
+    return if @builder.end
+
+    saved = @last
+    id = @stackmap_next_id
+    @stackmap_next_id = id + 1
+
+    llvm_fun = fetch_typed_fun(@llvm_mod, "llvm.experimental.stackmap") do
+      LLVM::Type.function(
+        [@llvm_context.int64, @llvm_context.int32],
+        @llvm_context.void,
+        true,
+      )
+    end
+    call(llvm_fun, [
+      @llvm_context.int64.const_int(id),
+      @llvm_context.int32.const_int(0),
+    ])
+    @last = saved
   end
 end
