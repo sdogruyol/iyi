@@ -39,7 +39,9 @@ workloads (without them the legacy `Crystal::Scheduler` path livelocks
 
 - Skip empty live sets; skip C `External` calls
 - Cap maps per LLVM function (`CRYSTAL_STACKMAP_PER_FUN`, default **2**;
-  acik exclusive harness uses **256**)
+  **0 = unlimited** — acik `exclusivef` harness default)
+- Lives: refs, Pointer, Proc, MixedUnion/tuple allocas (runtime scans
+  `loc.size` for multi-word slots)
 - Mark stackmap calls **nounwind** (else EH prep → invoke → LLVM 18
   `LowerStatepoint` crash on fat `--release` apps)
 - Emit after `invoke` in the `invoke_out` block (nounwind call, not as the

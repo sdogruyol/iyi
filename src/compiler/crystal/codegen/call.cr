@@ -645,9 +645,9 @@ class Crystal::CodeGenVisitor
 
   # gcry spike: llvm.experimental.stackmap(i64 id, i32 shadow, ...lives).
   # Gated by CRYSTAL_EMIT_STACKMAP=1. Must not clobber @last (call return value).
-  # Lives: reference-like / Pointer / Proc locals from context.vars (MVP — skips
-  # passed-by-value unions/tuples with inner pointers). Cap keeps IR sane.
-  STACKMAP_LIVE_CAP = 32
+  # Lives: reference-like / Pointer / Proc / union-by-value allocas.
+  # Cap keeps IR sane; raise via denser PER_FUN for exclusive fiber cuts.
+  STACKMAP_LIVE_CAP = 64
 
   private def emit_gcry_stackmap_probe : Nil
     return if @builder.end
@@ -657,8 +657,8 @@ class Crystal::CodeGenVisitor
     # bloated .llvm_stackmaps — skip when nothing to report.
     return if lives.empty?
 
-    # Cap density per LLVM function. Full call-site maps made soak unusable
-    # (may-write-all barrier). Override: CRYSTAL_STACKMAP_PER_FUN (default 2).
+    # Cap density per LLVM function. Override: CRYSTAL_STACKMAP_PER_FUN
+    # (default 2; 0 = unlimited).
     fun_addr = context.fun.to_unsafe.address
     if fun_addr != @stackmap_last_fun
       @stackmap_last_fun = fun_addr
@@ -699,16 +699,10 @@ class Crystal::CodeGenVisitor
       break if lives.size >= STACKMAP_LIVE_CAP
       next unless stackmap_live_type?(var.type)
 
-      # Prefer the alloca address (LLVM Direct: BP+off) so the runtime can
-      # reload the slot from any frame. Loading yields Register locations that
-      # are only valid at the exact stackmap PC — weak for STW frame walks.
-      value = if var.already_loaded
-                var.pointer
-              else
-                next unless llvm_type(var.type).kind.pointer?
-                var.pointer
-              end
-
+      # Always pass the alloca address (LLVM Direct: BP+off). Runtime loads
+      # the slot (and scans multi-word union/proc allocas by loc.size).
+      # Loading into a Register is weak for STW frame walks.
+      value = var.pointer
       next unless value.type.kind.pointer?
       # Skip values from other functions (leaked context.vars / foreign %self).
       next unless value_in_fun?(value, current_fun)
@@ -742,13 +736,17 @@ class Crystal::CodeGenVisitor
     end
   end
 
-  # Single-word GC pointer roots. Proc/union-by-value expansion is later.
+  # GC pointer roots + by-value aggregates with inner pointers (union/tuple/proc
+  # allocas). Runtime scans loc.size bytes for multi-word slots.
   private def stackmap_live_type?(type : Type) : Bool
     t = type.remove_indirection
     return false if t.nil_type?
     return false if t.is_a?(PrimitiveType) || t.is_a?(EnumType)
     return true if t.is_a?(PointerInstanceType)
-    return false if t.is_a?(ProcInstanceType) # closure struct — later
+    return true if t.is_a?(ProcInstanceType)
+    return true if t.is_a?(MixedUnionType) && t.has_inner_pointers?
+    return true if t.is_a?(TupleInstanceType) && t.has_inner_pointers?
+    return true if t.is_a?(NamedTupleInstanceType) && t.has_inner_pointers?
     return false if t.passed_by_value?
     t.has_inner_pointers?
   end
