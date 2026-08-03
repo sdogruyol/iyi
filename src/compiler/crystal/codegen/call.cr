@@ -508,6 +508,11 @@ class Crystal::CodeGenVisitor
     # using the original invocation
     set_current_debug_location node if @debug.line_numbers? && fun_type.nil?
 
+    # gcry: optional pre-call stackmap (CRYSTAL_STACKMAP_BEFORE=1 or PER_FUN=0).
+    if @emit_stackmap && @stackmap_before_call
+      emit_gcry_stackmap_probe(call_args)
+    end
+
     used_invoke = false
     if raises && (rescue_block = @rescue_block)
       invoke_out_block = new_block "invoke_out"
@@ -519,12 +524,12 @@ class Crystal::CodeGenVisitor
     end
 
     # gcry stack-map spike: live GC pointers (alloca preferred → Direct).
-    # Skip C externals (opt clobber). After invoke we are already at
-    # invoke_out — emit a nounwind stackmap *call* there (not as the invoke
-    # itself). Earlier LLVM 18 LowerStatepoint crashes were from stackmap
-    # defaulting to Throws and being rewritten to invoke; nounwind fixes that.
-    if @emit_stackmap && !target_def.is_a?(External)
-      emit_gcry_stackmap_probe
+    # Emit at Crystal *and* External calls — fibers often park under LibC/IO;
+    # skipping External left older frames without maps (exclusivef UAF).
+    # After invoke we are already at invoke_out — nounwind stackmap *call*
+    # (not invoke). LLVM 18 LowerStatepoint crashes if stackmap Throws.
+    if @emit_stackmap
+      emit_gcry_stackmap_probe(call_args)
     end
 
     if target_def.is_a?(External) && (call_convention = target_def.call_convention)
@@ -645,14 +650,15 @@ class Crystal::CodeGenVisitor
 
   # gcry spike: llvm.experimental.stackmap(i64 id, i32 shadow, ...lives).
   # Gated by CRYSTAL_EMIT_STACKMAP=1. Must not clobber @last (call return value).
-  # Lives: reference-like / Pointer / Proc / union-by-value allocas.
+  # Lives: reference-like / Pointer / Proc / union-by-value allocas + pointer
+  # call_args (Register) so SSA args across IO/External calls stay mapped.
   # Cap keeps IR sane; raise via denser PER_FUN for exclusive fiber cuts.
   STACKMAP_LIVE_CAP = 64
 
-  private def emit_gcry_stackmap_probe : Nil
+  private def emit_gcry_stackmap_probe(call_args : Array(LLVM::Value)? = nil) : Nil
     return if @builder.end
 
-    lives = gather_stackmap_live_values
+    lives = gather_stackmap_live_values(call_args)
     # Empty maps still inhibit LLVM opts (stackmap = clobber all memory) and
     # bloated .llvm_stackmaps — skip when nothing to report.
     return if lives.empty?
@@ -690,7 +696,7 @@ class Crystal::CodeGenVisitor
     @last = saved
   end
 
-  private def gather_stackmap_live_values : Array(LLVM::Value)
+  private def gather_stackmap_live_values(call_args : Array(LLVM::Value)? = nil) : Array(LLVM::Value)
     lives = [] of LLVM::Value
     seen = Set(UInt64).new
     current_fun = context.fun
@@ -711,6 +717,20 @@ class Crystal::CodeGenVisitor
       next if seen.includes?(key)
       seen << key
       lives << value
+    end
+
+    # Call arguments still in regs/SSA at the call — not always in context.vars.
+    # Pointer-typed LLVM args become Register locations (runtime marks them).
+    if call_args
+      call_args.each do |arg|
+        break if lives.size >= STACKMAP_LIVE_CAP
+        next unless arg.type.kind.pointer?
+        next unless value_in_fun?(arg, current_fun) || arg.kind.argument?
+        key = arg.to_unsafe.address
+        next if seen.includes?(key)
+        seen << key
+        lives << arg
+      end
     end
 
     lives

@@ -279,6 +279,7 @@ module Crystal
     # gcry stack-map spike: emit llvm.experimental.stackmap after calls
     # when CRYSTAL_EMIT_STACKMAP=1 (see docs/STACK_MAPS.md in gcry).
     @emit_stackmap : Bool
+    @stackmap_before_call : Bool
     @stackmap_next_id : Int64
     @stackmap_per_fun_cap : Int32
     @stackmap_last_fun : UInt64
@@ -365,6 +366,8 @@ module Crystal
       # 0 ⇒ unlimited (needed for exclusive fiber proofs on fat apps).
       per_fun = ENV["CRYSTAL_STACKMAP_PER_FUN"]?.try(&.to_i?) || 2
       @stackmap_per_fun_cap = per_fun <= 0 ? Int32::MAX : per_fun.clamp(1, 100_000)
+      # Pre-call maps: explicit CRYSTAL_STACKMAP_BEFORE=1, or auto when PER_FUN=0.
+      @stackmap_before_call = ENV["CRYSTAL_STACKMAP_BEFORE"]? == "1" || per_fun <= 0
       @stackmap_last_fun = 0_u64
       @stackmap_in_fun = 0
 
