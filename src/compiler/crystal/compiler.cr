@@ -537,6 +537,7 @@ module Crystal
       else
         link_flags = @link_flags || ""
         link_flags += " -rdynamic"
+        link_flags = maybe_add_stackmap_nopie(link_flags)
 
         if program.has_flag?("freebsd") || program.has_flag?("openbsd")
           # pkgs are installed to usr/local/lib but it's not in LIBRARY_PATH by
@@ -548,6 +549,16 @@ module Crystal
 
         {DEFAULT_LINKER, %(#{DEFAULT_LINKER} "${@}" -o #{Process.quote_posix(output_filename)} #{link_flags} #{program.lib_flags(@cross_compile)}), object_names}
       end
+    end
+
+    # gcry stack-map spike: llvm.experimental.stackmap writes absolute
+    # R_X86_64_64 into `.llvm_stackmaps`. Default PIE link rejects those
+    # ("recompile with -fPIC"). Force -no-pie when emitting stackmaps unless
+    # the user already chose -pie / -no-pie. See STACKMAP_PROBE.md.
+    private def maybe_add_stackmap_nopie(link_flags : String) : String
+      return link_flags unless ENV["CRYSTAL_EMIT_STACKMAP"]? == "1"
+      return link_flags if link_flags.includes?("-no-pie") || link_flags.includes?("-pie")
+      link_flags + " -no-pie"
     end
 
     # Tests if `mold` or `lld` are available and prefers them as linkers over
