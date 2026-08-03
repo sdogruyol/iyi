@@ -516,7 +516,7 @@ class Crystal::CodeGenVisitor
       @last = call func, call_args
     end
 
-    # gcry stack-map spike: empty live set — proves Crystal→LLVM keeps stackmaps.
+    # gcry stack-map spike: live GC pointers (alloca preferred → Direct).
     emit_gcry_stackmap_probe if @emit_stackmap
 
     if target_def.is_a?(External) && (call_convention = target_def.call_convention)
@@ -674,15 +674,15 @@ class Crystal::CodeGenVisitor
       break if lives.size >= STACKMAP_LIVE_CAP
       next unless stackmap_live_type?(var.type)
 
+      # Prefer the alloca address (LLVM Direct: BP+off) so the runtime can
+      # reload the slot from any frame. Loading yields Register locations that
+      # are only valid at the exact stackmap PC — weak for STW frame walks.
       value = if var.already_loaded
                 var.pointer
               else
-                # Skip allocas from other functions / non-instructions (avoids
-                # "Instruction does not dominate all uses" on cross-fun vars).
                 next unless alloca_in_fun?(var.pointer, current_fun)
-                # Only load pointer LLVM types (skip Proc struct etc.)
                 next unless llvm_type(var.type).kind.pointer?
-                load(llvm_type(var.type), var.pointer, "sm.#{name}")
+                var.pointer
               end
 
       next unless value.type.kind.pointer?

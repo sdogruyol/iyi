@@ -14,6 +14,9 @@ See sibling: `gcry/docs/STACK_MAPS.md`.
 - Filter: `Pointer` + non-`passed_by_value` `has_inner_pointers?` types;
   skip Proc/union-by-value for now; cap 32 lives; alloca must belong to
   current function.
+- Emit prefers the **alloca address** (not a load) so slots stay findable
+  across frames; LLVM often still encodes them as Register — gcry deref
+  when the reg value lies on the stack.
 - Object/executable contain `.llvm_stackmaps`.
 - Default PIE link failed; auto **`-no-pie`** when the env gate is set.
 
