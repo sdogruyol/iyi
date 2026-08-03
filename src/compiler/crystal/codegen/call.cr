@@ -519,9 +519,11 @@ class Crystal::CodeGenVisitor
     end
 
     # gcry stack-map spike: live GC pointers (alloca preferred → Direct).
-    # Skip C externals (opt clobber) and invoke sites — LLVM 18 SelectionDAG
-    # crashes in LowerStatepoint when a stackmap follows invoke (acik --release).
-    if @emit_stackmap && !used_invoke && !target_def.is_a?(External)
+    # Skip C externals (opt clobber). After invoke we are already at
+    # invoke_out — emit a nounwind stackmap *call* there (not as the invoke
+    # itself). Earlier LLVM 18 LowerStatepoint crashes were from stackmap
+    # defaulting to Throws and being rewritten to invoke; nounwind fixes that.
+    if @emit_stackmap && !target_def.is_a?(External)
       emit_gcry_stackmap_probe
     end
 
