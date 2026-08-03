@@ -635,14 +635,20 @@ class Crystal::CodeGenVisitor
     abi_info.return_type.attr == LLVM::Attribute::StructRet
   end
 
-  # gcry spike: llvm.experimental.stackmap(i64 id, i32 shadow, ...) with empty lives.
+  # gcry spike: llvm.experimental.stackmap(i64 id, i32 shadow, ...lives).
   # Gated by CRYSTAL_EMIT_STACKMAP=1. Must not clobber @last (call return value).
+  # Lives: reference-like / Pointer / Proc locals from context.vars (MVP — skips
+  # passed-by-value unions/tuples with inner pointers). Cap keeps IR sane.
+  STACKMAP_LIVE_CAP = 32
+
   private def emit_gcry_stackmap_probe : Nil
     return if @builder.end
 
     saved = @last
     id = @stackmap_next_id
     @stackmap_next_id = id + 1
+
+    lives = gather_stackmap_live_values
 
     llvm_fun = fetch_typed_fun(@llvm_mod, "llvm.experimental.stackmap") do
       LLVM::Type.function(
@@ -651,10 +657,60 @@ class Crystal::CodeGenVisitor
         true,
       )
     end
-    call(llvm_fun, [
-      @llvm_context.int64.const_int(id),
-      @llvm_context.int32.const_int(0),
-    ])
+    args = Array(LLVM::Value).new(2 + lives.size)
+    args << @llvm_context.int64.const_int(id)
+    args << @llvm_context.int32.const_int(0)
+    lives.each { |v| args << v }
+    call(llvm_fun, args)
     @last = saved
+  end
+
+  private def gather_stackmap_live_values : Array(LLVM::Value)
+    lives = [] of LLVM::Value
+    seen = Set(UInt64).new
+    current_fun = context.fun
+
+    context.vars.each do |name, var|
+      break if lives.size >= STACKMAP_LIVE_CAP
+      next unless stackmap_live_type?(var.type)
+
+      value = if var.already_loaded
+                var.pointer
+              else
+                # Skip allocas from other functions / non-instructions (avoids
+                # "Instruction does not dominate all uses" on cross-fun vars).
+                next unless alloca_in_fun?(var.pointer, current_fun)
+                # Only load pointer LLVM types (skip Proc struct etc.)
+                next unless llvm_type(var.type).kind.pointer?
+                load(llvm_type(var.type), var.pointer, "sm.#{name}")
+              end
+
+      next unless value.type.kind.pointer?
+
+      key = value.to_unsafe.address
+      next if seen.includes?(key)
+      seen << key
+      lives << value
+    end
+
+    lives
+  end
+
+  private def alloca_in_fun?(value : LLVM::Value, llvm_fun : LLVM::Function) : Bool
+    bb = LibLLVM.get_instruction_parent(value)
+    return false if bb.null?
+    parent = LibLLVM.get_basic_block_parent(bb)
+    parent == llvm_fun.to_unsafe
+  end
+
+  # Single-word GC pointer roots. Proc/union-by-value expansion is later.
+  private def stackmap_live_type?(type : Type) : Bool
+    t = type.remove_indirection
+    return false if t.nil_type?
+    return false if t.is_a?(PrimitiveType) || t.is_a?(EnumType)
+    return true if t.is_a?(PointerInstanceType)
+    return false if t.is_a?(ProcInstanceType) # closure struct — later
+    return false if t.passed_by_value?
+    t.has_inner_pointers?
   end
 end

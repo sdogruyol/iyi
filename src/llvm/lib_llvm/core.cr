@@ -198,6 +198,7 @@ lib LibLLVM
   fun append_basic_block_in_context = LLVMAppendBasicBlockInContext(c : ContextRef, fn : ValueRef, name : Char*) : BasicBlockRef
   fun delete_basic_block = LLVMDeleteBasicBlock(bb : BasicBlockRef)
   fun get_first_instruction = LLVMGetFirstInstruction(bb : BasicBlockRef) : ValueRef
+  fun get_instruction_parent = LLVMGetInstructionParent(inst : ValueRef) : BasicBlockRef
 
   fun set_metadata = LLVMSetMetadata(val : ValueRef, kind_id : UInt, node : ValueRef)
   fun get_next_instruction = LLVMGetNextInstruction(inst : ValueRef) : ValueRef
