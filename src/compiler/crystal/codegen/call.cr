@@ -680,12 +680,13 @@ class Crystal::CodeGenVisitor
       value = if var.already_loaded
                 var.pointer
               else
-                next unless alloca_in_fun?(var.pointer, current_fun)
                 next unless llvm_type(var.type).kind.pointer?
                 var.pointer
               end
 
       next unless value.type.kind.pointer?
+      # Skip values from other functions (leaked context.vars / foreign %self).
+      next unless value_in_fun?(value, current_fun)
 
       key = value.to_unsafe.address
       next if seen.includes?(key)
@@ -696,11 +697,24 @@ class Crystal::CodeGenVisitor
     lives
   end
 
-  private def alloca_in_fun?(value : LLVM::Value, llvm_fun : LLVM::Function) : Bool
-    bb = LibLLVM.get_instruction_parent(value)
-    return false if bb.null?
-    parent = LibLLVM.get_basic_block_parent(bb)
-    parent == llvm_fun.to_unsafe
+  private def value_in_fun?(value : LLVM::Value, llvm_fun : LLVM::Function) : Bool
+    case value.kind
+    when .argument?
+      n = LibLLVM.get_count_params(llvm_fun.to_unsafe)
+      i = 0_u32
+      while i < n
+        return true if LibLLVM.get_param(llvm_fun.to_unsafe, i) == value.to_unsafe
+        i += 1
+      end
+      false
+    when .instruction?
+      bb = LibLLVM.get_instruction_parent(value)
+      return false if bb.null?
+      LibLLVM.get_basic_block_parent(bb) == llvm_fun.to_unsafe
+    else
+      # Constants / globals are fine in any function.
+      true
+    end
   end
 
   # Single-word GC pointer roots. Proc/union-by-value expansion is later.

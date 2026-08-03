@@ -30,3 +30,19 @@ readelf -S hello | grep llvm_stackmaps
 CRYSTAL_EMIT_STACKMAP=1 bin/crystal build --emit=llvm-ir --no-debug hello.cr -o hello
 # grep stackmap hello.ll
 ```
+
+### With gcry (`-Dgc_none`)
+
+Tip stdlib only declares `Thread.@execution_context` under
+`-Dexecution_context` (and EC itself also needs `-Dpreview_mt`). gcry gates
+EC root pins on the **ivar**, so default tip + `-Dgc_none` builds without
+those flags. For Parallel EC on tip:
+
+```sh
+CRYSTAL_EMIT_STACKMAP=1 bin/crystal build -Dgc_none \
+  -Dpreview_mt -Dexecution_context app.cr -o app
+GCRY_PRECISE_STACK=1 ./app
+```
+
+Lives must belong to the current LLVM function (foreign `%self` / leaked
+`context.vars` are skipped — otherwise module verify fails).
