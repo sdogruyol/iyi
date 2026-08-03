@@ -33,16 +33,18 @@ CRYSTAL_EMIT_STACKMAP=1 bin/crystal build --emit=llvm-ir --no-debug hello.cr -o 
 
 ### With gcry (`-Dgc_none`)
 
-Tip stdlib only declares `Thread.@execution_context` under
-`-Dexecution_context` (and EC itself also needs `-Dpreview_mt`). gcry gates
-EC root pins on the **ivar**, so default tip + `-Dgc_none` builds without
-those flags. For Parallel EC on tip:
+Tip Crystal **requires** `-Dpreview_mt -Dexecution_context` for process-GC
+workloads (without them the legacy `Crystal::Scheduler` path livelocks
+`bench/soak`). Also:
+
+- Skip empty live sets; skip C `External` calls
+- Cap maps per LLVM function (`CRYSTAL_STACKMAP_PER_FUN`, default **2**) —
+  denser emit is a may-write-all opt barrier (LLVM rejects `readonly` on
+  stackmap in LLVM 18)
+- Lives must belong to the current LLVM function (foreign `%self` skipped)
 
 ```sh
 CRYSTAL_EMIT_STACKMAP=1 bin/crystal build -Dgc_none \
-  -Dpreview_mt -Dexecution_context app.cr -o app
+  -Dpreview_mt -Dexecution_context --frame-pointers=always app.cr -o app
 GCRY_PRECISE_STACK=1 ./app
 ```
-
-Lives must belong to the current LLVM function (foreign `%self` / leaked
-`context.vars` are skipped — otherwise module verify fails).

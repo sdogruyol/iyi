@@ -276,10 +276,13 @@ module Crystal
     @c_malloc_fun : LLVMTypedFunction?
     @c_realloc_fun : LLVMTypedFunction?
 
-    # gcry stack-map spike: emit empty llvm.experimental.stackmap after calls
+    # gcry stack-map spike: emit llvm.experimental.stackmap after calls
     # when CRYSTAL_EMIT_STACKMAP=1 (see docs/STACK_MAPS.md in gcry).
     @emit_stackmap : Bool
     @stackmap_next_id : Int64
+    @stackmap_per_fun_cap : Int32
+    @stackmap_last_fun : UInt64
+    @stackmap_in_fun : Int32
 
     def initialize(@program : Program, @node : ASTNode,
                    @single_module : Bool = false,
@@ -359,6 +362,10 @@ module Crystal
 
       @emit_stackmap = ENV["CRYSTAL_EMIT_STACKMAP"]? == "1"
       @stackmap_next_id = 1_i64
+      per_fun = ENV["CRYSTAL_STACKMAP_PER_FUN"]?.try(&.to_i?) || 2
+      @stackmap_per_fun_cap = per_fun.clamp(0, 256)
+      @stackmap_last_fun = 0_u64
+      @stackmap_in_fun = 0
 
       @unused_fun_defs = [] of FunDef
       @proc_counts = Hash(String, Int32).new(0)

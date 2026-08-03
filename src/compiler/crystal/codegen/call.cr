@@ -517,7 +517,10 @@ class Crystal::CodeGenVisitor
     end
 
     # gcry stack-map spike: live GC pointers (alloca preferred → Direct).
-    emit_gcry_stackmap_probe if @emit_stackmap
+    # Skip C externals — stackmap clobbers memory opts; libc churn killed soak.
+    unless target_def.is_a?(External)
+      emit_gcry_stackmap_probe if @emit_stackmap
+    end
 
     if target_def.is_a?(External) && (call_convention = target_def.call_convention)
       @last.call_convention = call_convention
@@ -644,11 +647,24 @@ class Crystal::CodeGenVisitor
   private def emit_gcry_stackmap_probe : Nil
     return if @builder.end
 
+    lives = gather_stackmap_live_values
+    # Empty maps still inhibit LLVM opts (stackmap = clobber all memory) and
+    # bloated .llvm_stackmaps — skip when nothing to report.
+    return if lives.empty?
+
+    # Cap density per LLVM function. Full call-site maps made soak unusable
+    # (may-write-all barrier). Override: CRYSTAL_STACKMAP_PER_FUN (default 2).
+    fun_addr = context.fun.to_unsafe.address
+    if fun_addr != @stackmap_last_fun
+      @stackmap_last_fun = fun_addr
+      @stackmap_in_fun = 0
+    end
+    return if @stackmap_in_fun >= @stackmap_per_fun_cap
+    @stackmap_in_fun += 1
+
     saved = @last
     id = @stackmap_next_id
     @stackmap_next_id = id + 1
-
-    lives = gather_stackmap_live_values
 
     llvm_fun = fetch_typed_fun(@llvm_mod, "llvm.experimental.stackmap") do
       LLVM::Type.function(
