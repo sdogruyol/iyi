@@ -508,18 +508,21 @@ class Crystal::CodeGenVisitor
     # using the original invocation
     set_current_debug_location node if @debug.line_numbers? && fun_type.nil?
 
+    used_invoke = false
     if raises && (rescue_block = @rescue_block)
       invoke_out_block = new_block "invoke_out"
       @last = invoke func, call_args, invoke_out_block, rescue_block
       position_at_end invoke_out_block
+      used_invoke = true
     else
       @last = call func, call_args
     end
 
     # gcry stack-map spike: live GC pointers (alloca preferred → Direct).
-    # Skip C externals — stackmap clobbers memory opts; libc churn killed soak.
-    unless target_def.is_a?(External)
-      emit_gcry_stackmap_probe if @emit_stackmap
+    # Skip C externals (opt clobber) and invoke sites — LLVM 18 SelectionDAG
+    # crashes in LowerStatepoint when a stackmap follows invoke (acik --release).
+    if @emit_stackmap && !used_invoke && !target_def.is_a?(External)
+      emit_gcry_stackmap_probe
     end
 
     if target_def.is_a?(External) && (call_convention = target_def.call_convention)
@@ -677,7 +680,11 @@ class Crystal::CodeGenVisitor
     args << @llvm_context.int64.const_int(id)
     args << @llvm_context.int32.const_int(0)
     lives.each { |v| args << v }
-    call(llvm_fun, args)
+    sm = call(llvm_fun, args)
+    # Intrinsic defaults to Throws; EH prep rewrites it to invoke → LLVM 18
+    # SelectionDAG LowerStatepoint crash on fat --release (acikturkiye).
+    # nounwind keeps a call; omit readonly (LLVM 18 rejects it on stackmap).
+    sm.add_instruction_attribute(-1, LLVM::Attribute::NoUnwind, @llvm_context)
     @last = saved
   end
 

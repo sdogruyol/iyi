@@ -38,13 +38,14 @@ workloads (without them the legacy `Crystal::Scheduler` path livelocks
 `bench/soak`). Also:
 
 - Skip empty live sets; skip C `External` calls
-- Cap maps per LLVM function (`CRYSTAL_STACKMAP_PER_FUN`, default **2**) —
-  denser emit is a may-write-all opt barrier (LLVM rejects `readonly` on
-  stackmap in LLVM 18)
+- Cap maps per LLVM function (`CRYSTAL_STACKMAP_PER_FUN`, default **2**)
+- Mark stackmap calls **nounwind** (else EH prep → invoke → LLVM 18
+  `LowerStatepoint` crash on fat `--release` apps)
+- Skip emit after `invoke` sites and C `External` calls
 - Lives must belong to the current LLVM function (foreign `%self` skipped)
 
 ```sh
 CRYSTAL_EMIT_STACKMAP=1 bin/crystal build -Dgc_none \
-  -Dpreview_mt -Dexecution_context --frame-pointers=always app.cr -o app
+  -Dpreview_mt -Dexecution_context app.cr -o app
 GCRY_PRECISE_STACK=1 ./app
 ```
