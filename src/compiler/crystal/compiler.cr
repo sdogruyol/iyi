@@ -64,6 +64,9 @@ module Crystal
 
     # Compiler flags. These will be true when checked in macro
     # code by the `flag?(...)` macro method.
+    #
+    # Known aliases (see `Program.has_flag?`): `-Dgc_gcry` implies `-Dgc_none`
+    # (stub GC / no Boehm link) so alternative collectors can reopen `GC`.
     property flags = [] of String
 
     # Controls generation of frame pointers.

@@ -18,17 +18,17 @@ class Crystal::Program
 
   # Returns `true` if *name* is in the program's flags.
   def has_flag?(name : String)
-    flags.includes?(name)
+    self.class.has_flag?(flags, name)
   end
 
   # Returns the value of a flag in the format `"#{key}=#{value}"`.
-  # Or `true` if the flags contain `key`.
+  # Or `true` if the flags contain *name*.
   def flag_value(name : String) : String | Bool
     self.class.flag_value(flags_ary, name)
   end
 
   # Returns the value of a host flag in the format `"#{key}=#{value}"`.
-  # Or `true` if the host flags contain `key`.
+  # Or `true` if the host flags contain *name*.
   def host_flag_value(name : String) : String | Bool
     self.class.flag_value(host_flags_ary, name)
   end
@@ -38,6 +38,14 @@ class Crystal::Program
   end
   private getter host_flags_ary : Array(String) do
     host_flags.to_a
+  end
+
+  # `-Dgc_gcry` is a documented alias for `-Dgc_none`: skip Boehm and use the
+  # stub allocator so a shard (e.g. https://github.com/sdogruyol/gcry) can
+  # reopen `GC`. Behavior is identical to `gc_none`.
+  def self.has_flag?(flags : Enumerable(String), name : String) : Bool
+    return true if flags.includes?(name)
+    name == "gc_none" && flags.includes?("gc_gcry")
   end
 
   def self.flag_value(flags, name)
@@ -52,6 +60,9 @@ class Crystal::Program
         return assign == "=" ? value : true
       end
     end
+
+    # See `has_flag?` — `gc_gcry` implies `gc_none` for `flag?(:gc_none)`.
+    return true if name == "gc_none" && flags.includes?("gc_gcry")
 
     false
   end

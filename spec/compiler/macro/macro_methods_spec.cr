@@ -3908,6 +3908,12 @@ module Crystal
         assert_macro %({{flag?(:foo)}}), %(false)
       end
 
+      it "aliases gc_gcry to gc_none" do
+        assert_macro %({{flag?(:gc_gcry)}}), %(true), flags: "gc_gcry"
+        assert_macro %({{flag?(:gc_none)}}), %(true), flags: "gc_gcry"
+        assert_macro %({{flag?(:gc_gcry)}}), %(false), flags: "gc_none"
+      end
+
       it "has flag value" do
         assert_macro %({{flag?(:foo)}}), %("bar"), flags: "foo=bar"
       end

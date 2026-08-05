@@ -152,7 +152,9 @@ module GC
   # abstract def self.syscall(&block : ->) : Nil
 end
 
-{% if flag?(:gc_none) || flag?(:wasm32) %}
+# `-Dgc_none` disables Boehm (stub allocator). `-Dgc_gcry` is an alias for the
+# same path — ecosystem signal for alternative GCs that reopen `GC` (e.g. gcry).
+{% if flag?(:gc_none) || flag?(:gc_gcry) || flag?(:wasm32) %}
   require "gc/none"
 {% else %}
   require "gc/boehm"
