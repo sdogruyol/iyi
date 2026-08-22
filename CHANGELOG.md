@@ -25,6 +25,24 @@
   how an alias lost its right-hand side and, once enums arrived, how one lost
   its members.
 
+- **A generic type crosses a boundary.** Its methods exist once per
+  instantiation and the instantiations belong to whoever writes them — a
+  consumer that writes `Holder(Float64)` needs a method the producer never made
+  — so what travels is the declaration with its type parameters and the
+  *source* of its methods, in `MonoBodies`, which is the answer IV.2 already
+  names and `crystal tool bind` was not using. `new` stays out: it is
+  synthesized from `initialize`, so a consumer makes its own and a carried one
+  would meet it at the linker.
+
+  A generic travels even with no methods to carry, because a consumer may need
+  only to *name* it: `Kemal` refers to `Array(Radix::Node(...))` and calls no
+  `Node` method. `Radix` carries three types where it carried none.
+
+  What a generic's methods must have is a written return type. The trick that
+  rescues an ordinary method — instantiate it on purpose and read what comes
+  back — has no single answer when the owner is generic, so 20 of `Radix`'s 33
+  methods stay behind.
+
 - **A harness for what a consumer pays for a shard** (`bench/bind_speed.py`),
   from its source and from its boundary, at three sizes. A boundary pays once
   compiling the shard is a real share of the build — near ten thousand lines

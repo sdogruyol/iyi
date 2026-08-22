@@ -45,6 +45,8 @@ module Crystal
     # on purpose, or the reason it could not be.
     inferred : String?,
     refused : String?,
+    # A generic's method travels as source, so the source has to be here.
+    body : String?,
     # Whether every parameter names a type a variable can have. `Int` is a name
     # an iyi program can write and not a type anything can hold: it is the head
     # of a family, and a method taking one is compiled once per member with a
@@ -125,6 +127,7 @@ module Crystal
 
     @@builtin = program.builtin_type_names
     @@bound_prefix = {} of String => String
+    @@mono_bodies = {} of String => String
     @@bound_module = {} of String => String
     @@bound_used = Set(String).new
     @@bound = bound_dir ? bound_names(program, bound_dir, io) : Set(String).new
@@ -422,6 +425,7 @@ module Crystal
       target_triple: program.codegen_target.to_s,
       flags: program.flags.to_a.sort!,
       imports: @@bound_used.to_a.sort.map { |name| IyiMod::ImportEdge.new(name) },
+      mono_bodies: @@mono_bodies.dup,
       exports: IyiMod::Exports.new(exported, carried_types, [] of IyiMod::ImplRecord),
       # True, and it was false here on an argument that measurement has since
       # answered. The argument was that a boundary stands *between* Crystal's
@@ -774,6 +778,17 @@ module Crystal
     # A constant lives in the same table as a type — `Kemal::VERSION` is in
     # here — and asking one for its instance variables is how this found out.
     return nil unless type.is_a?(ModuleType)
+
+    # A generic travels as a declaration *and* its bodies. Its methods exist
+    # once per instantiation and the instantiations belong to whoever writes
+    # them — a consumer that writes `Holder(Float64)` needs a method the
+    # producer never made — so what crosses is the source, rendered back into
+    # the declarations the consumer parses (IV.2, `MonoBodies`). Skipping them
+    # is what left `Radix` with nothing to carry, and `Radix` is what `Kemal`
+    # waits on.
+    if type.is_a?(GenericClassType)
+      return generic_declaration name, type, by_owner, root
+    end
     return nil if type.is_a?(GenericType)
     # A private type travels *as private*, which is a different thing from
     # travelling and a different thing from being dropped.
@@ -1072,6 +1087,12 @@ module Crystal
     # IO::Encoder referenced`.
     return counter if declaration.visibility == "private"
 
+    # A generic has no machine code of its own to keep: its methods exist once
+    # per instantiation, the instantiations are the consumer's, and what
+    # travels is their source. `uninitialized Holder(T)` is not a thing anybody
+    # can write, which is what this file found out.
+    return counter unless declaration.type_parameters.empty?
+
     qualified = "#{prefix}#{declaration.name}"
     receiver = "t#{counter}"
     counter += 1
@@ -1271,6 +1292,70 @@ module Crystal
     iyi_module_name(root).split('/').map(&.camelcase).join("::")
   end
 
+  # The bodies a generic's methods travel as, keyed the way the reader looks
+  # them up. Reset per run with everything else this file accumulates.
+  @@mono_bodies = {} of String => String
+
+  # A generic type: its parameters, its fields, and its methods with bodies.
+  #
+  # `new` is left out on purpose and the reason is already in IV.2: it is
+  # synthesized from `initialize` rather than read from an artifact, so a
+  # consumer makes its own — and one carried here would meet it at the linker
+  # as a duplicate.
+  private def self.generic_declaration(name : String, type : GenericClassType,
+                                       by_owner, root : String) : IyiMod::TypeDecl?
+    parameters = type.type_vars
+    signatures = [] of IyiMod::Signature
+
+    { {type.to_s, false}, {type.metaclass.to_s, true} }.each do |(owner, on_metaclass)|
+      by_owner[owner]?.try &.each do |method|
+        next if method.name == "new"
+        next unless method.verdict.ready? || method.inferred
+        next unless method.callable?
+        # A type variable is nameable inside the type that binds it, which is
+        # the whole point of carrying the parameters beside the methods.
+        next unless method.signature_types.all? do |written|
+                      nameable?(written, root) || parameters.any? { |bound| written == bound }
+                    end
+        next unless body = method.body
+
+        signature = IyiMod::Signature.new(
+          name: method.name,
+          receiver: on_metaclass && method.receiver.empty? ? "self" : method.receiver,
+          parameters: method.params.map { |(argument, restriction)| "#{argument} : #{restriction}" },
+          block_parameter: method.written_block,
+          return_type: (method.returns || method.inferred).not_nil!,
+          free_variables: [] of String,
+          required: false,
+        )
+        signatures << signature
+        @@mono_bodies[IyiMod.mono_body_key(name, signature)] = body
+      end
+    end
+
+    # No guard on an empty method list, and that is the point. A consumer may
+    # need only to *name* this type — `Kemal` refers to
+    # `Array(Radix::Node(...))` and never calls a `Node` method — and naming is
+    # what a declaration is for. Dropping the empty ones is what left `Kemal`
+    # waiting on a type whose methods it had no use for.
+    fields = [] of {String, String}
+    type.instance_vars.each do |field, variable|
+      fields << {field, variable.type?.try(&.devirtualize.to_s) || "?"}
+    end
+
+    IyiMod::TypeDecl.new(
+      name: name,
+      kind: type.type_desc.lchop("generic "),
+      type_parameters: parameters,
+      assoc_types: [] of String,
+      supertraits: [] of String,
+      fields: fields,
+      methods: signatures.sort_by(&.name),
+      visibility: type.private? ? "private" : "pub",
+      types: [] of IyiMod::TypeDecl,
+    )
+  end
+
   # An enum, as its members and the integer they are numbered on.
   #
   # A member is a `Const` under the enum whose value is the number the compiler
@@ -1458,6 +1543,7 @@ module Crystal
       location: a_def.location.try(&.to_s) || "?",
       inferred: inferred,
       refused: refused,
+      body: a_def.body.to_s,
       storable: a_def.args.all? { |arg| storable_restriction?(owner, arg.restriction) },
       params: a_def.args.map { |arg| {arg.name, resolve_restriction(owner, arg.restriction) || "?"} },
       returns: resolve_restriction(owner, a_def.return_type),

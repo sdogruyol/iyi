@@ -103,6 +103,28 @@ describe "`crystal tool bind`, end to end" do
             size == Size::Large
           end
 
+          # A generic, whose methods exist once per instantiation and whose
+          # instantiations belong to whoever writes them. What crosses is the
+          # declaration and the *source* of its methods (IV.2, `MonoBodies`);
+          # the consumer compiles them for the arguments it picks. Its return
+          # type has to be written, because the trick that rescues an ordinary
+          # method — instantiate it and read the answer — has no single answer
+          # for a generic owner.
+          class Holder(T)
+            @item : T
+
+            def initialize(@item : T)
+            end
+
+            def item : T
+              @item
+            end
+          end
+
+          def self.hold(n : Int32) : Holder(Int32)
+            Holder(Int32).new(n)
+          end
+
           # And a type under the root, with a constant of its own. Its unit is
           # the root's second, and the assignment travels as `Inner::LABELS`,
           # which defines rather than reopens.
@@ -129,6 +151,7 @@ describe "`crystal tool bind`, end to end" do
         puts ABCGreeter::Inner.label(1)
         puts ABCGreeter.bigger(ABCGreeter::Size::Large)
         puts ABCGreeter.bigger(ABCGreeter::Size::Small)
+        puts ABCGreeter.hold(42).item
         IYI
 
       # 1. The declarations, and the keep file that makes the code exist.
@@ -157,7 +180,7 @@ describe "`crystal tool bind`, end to end" do
       # The claim. Not that it compiled, not that it linked — that the program
       # ran and the answers came from the shard.
       Process.capture_result([File.join(dir, "app")], chdir: dir)
-        .output.chomp.should eq "hello, iyi\nhi iyi\n7\none\n10\nb\ntrue\nfalse"
+        .output.chomp.should eq "hello, iyi\nhi iyi\n7\none\n10\nb\ntrue\nfalse\n42"
     end
   end
 end

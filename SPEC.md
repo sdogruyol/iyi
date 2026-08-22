@@ -4608,6 +4608,39 @@ Named honestly, so nobody mistakes this draft for complete.
     > > size. Below that it costs a little: reading a megabyte of artifact and
     > > linking twenty objects is not free, and there was nothing to save.
     > >
+    > > **And then the generics, which is what `Kemal` had stopped on.** IV.2
+    > > already says what a generic does: its methods exist once per
+    > > instantiation, the instantiations belong to whoever writes them, and the
+    > > bodies travel as source in `MonoBodies`. `tool bind` was not using it —
+    > > it skipped a generic type in three places — so `Radix` carried nothing
+    > > and `Kemal` waited on a type nobody had declared.
+    > >
+    > > It carries them now, declaration and bodies both, and a generic crosses:
+    > > `Bag.wrap(7).item` answers 7 from a consumer that compiled
+    > > `Holder(Int32)#item` itself, out of source the producer sent. `new` stays
+    > > behind because it is synthesized from `initialize` and a carried one
+    > > would meet the consumer's own at the linker — which IV.2 had already
+    > > written down.
+    > >
+    > > **A generic with no methods travels too**, and that was the second thing
+    > > wrong: an empty one was dropped, when naming is itself what a consumer
+    > > may need. `Kemal` refers to `Array(Radix::Node(...))` and calls no `Node`
+    > > method. `Radix` carries three types now where it carried none.
+    > >
+    > > What a generic's methods must have is a **written return type**. The
+    > > trick that rescues an ordinary method — instantiate it on purpose and
+    > > read what comes back — has no single answer when the owner is generic, so
+    > > 20 of `Radix`'s 33 methods stay behind. That is R-2 landing hardest
+    > > exactly where inference cannot help.
+    > >
+    > > **`Kemal` still does not link, and the reason has moved again**, which is
+    > > the fourth time in this item. It is no longer a generic: it is that a
+    > > bound shard's `require`s do not travel. `Radix`'s units number
+    > > `Hash(String, HTTP::Cookie)`, and a consumer whose prelude is Crystal's
+    > > still has to `require "http/cookie"` before it can name one. The format
+    > > carries `Requires` for precisely this — 12d put it there — and `tool
+    > > bind` does not write it.
+    > >
     > > **The first version of this measured nothing, and why is the useful
     > > part.** Its consumer called one method. Codegen is demand-driven, so a
     > > consumer that reaches one method has the compiler emit one — and a
