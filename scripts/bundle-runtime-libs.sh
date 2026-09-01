@@ -155,11 +155,29 @@ if [ "$mode" != "--verify-only" ]; then
   Darwin) bundle_darwin ;;
   esac
 
-  ls "$lib" | grep -q 'libLLVM' || {
-    echo "bundle-runtime-libs: no libLLVM landed in $lib — the package would"
-    echo "need the host's, which is the bug this script exists for."
-    exit 1
-  }
+  # The guard runs in whichever direction the binary chose. A compiler
+  # linked against shared LLVM must ship it — a package without it needs
+  # the host's, which is the bug this script exists for. A compiler
+  # linked against the static LLVM (the tarball diet: built per Crystal's
+  # own recipe, GC_DESIGN's Learned entry collected) must ship *no*
+  # libLLVM, because one in `lib/` would mean the link quietly went
+  # shared after all. Which direction applies is read off the binary,
+  # not assumed.
+  if ldd "$root/bin/iyi" 2>/dev/null | grep -q 'libLLVM' ||
+     otool -L "$root/bin/iyi" 2>/dev/null | grep -q 'libLLVM'; then
+    ls "$lib" | grep -q 'libLLVM' || {
+      echo "bundle-runtime-libs: no libLLVM landed in $lib — the package would"
+      echo "need the host's, which is the bug this script exists for."
+      exit 1
+    }
+  else
+    if ls "$lib" | grep -q 'libLLVM'; then
+      echo "bundle-runtime-libs: the binary does not need libLLVM but one was"
+      echo "bundled, so the link quietly went shared after all."
+      exit 1
+    fi
+    echo "static LLVM: no libLLVM to carry, and none carried"
+  fi
 
   echo "bundled beside the binaries:"
   ls -1 "$lib" | sed 's/^/  /'

@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The tarball went on the diet its own Learned entry prescribed.** The
+  Linux release package used to carry libLLVM and everything libLLVM asks
+  for — libedit, libxml2, libicu (icudata above all), libncursesw, libzstd,
+  179 MB of `lib/` — because the compiler linked the distribution's shared
+  monolith. It now links a minimal static LLVM built per Crystal's own
+  recipe, recorded in 0.6.0's Learned entry and collected here:
+  `BUILD_SHARED_LIBS=OFF`, `MinSizeRel`, only the five targets the
+  compiler reaches (X86, AArch64, ARM, AVR, WebAssembly), and zlib, zstd,
+  libxml2, ffi, z3 and libedit all `OFF`, so the closure never comes into
+  existence rather than being bundled well. `lib/` is libgc and libstdc++
+  at 3.4 MB, the tarball fell from 86 MB to 70 MB, and the installed
+  footprint halved (227 MB to 107 MB). The clean-room proof is unchanged
+  and passed on the first build: unpack somewhere else, run, and the
+  package names nothing outside itself but the loader and libc.
+
+  Two guards moved with it. `bundle-runtime-libs.sh` now reads which
+  direction the binary chose: a shared-LLVM compiler must ship libLLVM —
+  the original guard — and a static one must ship none, because a
+  libLLVM in `lib/` would mean the link quietly went shared after all.
+  And CI builds the static LLVM in its own container rather than
+  downloading one built elsewhere, cached on the recipe key: a static
+  archive must be linked by the glibc it was compiled against, and an
+  archive from a newer machine is a link error or a silent
+  binary-for-newer-glibc. The roughly-an-hour build is paid once per
+  LLVM bump, not per push. darwin's tarball keeps brew's shared LLVM for
+  now, stated rather than implied: its diet is its own piece of work.
+
 ## 0.8.0 — 2026-09-01
 
 **The collector is the default.** 0.7.0 built it; this release seats it: a
