@@ -3433,7 +3433,7 @@ Every undefined symbol in a linked own-prelude program, plain `iyi build`, read
 off the executable on darwin arm64:
 
 ```
-write  exit  memset                                        # libc staples
+write  exit                                                # libc staples
 kqueue  kevent  clock_gettime_nsec_np  __error             # the poller (III.4.8)
 mmap  munmap                                               # the collector's arena
 pthread_self  pthread_get_stackaddr_np                     # root discovery

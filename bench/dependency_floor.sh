@@ -67,7 +67,11 @@ trap 'rm -rf "$WORK"' EXIT
 # malloc again is the regression this list exists to catch. `mprotect`
 # appears only in a program that spawns a task, and no sample does;
 # bench/concurrency_exercise.sh allows it for the exercise binary.
-ALLOWED_SYMBOLS_DARWIN="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue memset mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
+# `memset` LEFT with the same flip, which the gate's own tightness check
+# demanded: the arena clears reused chunks with its own clear_block, so no
+# darwin sample references libSystem's memset any more, and an allowlist
+# entry nothing uses is a check without teeth.
+ALLOWED_SYMBOLS_DARWIN="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
 ALLOWED_SYMBOLS_LINUX="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
 
 # What a program may link. The platform libc only.
