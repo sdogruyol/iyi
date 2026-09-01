@@ -4,14 +4,14 @@
 # allocation speed"). `bench/arena_exercise.sh` drives it.
 #
 #   ./bin/iyi run bench/arena_exercise.iyi
-#   ./bin/iyi run -Dgc_iyi bench/arena_exercise.iyi
+#   ./bin/iyi run -Dgc_none bench/arena_exercise.iyi
 #
-# Built twice: with `-Dgc_iyi` every check below runs against the size-class
-# arena allocator, and without it the allocator-independent checks run against
-# the default bump allocator, so the same program proves the default path
-# still works. The checks that only an arena can answer (free, clearing,
-# classes, addressability, large-object release) compile out without the
-# flag. Every check raises with the block and offset on a wrong byte, and a
+# Built twice: a plain build runs every check below against the size-class
+# arena allocator, which is the default now, and `-Dgc_none` runs the
+# allocator-independent checks against the opted-out bump pointer, so the
+# same program proves the opt-out path still works. The checks that only an
+# arena can answer (free, clearing, classes, addressability, large-object
+# release) compile out under `-Dgc_none`. Every check raises with the block and offset on a wrong byte, and a
 # panic exits non-zero, which is what the driver keys on.
 #
 # Since Stage 5, the size rides twenty-four bytes under the pointer instead of
@@ -132,7 +132,7 @@ fill(nothing, 64, 9)
 verify(nothing, 64, 9, "realloc of null")
 puts "realloc: same-class, cross-class and null all hold their bytes"
 
-{% if flag?(:gc_iyi) %}
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
   # The allocation-pressure trigger is off for this exercise: it
   # choreographs colours and free lists across explicit collections,
   # and a string interpolation running a collection mid-check would be
@@ -353,7 +353,7 @@ puts "realloc: same-class, cross-class and null all hold their bytes"
   end
   puts "large: 2 MiB over the top class round trips and unlists on free; bench/arena_large_probe.iyi proves the mapping is gone"
 {% else %}
-  puts "gc_iyi checks skipped: this build has the default bump allocator; -Dgc_iyi runs them"
+  puts "arena checks skipped: this build deselected the collector's allocator; a plain build runs them"
 {% end %}
 
 # --- Speed: a long run of allocations, nanoseconds per allocation ---
@@ -370,7 +370,7 @@ end
 elapsed = monotonic_ns - start
 puts "speed: #{elapsed.unsafe_div(runs.to_u64).to_i64} ns per allocation over #{runs} (sink #{(sink & 1023).to_i64})"
 
-{% if flag?(:gc_iyi) %}
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
   # The pair loop: what an allocation costs when its chunk is freed each
   # time, which is the shape a collecting heap's mutator actually takes.
   start = monotonic_ns

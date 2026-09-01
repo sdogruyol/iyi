@@ -2,9 +2,11 @@
 # verification: live objects are marked, unreachable objects stay white, and the
 # tri-colour representation supports what Stage 7 will do to it.
 #
-#   ./bin/iyi run -Dgc_iyi bench/mark_exercise.iyi
+#   ./bin/iyi run bench/mark_exercise.iyi
 #
-# Everything here needs `-Dgc_iyi`, because `IyiMark` only exists behind that
+# Everything here needs the collector's allocator — the default on POSIX,
+# and what `-Dgc_none` and `-Dgc_boehm` deselect — because `IyiMark` only
+# exists behind that
 # flag. Built without it the program says so in one line and exits 0, which is
 # what stops a build that compiled the whole section out from reading as a pass.
 # Every check raises on a wrong answer, and a panic exits non-zero, which is
@@ -21,7 +23,7 @@
 # Not under `samples/`: the sample count is a gated number, and samples are
 # explanations rather than torture tests.
 
-{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
   # The allocation-pressure trigger is off for this exercise: it
   # choreographs colours and free lists across explicit collections,
   # and a string interpolation running a collection mid-check would be
@@ -231,7 +233,7 @@
     Held.cycle = anchor.as(Void*).address if anchor.is_a?(ProbeNode)
   end
 
-  puts "== the exercise, -Dgc_iyi"
+  puts "== the exercise, the collector's allocator"
 
   # 1. A chain, and garbage beside it.
   build_chain(400_u64)
@@ -391,5 +393,5 @@
 
   puts "    all mark checks passed"
 {% else %}
-  puts "    marking needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here"
+  puts "    marking needs the collector's allocator (the default on linux-x86_64, linux-aarch64 and darwin); this build deselected it, nothing to exercise here"
 {% end %}

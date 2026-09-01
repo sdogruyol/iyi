@@ -3,9 +3,11 @@
 # global memory, stack, and registers; verify that manual root discovery finds
 # them". This is that program and `bench/root_exercise.sh` drives it.
 #
-#   ./bin/iyi run -Dgc_iyi bench/root_exercise.iyi
+#   ./bin/iyi run bench/root_exercise.iyi
 #
-# Everything here needs `-Dgc_iyi`, because `IyiRoots` only exists behind that
+# Everything here needs the collector's allocator — the default on POSIX,
+# and what `-Dgc_none` and `-Dgc_boehm` deselect — because `IyiRoots` only
+# exists behind that
 # flag. Built without it the program says so in one line and exits 0, which is
 # what stops a build that compiled the whole section out from reading as a
 # pass. Every check raises on a wrong answer, and a panic exits non-zero, which
@@ -14,7 +16,7 @@
 # Not under `samples/`: the sample count is a gated number and samples are
 # explanations, not torture tests.
 
-{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
   # The allocation-pressure trigger is off for this exercise: it
   # choreographs colours and free lists across explicit collections,
   # and a string interpolation running a collection mid-check would be
@@ -468,5 +470,5 @@
   print "  all root checks passed\n"
   __iyi_exit(status)
 {% else %}
-  print "  root discovery needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here\n"
+  print "  root discovery needs the collector's allocator (the default on linux-x86_64, linux-aarch64 and darwin); this build deselected it, nothing to exercise here\n"
 {% end %}

@@ -86,12 +86,12 @@ build_and_run() {
   return 0
 }
 
-echo "== the exercise, default allocator"
-build_and_run "default" exercise-default "$REPO/bench/arena_exercise.iyi"
+echo "== the exercise, -Dgc_none (the opted-out bump pointer)"
+build_and_run "gc_none" exercise-default "$REPO/bench/arena_exercise.iyi" -Dgc_none
 
 echo
-echo "== the exercise, -Dgc_iyi"
-build_and_run "gc_iyi" exercise-gc "$REPO/bench/arena_exercise.iyi" -Dgc_iyi
+echo "== the exercise, the default (the collector's arena)"
+build_and_run "default" exercise-gc "$REPO/bench/arena_exercise.iyi"
 
 # Every check in the program prints a line, and the arena-only ones print
 # nothing without the flag. Naming them here is what stops a build that
@@ -108,7 +108,7 @@ done
 
 echo
 echo "== a freed large object's mapping is gone"
-if ! "$IYI" build -Dgc_iyi -o "$WORK/large-probe" "$REPO/bench/arena_large_probe.iyi" >"$WORK/large-probe.build.log" 2>&1; then
+if ! "$IYI" build -o "$WORK/large-probe" "$REPO/bench/arena_large_probe.iyi" >"$WORK/large-probe.build.log" 2>&1; then
   echo "  probe build failed"
   tail -12 "$WORK/large-probe.build.log"
   status=1

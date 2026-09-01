@@ -1,9 +1,9 @@
 # The allocation-pressure trigger, exercised rather than asserted. Every
 # earlier collector gate calls `IyiMark.collect` by hand; this is the one
 # where nobody does, because a collector a program has to call is a verb,
-# and the claim under test is that `-Dgc_iyi` is a collector.
+# and the claim under test is that the default build is a collector.
 #
-#   ./bin/iyi run -Dgc_iyi bench/collect_trigger.iyi
+#   ./bin/iyi run bench/collect_trigger.iyi
 #
 # The budget arithmetic is stated where it is checked: the first collection
 # comes after a MiB of allocation, and after each one the budget is twice
@@ -12,13 +12,14 @@
 # that never crosses a MiB never collects at all. Every check below is that
 # sentence, measured.
 #
-# Everything here needs `-Dgc_iyi`. Built without it the program says so in
+# Everything here needs the collector's allocator, the default on POSIX.
+# Built with `-Dgc_none` or `-Dgc_boehm` the program says so in
 # one line and exits 0.
 #
 # Not under `samples/`: the sample count is a gated number, and samples are
 # explanations rather than torture tests.
 
-{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
   def count(value : UInt64) : String
     value.to_i64.to_s
   end
@@ -56,7 +57,7 @@
     arenas
   end
 
-  puts "== the trigger, -Dgc_iyi"
+  puts "== the trigger, the default allocator"
 
   # 1. Below the budget, nothing runs. A quarter MiB of garbage is a quarter
   # of the floor, and a collector that fires under its own stated budget is
@@ -151,5 +152,5 @@
 
   puts "    all trigger checks passed"
 {% else %}
-  puts "    the trigger needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here"
+  puts "    the trigger needs the collector's allocator (the default on linux-x86_64, linux-aarch64 and darwin); this build deselected it, nothing to exercise here"
 {% end %}

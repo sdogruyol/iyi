@@ -38,8 +38,8 @@ run_case() {
   return 0
 }
 
-echo "== the exercise, -Dgc_iyi"
-run_case "the exercise" trigger -Dgc_iyi
+echo "== the exercise, the default allocator"
+run_case "the exercise" trigger
 if ! grep -q "all trigger checks passed" "$WORK/trigger.out" 2>/dev/null; then
   echo "  MISSING: the exercise did not reach the end"
   status=1
@@ -57,15 +57,15 @@ done
 
 echo
 echo "== the same program with optimisation on"
-run_case "release" trigger-release -Dgc_iyi --release
+run_case "release" trigger-release --release
 if ! grep -q "all trigger checks passed" "$WORK/trigger-release.out" 2>/dev/null; then
   echo "  MISSING: the optimised build did not reach the end"
   status=1
 fi
 
 echo
-echo "== the same program without the flag"
-run_case "no flag" trigger-noflag
+echo "== the same program, opted out with -Dgc_none"
+run_case "gc_none" trigger-none -Dgc_none
 
 echo
 echo "== the exercise is fast enough to be a gate"
@@ -91,7 +91,7 @@ prove_fails() {
   mkdir -p "$WORK/$dir/iyi"
   cp -R "$REPO/src/iyi/." "$WORK/$dir/iyi/"
   awk "$script" "$REPO/src/iyi/prelude.iyi" > "$WORK/$dir/iyi/prelude.iyi"
-  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build -Dgc_iyi \
+  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/collect_trigger.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
     echo "  $label: the patched prelude did not build"

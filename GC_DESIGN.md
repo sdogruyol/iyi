@@ -1,9 +1,11 @@
 # iyi Garbage Collector Design
 
-**Status:** Stages 1, 2, 3, 5 and 6 built, so the collector works end to end
-behind `-Dgc_iyi`: allocate, mark, sweep, and the memory is handed out again.
-Stage 4 is mostly vacuous, Stages 7 to 9 wait on a scheduler, and Stage 10 is
-design.
+**Status:** Stages 1, 2, 3, 5 and 6 built, and **the collector is the
+default allocator on POSIX**: a plain build allocates from the arena,
+collects under its own allocation-pressure trigger, and hands memory back.
+The flip followed the measurement below. `-Dgc_none` opts out to the bump
+pointer, `-Dgc_boehm` to libgc. Stage 4 is mostly vacuous, Stages 7 to 9
+wait on threads, and Stage 10 is design.
 
 Stage 6: the sweep. One walk over every carved chunk, a white object's chunk
 goes back on its class's free list, a black one survives and is repainted white
@@ -71,8 +73,11 @@ and the cause was the header having no way to say *atomic* — a 32 MiB
 `Array(Int32)` buffer was word-scanned at every triggered collection.
 `ATOMIC_FLAG` (mark-word bit 3, set where `clear` is false, carried across
 `realloc`) is the fix, and it is Boehm's own contract: `GC_malloc_atomic`
-memory is never opened. The flip itself stays a decision for a release of
-its own; what this table changes is that the evidence now argues for it.
+memory is never opened. **The flip followed:** with the table above as the
+evidence and every stage gated, the default moved to the collector, and
+the doors out are `-Dgc_none` and `-Dgc_boehm`. The selection lives in two
+places that must agree — the prelude's allocator seam and
+`Program#iyi_gc_arena?` in the compiler — and both name each other.
 
 Stage 1: the artifact carries a pointer map per type it owns (`.iyimod` format
 v43, `Layouts` section 64), and the object header and its CAS-safe mark word
@@ -80,15 +85,17 @@ exist and are tested as a unit. Stage 1's own tasks 3 and 4, work distribution
 and write barriers, are design here and deferred to Stage 6 by their own text;
 they were not built.
 
-Stage 2: a size-class arena allocator, `-Dgc_iyi`, on Linux x86_64 and aarch64
-and on darwin. Size classes to 16 KiB, 16 MiB arenas, free lists, large objects
-by their own mapping and released with `munmap`, and the two properties Stage 3
-needs: a pointer resolves to its arena and class, and the arena list walks. It
-costs no symbol and no library beyond `munmap`, so the dependency floor holds.
+Stage 2: a size-class arena allocator — the default's, since the flip — on
+Linux x86_64 and aarch64 and on darwin. Size classes to 16 KiB, 16 MiB
+arenas, free lists, large objects by their own mapping and released with
+`munmap`, and the two properties Stage 3 needs: a pointer resolves to its
+arena and class, and the arena list walks. On Linux it costs no symbol and
+no library — mmap and munmap are raw syscalls — and on darwin it costs
+libSystem's `mmap`/`munmap`, named in the floor's list with the flip as
+the reason.
 
-What it does not do yet: collection is opt-in behind `-Dgc_iyi`, and moving
-the default is a measurement and a decision, not a side effect. Windows and
-wasm32 keep their existing allocators — the first's memory diagnosis now has
+What it does not do yet: Windows and wasm32 keep their existing
+allocators — the first's memory diagnosis now has
 a fixed suspect (the prelude memset's stride) and CI's watch is what retires
 it, the second has no mmap and its watermark arena is a separate design.
 Threads, and with them Stages 4, 7, 8 and 9, wait where the section below

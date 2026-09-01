@@ -63,8 +63,8 @@ run_case() {
   return 0
 }
 
-echo "== the exercise, -Dgc_iyi"
-run_case "the exercise" mark -Dgc_iyi
+echo "== the exercise, the default allocator"
+run_case "the exercise" mark
 # Exit 0 is not the check: a program that compiled the whole section out also
 # exits 0. Reaching the last line is the check.
 if ! grep -q "all mark checks passed" "$WORK/mark.out" 2>/dev/null; then
@@ -87,15 +87,15 @@ echo "== the same program with optimisation on"
 # Marking reads words the optimiser is free to move between registers and the
 # stack, so the release build is a different test rather than the same one
 # faster.
-run_case "release" mark-release -Dgc_iyi --release
+run_case "release" mark-release --release
 if ! grep -q "all mark checks passed" "$WORK/mark-release.out" 2>/dev/null; then
   echo "  MISSING: the optimised build did not reach the end"
   status=1
 fi
 
 echo
-echo "== the same program without the flag"
-run_case "no flag" mark-noflag
+echo "== the same program, opted out with -Dgc_none"
+run_case "gc_none" mark-none -Dgc_none
 
 echo
 echo "== what marking asks the machine for"
@@ -133,7 +133,7 @@ prove_fails() {
   mkdir -p "$WORK/$dir/iyi"
   cp -R "$REPO/src/iyi/." "$WORK/$dir/iyi/"
   awk "$script" "$REPO/src/iyi/prelude.iyi" > "$WORK/$dir/iyi/prelude.iyi"
-  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build -Dgc_iyi \
+  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/mark_exercise.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
     echo "  $label: the patched prelude did not build"

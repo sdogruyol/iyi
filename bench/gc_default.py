@@ -5,10 +5,11 @@ The collector's own record says moving the default is "a measurement and a
 decision, not a side effect", and this is the measurement. The same program,
 iyi's own prelude, three allocators:
 
-  * **default** — the bump pointer: allocate, never free. The fastest path
-    and the unbounded one.
-  * **-Dgc_iyi** — the owned collector, triggering itself by allocation
-    pressure.
+  * **default** — the owned collector, triggering itself by allocation
+    pressure. It became the default on the strength of this file's own
+    table.
+  * **-Dgc_none** — the bump pointer: allocate, never free. The fastest
+    path, the unbounded one, and the default this file retired.
   * **-Dgc_boehm** — libgc, the collector 0.1.0 shipped and the dependency
     the floor exists to refuse.
 
@@ -43,8 +44,8 @@ IYI = ROOT / "bin" / "iyi"
 RUNS = 5
 
 ARMS = {
-    "default": [],
-    "gc_iyi": ["-Dgc_iyi"],
+    "default": [],          # the collector, since the flip this file argued for
+    "gc_none": ["-Dgc_none"],   # the bump pointer, the old default
     "gc_boehm": ["-Dgc_boehm"],
 }
 

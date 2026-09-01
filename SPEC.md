@@ -63,7 +63,7 @@ own reference accepts.
 | warm full build, `hello` / 6,900-line pair | 0.07 s / 0.24 s, against `go build`'s 0.08 s / 0.09 s |
 | front end, `hello.iyi` | **0.036 s** against the 0.050 s target: MET |
 | starting the compiler and doing nothing | 0.018 s of that |
-| iyi's own prelude | 5,538 lines, ceiling 3,734 |
+| iyi's own prelude | 5,545 lines, ceiling 3,734 |
 | compiler | 84,068 lines, none of it written in iyi |
 | artifact format | `.iyimod` v19, checksum per section |
 | samples | 9, of which 5 rebuild from artifacts with their modules' source deleted |
@@ -88,7 +88,7 @@ shape.
 > is a library and the rules are the language, so a program can keep one and
 > change the other: `--crystal` builds against Crystal's standard library, and
 > there `require` reaches the ecosystem while every rule stays where it was.
-> "No standard library worth the name" is still true of iyi's own 5,538 lines
+> "No standard library worth the name" is still true of iyi's own 5,545 lines
 > and no longer true of what a program can have. Part V item 12a is the
 > measurement, nine shards wide.
 
@@ -270,7 +270,7 @@ of binary. It is not made the default on that trade, and the middle needs the
 initialisers to run *later* rather than not at all, which is the `dlsym` table
 above, and a larger piece of work than the number it wins.
 
-**3. A deliberately tiny prelude, written in iyi. Done: 5,538 lines,
+**3. A deliberately tiny prelude, written in iyi. Done: 5,545 lines,
 primitives included.** Not a standard library: integers, booleans, a string,
 one sequence, one dictionary, one range, `puts`. **Its scope is set by what the
 samples call and by nothing else**. A method enters the prelude because an
@@ -791,8 +791,8 @@ Checking it moved two things and left the shape alone.
 
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
-| Compiler | 24,984 lines, **written in Crystal** | 102,817 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 5,538-line own prelude + 777 in samples |
+| Compiler | 24,984 lines, **written in Crystal** | 102,836 lines, Crystal, forked |
+| Library | 8,161 lines (3,551 of it core) | 5,545-line own prelude + 777 in samples |
 | Specs | 21,146 lines | 9,064 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
@@ -3433,21 +3433,27 @@ Every undefined symbol in a linked own-prelude program, plain `iyi build`, read
 off the executable on darwin arm64:
 
 ```
-write  exit  memset  malloc  realloc               # libc
-kqueue  kevent  clock_gettime_nsec_np  __error     # the poller (III.4.8)
+write  exit  memset                                        # libc staples
+kqueue  kevent  clock_gettime_nsec_np  __error             # the poller (III.4.8)
+mmap  munmap                                               # the collector's arena
+pthread_self  pthread_get_stackaddr_np                     # root discovery
+_dyld_get_image_header  _dyld_get_image_vmaddr_slide       # root discovery, dyld
 ```
 
-Nine symbols, all of them libSystem — five the prelude always had, four the
-concurrency runtime's poller added when it reached darwin arm64 (III.4.8:
-the panic path runs through the scheduler, so every program carries the
-poller and its clock) — and the one shared library is the platform's
+The symbols are all libSystem — the prelude's staples, the concurrency
+runtime's poller (III.4.8: the panic path runs through the scheduler, so
+every program carries the poller and its clock), and the owned collector's
+`mmap`/`munmap` plus root discovery's `pthread_get_stackaddr_np` and dyld
+image calls (GC_DESIGN.md) — and the one shared library is the platform's
 libc. The list this section was written on was seven, four of them the
 allocator: `libgc.1.dylib` beside libc, carrying `GC_init`, `GC_malloc`,
-`GC_malloc_atomic` and `GC_realloc`. That library is gone from the default, and
-the four went with it: the prelude selects `src/gc/none.cr`, which allocates
-over `malloc` and `realloc` and never frees. Crystal's own `hello` additionally
-pulls `libiconv`, which iyi's `String` has no reason to want, and the compiler
-dropped that one too (`-Dwithout_iconv`).
+`GC_malloc_atomic` and `GC_realloc`. That library left the default twice
+over: first for the bump pointer, which held the floor by never freeing,
+and then for the owned collector, which holds the same floor and frees —
+the arena maps and unmaps through the platform's own VM interface, so
+real collection now costs not one library. Crystal's own `hello`
+additionally pulls `libiconv`, which iyi's `String` has no reason to
+want, and the compiler dropped that one too (`-Dwithout_iconv`).
 
 So **an own-prelude program's dependency is the platform libc and nothing
 else**, and what that is worth depends on which artifact is being read, so this
@@ -3456,36 +3462,33 @@ section says which. The gate checks this mode at two layers.
 **At the object layer**, which is the per-target cross-compile audit in CI, an
 own-prelude program's object for `x86_64-linux-gnu` leaves nothing undefined:
 the prelude issues the raw syscalls itself for `write`, `exit` and the
-allocator (`mmap`), and imports nothing. That is the strong form of the claim
-and it is measured rather than projected. On darwin the same audit defers to
-libSystem, because Apple supports it as the only interface and raw syscalls are
-not a stable ABI there — and the concurrency runtime (III.4.8) follows the same
-rule: its poller is a kqueue and its stacks, clock and events go through
-libSystem's `mmap`, `mprotect`, `clock_gettime_nsec_np` and `kevent`, so on
-darwin the runtime's calls are undefined symbols in a program that reaches
-them — counted by the exercise gate and by `bench/dependency_floor.sh` —
-where the Linux object carries nothing.
+collector's `mmap`/`munmap`, and imports nothing. That is the strong form of
+the claim and it is measured rather than projected. On darwin the same audit
+defers to libSystem, because Apple supports it as the only interface and raw
+syscalls are not a stable ABI there — the concurrency runtime and the
+collector follow the same rule, so on darwin their calls are undefined
+symbols in the object — counted by the exercise gates and by
+`bench/dependency_floor.sh` — where the Linux object carries nothing.
 
 **At the executable layer**, the linked program carries what its link template
 adds. On Linux that is the C runtime's five undefined references,
 `__libc_start_main`, `__gmon_start__`, `__cxa_finalize` and the two weak
 `_ITM_` clone-table callbacks, left behind by `crt1.o`, `crti.o` and
-`crtbegin.o`. On darwin it is libSystem's nine above.
+`crtbegin.o`. On darwin it is libSystem's list above.
 Either way an own-prelude program's dependency list is the platform libc and
 nothing else.
 
-What dropping libgc bought is the price below rather than an open question:
-the own-prelude default allocates and never collects, a default kept on purpose
-and documented loudly (Appendix B #23).
-
-`-Dgc_none` used to have no effect on an own-prelude program. The prelude
-declared
-`@[Link("gc")]` directly rather than going through the selection in `src/gc.cr`,
-so the flag was accepted and ignored, and the fix was routing that selection.
-Then the default was inverted: the libc allocator is what a plain `iyi build`
-binds, `-Dgc_boehm` is the opt-in that restores real collection, `libgc.1.dylib`
-and the four `GC_*` symbols and all, and `-Dgc_none` still works and selects the
-same allocator as the default, so nothing that passes it breaks.
+The default under that floor has been three allocators, each a decision
+this document records. Boehm shipped with 0.1.0 and was measured off as
+the last library a plain build could not refuse. The bump pointer held
+the floor next — allocate, never free, kept on purpose and documented
+loudly (Appendix B #23) — until GC_DESIGN.md's collector was built,
+gated, and measured against it (`bench/gc_default.py`). Now the owned
+collector is the default: same floor, plus collection. `-Dgc_none`
+selects the bump pointer for a program that wants the last nanosecond
+and accepts unbounded memory; `-Dgc_boehm` restores libgc, the four
+`GC_*` symbols and all, and is the third door, kept so nothing that
+passes it breaks.
 
 #### The collector is not hygiene, it is R-4
 
@@ -3572,7 +3575,7 @@ Two facts about the seam, which iyi's own collector inherits as constraints:
    `__crystal_malloc64` and friends to them. A collector iyi owns is pointed
    at those four, and none of the `GC` facade is needed.
 2. **A real collector raises the floor, and the gate will say so.** A process
-   GC needs `mmap`, `munmap`, signals and `pthread_atfork`, so darwin's five
+   that gives memory back needs `munmap` beside `mmap`; on darwin the
    libSystem symbols become more and the Linux object stops being empty. That
    is not a regression, it is the trade: a default that does not collect
    becomes one that does, paying syscalls plus code iyi ships for it.
@@ -3580,11 +3583,20 @@ Two facts about the seam, which iyi's own collector inherits as constraints:
    correct, and the commit adds the new symbols to the list with this section
    as the reason.
 
-One piece of luck worth naming: iyi's own prelude has no concurrency (III.4 is
-unbuilt), so the owned collector starts single-threaded, with no fibers or
-execution contexts, and grows toward III.4 rather than chasing it. A
-`--crystal` program has Crystal's fibers and is not the configuration this
-collector plan or floor measures.
+   **Resolved, and the trade came in under the prediction.** The flip's
+   commit added darwin's `mmap`/`munmap` and root discovery's four to the
+   list with this section as the reason, exactly as written — and the
+   Linux object *stayed empty*, because the arena issues `mmap` and
+   `munmap` as raw syscalls the way `write` and `exit` always were. On
+   Linux a collected default costs the floor nothing at all.
+
+One piece of luck this section named did not last, and what replaced it is
+better: the own prelude grew III.4's scheduler before the collector's roots
+were done, so the collector did not start "single-threaded with no fibers" —
+it started with a fiber registry to walk, and `bench/root_exercise.sh` and
+`bench/collect_trigger.sh` hold a parked fiber's stack as a root range. A
+`--crystal` program has Crystal's fibers and is still not the configuration
+this collector or floor measures.
 
 #### Where the collector decision splits: the language, not the compiler
 
@@ -3726,8 +3738,8 @@ From Crystal's own *Required libraries* page, plus every `@[Link]` in this tree.
 
 | Library | What it is for | Reachable | iyi's answer |
 |---|---|---|---|
-| libc | everything | yes: `write`, `exit`, `memset`, `malloc`, `realloc` on darwin | keep. On Linux the prelude issues the raw syscalls instead, so the object asks libc for nothing and the executable carries only the link template's five |
-| Boehm GC | allocation | no: the default allocates over libc and never collects; `-Dgc_boehm` opts back in | **own it.** II.5 already requires a precise collector for R-4, and the default holding the floor does not collect |
+| libc | everything | yes: `write`, `exit`, `memset` and the collector's `mmap`/`munmap` on darwin | keep. On Linux the prelude issues the raw syscalls instead, so the object asks libc for nothing and the executable carries only the link template's five |
+| Boehm GC | allocation | no: the default is the owned collector, arena over the platform's own `mmap`; `-Dgc_boehm` opts libgc back in, `-Dgc_none` opts out of collecting | **owned, shipped, default.** II.5 already required a precise collector for R-4; GC_DESIGN.md is the record and `bench/gc_default.py` the measurement that flipped the default |
 | compiler-rt builtins | 128-bit divide, float conversion, overflow-checked multiply | no | **already owned**: `src/crystal/compiler_rt/` ports them to Crystal. Keep porting |
 | libunwind / libgcc | exception backtraces | no | own the walk. III.1 is what makes this cheap: errors are union members, so only a panic unwinds |
 | libevent | event loop | no | **never adopt it.** Crystal already wrote native backends and libevent is its default only on OpenBSD, NetBSD, Dragonfly and Solaris |
@@ -3767,18 +3779,19 @@ the one that reaches for libevent because it is the shortest path. Adopting it
 would put a C library under every concurrent iyi program, permanently, to save
 work that has already been done by somebody else.
 
-**2. The collector.** III.9 and II.5, and the ground moved under it: the default
-no longer links libgc, so the floor has stopped arguing for the collector and
-what is left is the reason that was always the real one, R-4. The price already
-being paid is that a default iyi program allocates and never frees, which
-`-Dgc_boehm` escapes for any program that wants collection now. One shortcut is
-closed by measurement: **`-Dgc_none` is not viable for the compiler itself.** It
-was built and tried, and the compiler emits invalid IR ("Load operand must be a
-pointer", from `LLVM::Module#verify`) on some runs and dies in `main_user_code`
-on others, because it is a long walk over ASTs with parallel codegen and fibers
-under an allocator that never frees. So the compiler keeps a collector and the
-programs it builds do not, and a collected default arrives through the real
-collector, not through the flag.
+**2. The collector.** III.9 and II.5, and the ground moved under it twice: the
+default stopped linking libgc, so the floor stopped arguing for the collector
+— and then the collector arrived and became the default without giving the
+floor back (GC_DESIGN.md, `bench/gc_default.py`). The price this paragraph
+recorded — a default that allocates and never frees — is paid no longer; it
+is `-Dgc_none`'s price now, chosen rather than shipped. One shortcut stays
+closed by measurement: **`-Dgc_none` is not viable for the compiler itself.**
+It was built and tried, and the compiler emits invalid IR ("Load operand must
+be a pointer", from `LLVM::Module#verify`) on some runs and dies in
+`main_user_code` on others, because it is a long walk over ASTs with parallel
+codegen and fibers under an allocator that never frees. So the compiler keeps
+its collector, and the collected default for programs arrived through the
+real collector, exactly as this sentence once predicted.
 
 That finding now has a boundary drawn around it, and the collector inside it
 has a decision. **The owner decided (Appendix B #20, overruling the adopt-gcry
@@ -7745,7 +7758,7 @@ Named honestly, so nobody mistakes this draft for complete.
     shards exist and none of them is written to iyi's rules, so "run them
     directly" is not a compatibility problem, it is the four rules: `require`
     against R-1, inference against R-2, monkey patching against R-3, and
-    Crystal's 8,161-line standard library against iyi's own 5,538-line prelude.
+    Crystal's 8,161-line standard library against iyi's own 5,545-line prelude.
 
     What is measurable is narrower and better than that framing suggests, and
     it was measured on **Kemal 1.12.0**, which compiles under this compiler
@@ -8663,15 +8676,16 @@ Named honestly, so nobody mistakes this draft for complete.
     API, then a language server over it. R-1 is what makes that server cheap,
     and it is the one dividend of the compilation model nobody designed for.
 15. ~~**The dependency floor.**~~ **Measured in III.9, and everything on the
-    own-prelude floor is decided**: nine undefined symbols in an own-prelude
-    program on macOS, all libSystem — five libc staples and the concurrency
-    runtime's four (III.4.8); on Linux an object that leaves none at all,
-    against an executable carrying only the five its link template adds. libgc
-    left the default to buy that, so the own-prelude default allocates and never
-    collects, a price kept on purpose and stated in Appendix B #23. The
-    collector was the only open item and is now decided: iyi writes its own
-    (Appendix B #20), which II.5 already required for R-4, so it was never
-    dependency hygiene alone. Self-hosting stays where B.2 put it.
+    own-prelude floor is decided**: an own-prelude program on macOS asks
+    libSystem for the staples, the concurrency runtime's four (III.4.8) and
+    the owned collector's six (III.9, the flip); on Linux an object that
+    leaves none at all — the arena is raw syscalls — against an executable
+    carrying only the five its link template adds. libgc left the default
+    first for the bump pointer, whose never-collecting price Appendix B #23
+    kept on purpose, and then the owned collector (Appendix B #20, built)
+    took the default with the floor intact, which is II.5's requirement
+    for R-4 landing as the runtime rather than as hygiene. Self-hosting
+    stays where B.2 put it.
 
     `bench/dependency_floor.sh` checks plain own-prelude builds and
     `-Dgc_boehm`; it does not check `--crystal`. That mode links Crystal's
@@ -8759,7 +8773,7 @@ For traceability, since several rules here rest on numbers rather than taste.
 | 20 | ~~**Write a collector, or adopt `gcry`? (III.9)**~~ | **Decided: iyi writes its own collector; gcry is not adopted, overruling this row's earlier recommendation.** What changed is the goal, and the change is the owner's, not a finding: they want concurrency, parallelism and a performant language, and owning the collector is the only path to the control that takes; gcry was pointed at as hints about what has already been tried to pull Crystal off Boehm, never as a runtime to adopt. The price is stated rather than softened: everything gcry already built, the heap, the STW, the roots, the finalizers, two platforms, is rebuilt in this tree, and only its measurements are inherited (#21). R-4 still requires the precise heap-layout table either way (II.5) |
 | 21 | **Precise stack roots, now a design question inside the collector iyi writes (III.9)** | still open, and reframed by #20 rather than settled by it: it is a design decision in a collector iyi owns, no longer a finding inherited from gcry. R-4 needs heap-layout precision, which is a table. gcry's measurement is still the best available evidence on the expensive half: stack-map precision is correctness-stable and not an RSS win. Inherited as prior art rather than repeated, and answerable only when iyi's own collector exists to measure on |
 | 22 | ~~**Keep macro-level regex, and pcre2 on the compiler with it? (III.9, III.10)**~~ | **Decided and done: macro-level regex is kept, on iyi's own engine, and pcre2 is off the compiler, measured.** RE2 semantics everywhere. This row recommended keeping both until the owned engine from #17 landed; it landed as `src/compiler/iyi/rx.cr`, differentially verified against pcre2, and it took pcre2 out of compiler-owned source. It did not take the library off the binary. Ten reachable regex literals in four stdlib files the compiler compiles into itself did that, found by reading `--emit llvm-ir` (`$Regex:0` through `$Regex:9`) rather than by inference: `option_parser.cr`, `process/shell.cr`, `semantic_version.cr` and `spec/cli.cr` now parse by hand, each differentially verified, and `otool -L .build/iyi` is down to libLLVM, libc++, libgc and libSystem. `bench/dependency_floor.sh` forbids `libpcre` for the compiler and own-prelude programs, proven to fail by injecting a reachable literal. The price: macro authors lose the constructs that are not regular, backreferences, recursion, subroutine calls and conditionals, plus atomic groups and possessive quantifiers, and a macro using one fails with a named error rather than quietly meaning something else; and `Spec::CLI#pattern` changed from `Regex?` to `String?`, a breaking change to a stdlib public API even though the behaviour is identical. **This row also listed lookaround as part of that price, inheriting the false premise corrected in #17; lookaround is supported, in all four forms, and lookbehind here is unbounded where pcre2's is not.** The gain: the compiler sheds a library on Crystal's required list, and no pattern can take exponential time |
-| 23 | ~~**Is a default that does not collect acceptable until the collector lands? (III.9)**~~ | **Decided: yes, kept, and documented loudly.** A plain build using iyi's own prelude allocates and never collects; `-Dgc_boehm` opts that mode back into real collection. The own prelude has no IO beyond `puts` and no concurrency. `--crystal` uses Crystal's standard library and is a different mode, outside this allocator and dependency-floor claim. The price stays in the row: a long-running own-prelude program grows without bound, and this is a default that ships a known leak. "Until the collector lands" now means until iyi's own lands (#20) |
+| 23 | ~~**Is a default that does not collect acceptable until the collector lands? (III.9)**~~ | **Decided then, and now retired the way its last sentence promised.** A plain build using iyi's own prelude allocated and never collected, kept on purpose and documented loudly; the price stayed in the row: a long-running own-prelude program grew without bound, a default that shipped a known leak. "Until the collector lands" meant until iyi's own landed (#20) — and it landed: the owned collector is the default now (GC_DESIGN.md, `bench/gc_default.py` the measurement, III.9 the floor it kept). The never-collecting mode is `-Dgc_none`, chosen rather than shipped |
 | 24 | ~~**Keep bdw-gc on the compiler? (III.9, III.10)**~~ | **Decided: yes; the exception holds in the present tense, and this row is superseded by #20 in its premise and restated.** The compiler keeps bdw-gc: `-Dgc_none` is proven not viable for it (III.10), and a collector that cannot carry parallel codegen cannot host a compiler that runs parallel codegen over fibers. What changed is the revisit condition: it is no longer gcry's parallel path leaving experimental, since gcry is not being adopted; it is iyi's own collector reaching the stage that serves parallel codegen. Until then the dependency stays a recorded exception carrying this reason rather than an unexamined habit |
 | 25 | ~~**Build the interpreter on the macro interpreter, without C interop? (III.11)**~~ | **Decided: yes.** This reopens #11 on the owner's ask, with `iex` as the reference; the evidence that removed the old one still stands. The base is `src/compiler/iyi/macros/interpreter.cr`, 781 lines, a complete AST evaluator that already resolves types, extended for iyi's nine new AST nodes and two `Def` clauses, not the 11,377-line revert that cannot run iyi past the module header. No C interop, so no libffi, and that is enforced rather than assumed: `libffi` is on `bench/dependency_floor.sh`'s denylist, and the gate was proven to fire by adding to a sample the exact `@[Link("ffi")]` shape a naive revert would produce. It failed at three independent layers, reporting the gained symbol `ffi_prep_cif`, the gained library `libffi.8.dylib`, and the denylist hit, so an interpreter cannot quietly bring libffi with it. R-1 bounds what a session recompiles to the module graph; R-3 takes open-class patching away from the prompt |
 | 26 | ~~**wasm32's allocator: wasi-libc as the platform runtime, a qualified platform, or `memory.grow` in the compiler? (III.9, III.10)**~~ | **Decided: bind `memory.grow` so an own-prelude iyi program on wasm32 needs nothing but its WASI imports.** A two-argument `fun` declaration of `llvm.wasm.memory.grow.i32` (memory index, then page delta) lowers to `memory.grow 0`. An earlier probe used the one-argument form, failed the module verifier, and was misread as "Crystal cannot bind this intrinsic". It was an arity error, not an impossibility, so this landed as an own-prelude binding rather than a compiler primitive. Measured after: `hello.wasm` and `webapp.wasm` leave `wasi_fd_write` and `wasi_proc_exit` undefined, and no longer leave `malloc` or `realloc`. Two alternatives were rejected: accepting wasi-libc as the platform's own runtime the way libSystem and kernel32 are accepted, and documenting wasm32 as a qualified target, both because either leaves an asterisk on a platform the owner named as a priority |

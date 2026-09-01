@@ -101,8 +101,8 @@ build_and_run() {
   return 0
 }
 
-echo "== the exercise, -Dgc_iyi"
-build_and_run "gc_iyi" roots-gc -Dgc_iyi
+echo "== the exercise, the default allocator"
+build_and_run "default" roots-gc
 
 echo
 echo "== every check reported"
@@ -118,12 +118,13 @@ done
 [ "$status" -eq 0 ] && echo "  bounds, stack, register, global, interior, rejection, tail, freed, many and the maps parser all reported"
 
 echo
-echo "== the same program without the flag"
-# There is nothing to exercise without `-Dgc_iyi` and the program says so. What
-# this proves is that the prelude still compiles for a program that never asks
-# for a root scanner.
-build_and_run "default" roots-default
-if ! grep -q "root discovery needs -Dgc_iyi" "$WORK/roots-default.out" 2>/dev/null; then
+echo "== the same program, opted out with -Dgc_none"
+# There is nothing to exercise without the collector's allocator and the
+# program says so. What the arm proves is that a prelude carrying the root
+# finder still builds and runs cleanly when the allocator it serves is
+# deselected.
+build_and_run "gc_none" roots-default -Dgc_none
+if ! grep -q "root discovery needs the collector" "$WORK/roots-default.out" 2>/dev/null; then
   echo "  MISSING: the line saying the flag is what turns this on"
   status=1
 fi
@@ -135,7 +136,7 @@ echo "== the same program with optimisation on"
 # register check names its own premises and fails when one is gone, so this
 # run is not a formality: it is the one that would catch the ordering that
 # lets the optimiser reuse the register before the scan reaches it.
-build_and_run "release" roots-release -Dgc_iyi --release
+build_and_run "release" roots-release --release
 if ! grep -q "all root checks passed" "$WORK/roots-release.out" 2>/dev/null; then
   echo "  MISSING: the optimised build did not reach the end"
   status=1
@@ -206,7 +207,7 @@ case "$(uname -s)" in
   *)     other_targets="x86_64-linux-gnu aarch64-linux-gnu" ; other_expect="__data_start _end" ;;
 esac
 for target in $other_targets; do
-  if ! "$IYI" build -Dgc_iyi --cross-compile --target "$target" \
+  if ! "$IYI" build --cross-compile --target "$target" \
        -o "$WORK/roots-$target" "$REPO/bench/root_exercise.iyi" \
        >"$WORK/roots-$target.log" 2>&1; then
     echo "  $target: cross-compile failed"
@@ -246,7 +247,7 @@ prove_fails() {
   mkdir -p "$WORK/$dir/iyi"
   cp "$REPO"/src/iyi/*.iyi "$WORK/$dir/iyi/"
   awk "$1" "$REPO/src/iyi/prelude.iyi" > "$WORK/$dir/iyi/prelude.iyi"
-  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build -Dgc_iyi \
+  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/root_exercise.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
     echo "  $label: the patched prelude did not build"

@@ -14,6 +14,24 @@ require "./codegen"
 # on this platform today, but an artifact build that never asks for the
 # marker must still link a program that does, and the symbol existing on
 # demand is a promise a future build might quietly break.
+
+# The prelude's allocator selection has its twin here: `iyi_gc_arena?` is
+# the compiler's answer to "does this build's prelude allocate through the
+# owned collector's arena", and it must equal the macro condition at the
+# top of `src/iyi/prelude.iyi`'s allocator seam. It gates two emissions —
+# the type id stored into the object header at every class allocation, and
+# the layout table below — and the two sides disagreeing is not a
+# degradation in one direction: a compiler that writes ids into a header
+# the prelude did not allocate is memory corruption. Change both or
+# neither.
+class Iyi::Program
+  def iyi_gc_arena? : Bool
+    return false if has_flag?("gc_boehm") || has_flag?("gc_none")
+    (has_flag?("linux") && (has_flag?("x86_64") || has_flag?("aarch64"))) ||
+      has_flag?("darwin")
+  end
+end
+
 class Iyi::CodeGenVisitor
   GC_LAYOUTS_NAME = "__iyi_gc_layouts"
 

@@ -340,7 +340,7 @@ generics crossing a boundary is specified and unmeasured.
 **Efficiency — built, and it is mostly subtraction.** `puts "hello"` is a 36 KB
 binary that starts in 1.6 ms; the same program compiled with Crystal's standard
 library is 1,553 KB and 3.2 ms. Nothing clever is happening: a program links what
-it uses, and iyi's own library is 5,538 lines rather than 8,161. The whole
+it uses, and iyi's own library is 5,545 lines rather than 8,161. The whole
 library is 203 KB on disk beside the binary.
 
 <sup>Sizes and start times are a plain `iyi build`, no flags, on macOS arm64
@@ -447,14 +447,17 @@ startup objects, and the executable carries their five undefined references
 `_ITM_` callbacks). That distinction is the whole of it, and CI is what taught
 it: a claim measured on an object is not a claim about the binary. `--static`
 is where "no libc" becomes literally true, below. On macOS the object asks
-`libSystem` for nine symbols — five libc staples and the concurrency
-runtime's poller (SPEC.md III.4.8) — because that is Apple's only supported
-interface.
+`libSystem` for its staples, the concurrency runtime's poller and the
+collector's `mmap`/`munmap` (SPEC.md III.4.8, GC_DESIGN.md) — because that
+is Apple's only supported interface.
 Crystal's published required-libraries list is thirteen long. An own-prelude
-program reaches none of them: no libgc, no libevent, no openssl, no zlib. The
-price is that its default allocator never collects; memory is taken and not
-given back until the collector lands. `-Dgc_boehm` opts that mode into bdw-gc
-and real collection, making libgc its one dependency.
+program reaches none of them: no libgc, no libevent, no openssl, no zlib —
+and since the collector became the default, that costs no collection
+either: a plain build allocates from the owned arena, collects under its
+own allocation-pressure trigger, and still adds not one library. The
+doors out are `-Dgc_none` (the old bump pointer: allocate, never free,
+the last nanosecond of the fast path) and `-Dgc_boehm` (bdw-gc, making
+libgc its one dependency).
 
 `bench/dependency_floor.sh` measures own-prelude builds, not `--crystal`.
 `--crystal` links Crystal's standard library and may pull every library a
@@ -522,7 +525,7 @@ $ curl localhost:3000/json
 `pub`, traits with defaults, `impl … forall`, error unions and `!`, `.or`,
 `or_panic`, `defer` — all of them, on a program that requires a shard. R-2
 still refuses an export that does not write its types. What changes is what the
-program *has*: 8,161 lines of Crystal's standard library instead of 5,538
+program *has*: 8,161 lines of Crystal's standard library instead of 5,545
 lines of iyi's own prelude.
 
 **One name is unreachable, and it is a class of names.** `!` in iyi propagates
@@ -874,7 +877,7 @@ marked PROPOSED are the parts that will move under you.
 
 ## What is not here
 
-- **iyi's own library is 5,538 lines, and its IO is `puts`, `print`,
+- **iyi's own library is 5,545 lines, and its IO is `puts`, `print`,
   `read_input` and `File`**: integers, booleans, a string, one sequence, one
   dictionary, one range. `read_input` returns everything on standard input as
   one string, because there is no `IO` to keep the rest in. `File.read`,
@@ -975,7 +978,7 @@ marked PROPOSED are the parts that will move under you.
 | [SPEC.md](SPEC.md) | the design, and the record of what measurement settled |
 | [`samples/iyi`](samples/iyi) | thirteen programs: eleven documenting a part of it, one being a first half hour, and `calc`, a language |
 | [`samples/crystal/kemal`](samples/crystal/kemal) | a kemal application, from `shard.yml`: built from source and across four `.iyimod` boundaries |
-| [`src/iyi`](src/iyi) | iyi's own library, 5,538 lines. `--crystal` swaps it for Crystal's |
+| [`src/iyi`](src/iyi) | iyi's own library, 5,545 lines. `--crystal` swaps it for Crystal's |
 | [`src/compiler/iyi/iyimod.cr`](src/compiler/iyi/iyimod.cr) | the artifact format |
 | [`bench/incremental.py`](bench/incremental.py) | the edit loop, against Go, generated in both languages |
 | [`bench/build_speed.py`](bench/build_speed.py) | the full builds, and the gate that fails until the target holds |

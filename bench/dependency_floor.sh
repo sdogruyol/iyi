@@ -57,10 +57,17 @@ trap 'rm -rf "$WORK"' EXIT
 # runs through the scheduler, so every darwin program carries the poller and
 # its clock, all of it libSystem for the same reason `write` is. Linux keeps
 # raw syscalls, so its list and the per-target objects are unchanged.
-# `mmap`/`mprotect` appear only in a program that spawns a task, and no
-# sample does; bench/concurrency_exercise.sh allows them for the exercise
-# binary, which spawns plenty.
-ALLOWED_SYMBOLS_DARWIN="__error chmod clock_gettime_nsec_np close exit kevent kqueue malloc memset open read realloc unlink write"
+# `mmap`, `munmap`, `pthread_self`, `pthread_get_stackaddr_np` and the two
+# `_dyld_get_image_*` calls joined when the owned collector became the
+# default (GC_DESIGN.md, the flip): the arena maps and unmaps through
+# libSystem's VM interface, and root discovery asks libSystem for the stack
+# base and dyld for the image's segments — the same standing `write` has.
+# `malloc` and `realloc` LEFT the list with the same flip: a default darwin
+# program allocates from the arena now, and a build that asks libSystem for
+# malloc again is the regression this list exists to catch. `mprotect`
+# appears only in a program that spawns a task, and no sample does;
+# bench/concurrency_exercise.sh allows it for the exercise binary.
+ALLOWED_SYMBOLS_DARWIN="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue memset mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
 ALLOWED_SYMBOLS_LINUX="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
 
 # What a program may link. The platform libc only.
@@ -172,7 +179,10 @@ prog_syms="$(sort -u "$found_syms")"
 prog_libs="$(sort -u "$found_libs")"
 
 echo
-echo "== the collector is opt-in, and asking for it is the only way to get it"
+echo "== libgc is opt-in, and asking for it is the only way to get it"
+# The default is the owned collector, which links nothing; libgc arrives
+# only with -Dgc_boehm, and -Dgc_none (the bump pointer) must stay as
+# library-free as the default it used to be.
 "$IYI" build -Dgc_boehm -o "$WORK/boehm" "$REPO/samples/iyi/hello.iyi" >/dev/null 2>&1
 boehm_libs="$(libraries "$WORK/boehm")"
 printf '  -Dgc_boehm  %s\n' "$(echo "$boehm_libs" | tr '\n' ' ')"
@@ -181,7 +191,14 @@ if ! echo "$boehm_libs" | grep -q 'libgc\.'; then
   status=1
 fi
 if echo "$prog_libs" | grep -q 'libgc\.'; then
-  echo "  a plain build linked libgc, so the collector is not opt-in after all"
+  echo "  a plain build linked libgc, so the owned default is not holding the floor"
+  status=1
+fi
+"$IYI" build -Dgc_none -o "$WORK/none" "$REPO/samples/iyi/hello.iyi" >/dev/null 2>&1
+none_libs="$(libraries "$WORK/none")"
+printf '  -Dgc_none   %s\n' "$(echo "$none_libs" | tr '\n' ' ')"
+if echo "$none_libs" | grep -q 'libgc\.'; then
+  echo "  -Dgc_none linked libgc, so the opt-out is broken"
   status=1
 fi
 

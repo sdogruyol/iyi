@@ -4,6 +4,38 @@
 
 ### Added
 
+- **The owned collector is the default allocator.** A plain `iyi build` on
+  Linux x86_64, Linux aarch64 and darwin now allocates from the arena,
+  collects under the allocation-pressure trigger, and hands memory back —
+  with the dependency floor exactly where it was: on Linux the arena is
+  raw syscalls and the object still leaves nothing undefined, on darwin
+  it is libSystem's `mmap`/`munmap`, named in the floor's list with the
+  flip as the reason. The measurement came first
+  (`bench/gc_default.py`): the collector wins or ties every time column
+  against both predecessors and holds RSS at the live set where a heap
+  that never frees holds it at the garbage.
+
+  The doors out: `-Dgc_none` selects the bump pointer — allocate, never
+  free, the old default, still the right tool for a short-lived program
+  that wants the last nanosecond — and `-Dgc_boehm` selects libgc, both
+  held by `bench/dependency_floor.sh`: libgc arrives only when asked for,
+  and the opt-out stays as library-free as the default it used to be.
+  `-Dgc_iyi` still names the collector and is now the default spelled out
+  loud. The selection lives in two places that must agree — the prelude's
+  allocator seam and `Program#iyi_gc_arena?` in the compiler, which gates
+  the type-id store and the layout table — and each names the other,
+  because a compiler writing ids into a header the prelude did not
+  allocate is memory corruption, not a degradation.
+
+  Every collector gate now drives the *default* build and a `-Dgc_none`
+  arm where the bump pointer is the thing under test; the concurrency and
+  panics gates run collector-backed default builds, which makes them the
+  first integration proof that a program can schedule, panic and collect
+  in the same process without noticing. Appendix B #23's known leak —
+  "a default that ships a known leak" — is retired the way its own last
+  sentence promised: the never-collecting mode is chosen now, not
+  shipped.
+
 - **The header says atomic, and the default-flip question has its
   numbers.** `bench/gc_default.py` is the measurement the collector's
   record demanded before any default moves: the same programs, iyi's own
@@ -1081,7 +1113,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,538 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,545 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2590,7 +2622,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,538-line library and nothing else. Every other
+  written against iyi's own 5,545-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

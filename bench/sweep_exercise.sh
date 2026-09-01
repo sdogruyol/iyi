@@ -38,8 +38,8 @@ run_case() {
   return 0
 }
 
-echo "== the exercise, -Dgc_iyi"
-run_case "the exercise" sweep -Dgc_iyi
+echo "== the exercise, the default allocator"
+run_case "the exercise" sweep
 if ! grep -q "all sweep checks passed" "$WORK/sweep.out" 2>/dev/null; then
   echo "  MISSING: the run did not reach the end"
   status=1
@@ -57,7 +57,7 @@ done
 
 echo
 echo "== the same program with optimisation on"
-run_case "release" sweep-release -Dgc_iyi --release
+run_case "release" sweep-release --release
 if ! grep -q "all sweep checks passed" "$WORK/sweep-release.out" 2>/dev/null; then
   echo "  MISSING: the optimised build did not reach the end"
   status=1
@@ -65,7 +65,7 @@ fi
 
 echo
 echo "== the same program without the flag"
-run_case "no flag" sweep-noflag
+run_case "gc_none" sweep-none -Dgc_none
 
 echo
 echo "== the checks fail when the sweep is broken"
@@ -77,7 +77,7 @@ prove_fails() {
   mkdir -p "$WORK/$dir/iyi"
   cp -R "$REPO/src/iyi/." "$WORK/$dir/iyi/"
   awk "$script" "$REPO/src/iyi/prelude.iyi" > "$WORK/$dir/iyi/prelude.iyi"
-  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build -Dgc_iyi \
+  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/sweep_exercise.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
     echo "  $label: the patched prelude did not build"

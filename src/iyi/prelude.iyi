@@ -420,20 +420,14 @@ require "./hash"
 require "./file"
 
 # The allocator, selected rather than declared, because the selection has to be
-# a real seam a different allocator is swapped in at. Boehm was the default and
-# `-Dgc_none`, a flag this compiler already answers to (`src/gc.cr` reads it to
-# require `gc/none` instead of `gc/boehm`), only opted out of it: a prelude
-# that bound `GC_malloc` conditionally accepted the flag, linked the collector
-# anyway and said nothing about it, and a flag that is accepted and ignored is
-# worse than one that is refused. The dependency floor then measured the
-# collector as the last library a default `iyi build` could not refuse (SPEC.md
-# III.9), so the default is inverted: a plain build allocates and never
-# collects, which is the exact contract `-Dgc_none` already had, and
-# `-Dgc_boehm` restores the twelve lines of binding below along with the
-# collection they buy. `-Dgc_none` still selects the default, so nothing that
-# passes it changes meaning. A real collector is not dropped by this, it is
-# III.9's open item: adopt one and pay it back in layouts (SPEC.md B.1, table
-# row 20).
+# a real seam a different allocator is swapped in at. The seam has carried
+# three defaults: Boehm (0.1.0), then nothing — allocate and never collect —
+# after the dependency floor measured libgc as the last library a default
+# build could not refuse (SPEC.md III.9), and now the owned collector, once
+# GC_DESIGN.md's stages were built, gated, and measured against both
+# predecessors (`bench/gc_default.py`). `-Dgc_boehm` still buys libgc and its
+# collection; `-Dgc_none` still buys the bump pointer and its unbounded
+# floor-clean speed; a plain build gets the collector that pays for itself.
 #
 # Written out in full rather than put behind a `GC` module the way the standard
 # library has it. There are four call sites and all of them are in this file,
@@ -465,27 +459,40 @@ require "./file"
     LibGC.realloc(pointer, size)
   end
 {% else %}
-  {% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
-    # iyi: `-Dgc_iyi` selects the size-class arena allocator of GC_DESIGN.md's
-    # Stage 2, the heap the collector's later stages grow from. It is opt-in:
-    # the default on every target stays the allocator below, and moving the
-    # default is a separate decision backed by measurement, not a thing to
-    # slip in beside the allocator itself. The flag names the collector it
-    # belongs to, but nothing here marks, scans or collects: this stage is
-    # allocation, explicit free and realloc. An object comes back only when a
-    # caller passes it to `IyiHeap.free`, which exists now precisely so it can
-    # be called explicitly and tested; Stage 6's sweep is the caller it is
-    # waiting for.
+  {% if !flag?(:gc_none) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+    # iyi: **the default allocator on POSIX is the owned collector.** The
+    # size-class arena of GC_DESIGN.md's Stage 2, the roots, the marker,
+    # the sweep and the allocation-pressure trigger — a plain `iyi build`
+    # gets all of it, and the flip was a measurement before it was a
+    # decision (`bench/gc_default.py`, the table in GC_DESIGN.md): the
+    # collector wins or ties every time column against the bump pointer
+    # and Boehm alike, and holds RSS at the live set where a heap that
+    # never frees holds it at the garbage.
     #
-    # The flag reaches POSIX and stops there, which is deliberate rather than
-    # unfinished. Linux binds it over raw syscalls and darwin over libSystem,
-    # the two interfaces this file already calls the platform's own. win32 and
-    # wasm32 keep the allocators they have under the flag: win32's diagnosis
-    # for printing memory it was never given now has a fixed suspect — the
-    # memset stride defect recorded at that definition below — and the watch
-    # in CI is what retires it, not a new allocator landing in the same
-    # change; wasm32 has no mmap, and its watermark arena is a separate
-    # design.
+    # The doors out: `-Dgc_none` selects the bump pointer below —
+    # allocate, never free, the old default, still the right tool for a
+    # short-lived program that wants the last nanosecond — and
+    # `-Dgc_boehm` selects libgc above. `-Dgc_iyi` still names this
+    # branch and is now the default spelled out loud, kept so nothing
+    # that passes it changes meaning.
+    #
+    # **This condition has a twin in the compiler** —
+    # `Program#iyi_gc_arena?` in `src/compiler/iyi/codegen/gc_layouts.cr`
+    # — which decides whether codegen stores type ids into the header and
+    # embeds the layout table. The two must agree: a prelude that scans
+    # precisely against a compiler that never wrote an id is merely
+    # conservative, but a compiler that writes ids into a header this
+    # branch did not allocate is memory corruption. Change both or
+    # neither.
+    #
+    # POSIX and no further, which is deliberate rather than unfinished.
+    # Linux binds the arena over raw syscalls and darwin over libSystem,
+    # the two interfaces this file already calls the platform's own. win32
+    # and wasm32 keep the allocators they have: win32's diagnosis for
+    # printing memory it was never given has a fixed suspect — the memset
+    # stride defect recorded at that definition below — and the watch in
+    # CI is what retires it; wasm32 has no mmap, and its watermark arena
+    # is a separate design.
     #
     # Requests are rounded to size classes: 16, 32, 64 and doubling to 1 MiB,
     # seventeen classes. A small fixed set is what keeps allocation and free

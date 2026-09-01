@@ -666,7 +666,7 @@ module Iyi
       # Stage 5). The prelude's `IyiMark` reaches them through an external
       # global named `__iyi_gc_layouts`; `gc_layouts.cr` gives the symbol its
       # one real definition whenever this flag selected the iyi heap.
-      iyi_define_gc_layouts if @program.has_flag?("gc_iyi")
+      iyi_define_gc_layouts if @program.iyi_gc_arena?
 
       env_dump = ENV["DUMP"]?
       dump_llvm_regex : Rx::Pattern? = nil
@@ -2493,10 +2493,11 @@ module Iyi
         # else — so the store belongs here, right after the call returns,
         # which is what the prelude's header comment promises. `P-16`, a
         # u32, per `object_header.cr`; the same id `gc_layouts.cr` keys the
-        # embedded table by. Only under `-Dgc_iyi`: every other allocator's
-        # bytes under the pointer are its own, and a store there would
-        # corrupt the bump header or Boehm's heap.
-        if @program.has_flag?("gc_iyi")
+        # embedded table by. Gated on `iyi_gc_arena?`, the prelude
+        # selection's twin: every other allocator's bytes under the pointer
+        # are its own, and a store there would corrupt the bump header or
+        # Boehm's heap.
+        if @program.iyi_gc_arena?
           id_slot = gep llvm_context.int8, type_ptr, -16, "gc_type_id"
           store type_id(type), id_slot
         end

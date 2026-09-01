@@ -1,21 +1,22 @@
 # Stage 6 sweep, exercised rather than asserted. GC_DESIGN.md names the
 # verification: unreachable objects are freed and heap space is reclaimed.
 #
-#   ./bin/iyi run -Dgc_iyi bench/sweep_exercise.iyi
+#   ./bin/iyi run bench/sweep_exercise.iyi
 #
 # This is the stage where the collector stops being a decision and starts being
 # memory that comes back, so the check that matters is the one nobody can fake:
 # allocate garbage, collect, allocate again, and see the same addresses handed
 # out. A sweep that only counted things would pass while reclaiming nothing.
 #
-# Everything here needs `-Dgc_iyi`. Built without it the program says so in one
+# Everything here needs the collector's allocator, the default on POSIX.
+# Built with `-Dgc_none` or `-Dgc_boehm` the program says so in one
 # line and exits 0, which is what stops a build that compiled the whole section
 # out from reading as a pass.
 #
 # Not under `samples/`: the sample count is a gated number, and samples are
 # explanations rather than torture tests.
 
-{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
   # The allocation-pressure trigger is off for this exercise: it
   # choreographs colours and free lists across explicit collections,
   # and a string interpolation running a collection mid-check would be
@@ -87,7 +88,7 @@
     Pointer(UInt8).malloc(size).address
   end
 
-  puts "== the exercise, -Dgc_iyi"
+  puts "== the exercise, the collector's allocator"
 
   # 1. Garbage is reclaimed, and the proof is reuse rather than a counter.
   # Allocate a batch nothing references, record the addresses, collect, then
@@ -196,5 +197,5 @@
 
   puts "    all sweep checks passed"
 {% else %}
-  puts "    sweeping needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here"
+  puts "    sweeping needs the collector's allocator (the default on linux-x86_64, linux-aarch64 and darwin); this build deselected it, nothing to exercise here"
 {% end %}
