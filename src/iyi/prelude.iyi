@@ -1096,19 +1096,30 @@ require "./file"
         fun _dyld_get_image_vmaddr_slide(index : Int32) : Int64
       end
     {% else %}
-      # The static data span on Linux, from the two symbols the link already
-      # defines: `__data_start` at the front of `.data` and `_end` past the
-      # back of `.bss`, which is GC_DESIGN.md's "`__data_start` to
-      # `__bss_end`" written the way the linker spells it. Declaring them and
-      # taking their addresses costs no library: `_end` comes from the linker
-      # itself and `__data_start` from the C runtime object every link
-      # template already adds, so they arrive as two undefined symbols and no
-      # new `-l`. A binary whose link provides neither fails at the link
-      # rather than scanning nothing at run time.
-      lib LibIyiImage
-        $__data_start : UInt8
-        $_end : UInt8
-      end
+      # The static data span on Linux, from symbols the link already
+      # defines. On glibc, `__data_start` at the front of `.data` comes from
+      # the C runtime object every link template adds, and `_end` past the
+      # back of `.bss` from the linker itself — GC_DESIGN.md's
+      # "`__data_start` to `__bss_end`" written the way the linker spells
+      # it. musl's crt defines no `__data_start` (CI's Alpine arm failed at
+      # the link, which is this comment's provenance), so there the range is
+      # `__bss_start`.._end`, both linker-synthesized on every ELF: narrower
+      # by `.data`, and honest about it — this prelude's globals fold their
+      # literal initializers to static zero, so a global that ever holds a
+      # heap pointer lives in `.bss`, which is exactly the half kept.
+      # Declaring them costs no library; a binary whose link provides
+      # neither fails at the link rather than scanning nothing at run time.
+      {% if flag?(:musl) %}
+        lib LibIyiImage
+          $__bss_start : UInt8
+          $_end : UInt8
+        end
+      {% else %}
+        lib LibIyiImage
+          $__data_start : UInt8
+          $_end : UInt8
+        end
+      {% end %}
     {% end %}
 
     class IyiRoots
@@ -1364,9 +1375,13 @@ require "./file"
         # `@@const_low` and `@@const_high` stay zero here and the scan skips
         # an empty range rather than needing a flag to tell it to.
         def self.discover_globals : Nil
-          low = pointerof(LibIyiImage.__data_start).address
+          {% if flag?(:musl) %}
+            low = pointerof(LibIyiImage.__bss_start).address
+          {% else %}
+            low = pointerof(LibIyiImage.__data_start).address
+          {% end %}
           high = pointerof(LibIyiImage._end).address
-          fatal("iyi: __data_start.._end is not a range\n") if high <= low
+          fatal("iyi: the static data span is not a range\n") if high <= low
           @@data_low = low
           @@data_high = high
           @@found_globals = 1_u64

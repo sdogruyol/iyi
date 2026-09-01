@@ -31,11 +31,19 @@ class Iyi::Program
     # both halves of this gate would be wrong there — the layout walk
     # crashes on shapes the arena never allocates, and the id store would
     # scribble into Boehm's heap. CI taught this line by turning every
-    # crystal-mode build red the first time the predicate forgot it.
+    # `--crystal` build red the first time the predicate forgot it.
     return false unless iyi_prelude?
     return false if has_flag?("gc_boehm") || has_flag?("gc_none")
-    (has_flag?("linux") && (has_flag?("x86_64") || has_flag?("aarch64"))) ||
-      has_flag?("darwin")
+    return false unless (has_flag?("linux") && (has_flag?("x86_64") || has_flag?("aarch64"))) ||
+                        has_flag?("darwin")
+    # And the ground truth over the flags: the header exists if and only if
+    # the arena compiled in, and the arena is `IyiHeap`. A spec-built
+    # program carries the default `iyi_prelude?` without ever loading the
+    # prelude, and the compiler specs JIT such snippets inside their own
+    # process — where an id store into libc-malloc'd memory is 'corrupted
+    # size vs. prev_size' at the spec harness's next free. The type lookup
+    # is what makes that impossible rather than unlikely.
+    !types?.try(&.[]?("IyiHeap")).nil?
   end
 end
 
