@@ -1498,25 +1498,35 @@ require "./file"
     # because they are the flag and reserved bits the header promises to a
     # forwarding pointer later.
     #
-    # **Conservative, on purpose, for now.** Every object is word-scanned
-    # between its user pointer and its size, rather than by the pointer
-    # offsets its `TypeLayout` names. The table those offsets live in IS
-    # emitted into the binary (`__iyi_gc_layouts`, `codegen/gc_layouts.cr`),
-    # and this loop does not read it, because nothing writes an object's
-    # `type_id` yet: `malloc` is handed a size and cannot know the type, so
-    # the store belongs at the allocation site in codegen and that is the next
-    # step. Reading a table keyed by an id that is always zero would be a
-    # lookup no test could reach, so it is not written until the id is real.
-    # Conservative marking is not a placeholder either way: it is what Boehm
-    # does in production, and it is safe in the direction that matters, since
-    # a false positive retains a dead object and only a false negative frees a
-    # live one.
+    # **Precise where the header says a type, conservative everywhere else.**
+    # Codegen stores an object's `type_id` at `P-16` at the allocation site
+    # (`allocate_aggregate`), and this loop looks the id up in the layout
+    # table the same compiler embedded (`__iyi_gc_layouts`,
+    # `codegen/gc_layouts.cr`): a hit scans exactly the pointer offsets the
+    # `TypeLayout` names, so an integer that happens to hold an address no
+    # longer retains a dead object through a typed field. An id of zero — a
+    # `Pointer(T).malloc` buffer, a closure environment, anything not
+    # allocated as an instance of a type — word-scans between the user
+    # pointer and the size the header carries, which is what Boehm does in
+    # production and is safe in the direction that matters: a false positive
+    # retains a dead object, only a false negative frees a live one. A
+    # missing table entry falls back the same way, never a crash.
     #
     # Plain loads and stores rather than compare-and-swap: one mutator
     # thread, and the scheduler's fibers yield only at suspension points,
     # never inside the marker. `ObjectHeader`'s CAS helpers exist and are
     # tested for when Stage 7 has threads to contend, and with a single
     # mutator a CAS and a load-store pair decide the same thing.
+
+    # The compiler's embedded layout table. The symbol is a pointer-sized
+    # global whose value is the table's address (`gc_layouts.cr` gives it
+    # its one real definition, an empty table included, so referencing it
+    # can never cost a link). Declared the way `__data_start` is: an
+    # external the link already owes, no library.
+    lib LibIyiGCTable
+      $__iyi_gc_layouts : Void*
+    end
+
     class IyiMark
       WHITE = 0_u64
       GRAY  = 1_u64
@@ -1589,17 +1599,74 @@ require "./file"
         @@queue_len = @@queue_len + 1_u64
       end
 
-      # Scan one object's payload and blacken it. The bound is the size the
-      # header carries, which is the requested size rather than the chunk's:
-      # the bytes past the request belong to the caller only through a later
-      # realloc, and scanning them would read whatever the last owner left.
+      # The table's address, read from the symbol once. Zero after the read
+      # means an image with no table, which no build emits (`gc_layouts.cr`
+      # writes an empty one), so it is treated as "no entry for anything"
+      # rather than trusted.
+      @@layouts : UInt64 = 0_u64
+
+      def self.layouts_table : UInt64
+        @@layouts = IyiHeap.read64(pointerof(LibIyiGCTable.__iyi_gc_layouts).address) if @@layouts == 0
+        @@layouts
+      end
+
+      # Five words per entry, sorted by type id (`gc_layouts.cr` names the
+      # word layout beside its writer): +0 id, +8 alloc size, +16 scan cap,
+      # +24 offset count, +32 index into the offset words after the entries.
+      ENTRY = 40_u64
+
+      # The entry's address for a type id, or zero: zero id, no table, and
+      # an id the table does not carry all answer zero, and every zero means
+      # the same thing to `scan` — word-scan conservatively.
+      def self.layout_entry(type_id : UInt64) : UInt64
+        return 0_u64 if type_id == 0
+        table = layouts_table
+        return 0_u64 if table == 0
+        low = 0_u64
+        high = IyiHeap.read64(table)
+        while low < high
+          mid = (low + high).unsafe_div(2_u64)
+          entry = table + 8_u64 + mid * ENTRY
+          entry_id = IyiHeap.read64(entry)
+          return entry if entry_id == type_id
+          if entry_id < type_id
+            low = mid + 1_u64
+          else
+            high = mid
+          end
+        end
+        0_u64
+      end
+
+      # Scan one object's payload and blacken it. With a layout, the scan is
+      # exactly the pointer offsets the compiler wrote down — an integer
+      # field holding something address-shaped retains nothing. Without one
+      # (a buffer, a closure environment, an id the table does not carry),
+      # the bound is the size the header carries, which is the requested
+      # size rather than the chunk's: the bytes past the request belong to
+      # the caller only through a later realloc, and scanning them would
+      # read whatever the last owner left.
       def self.scan(base : UInt64) : Nil
-        size = IyiHeap.read64(base - IyiHeap::HEADER)
-        cursor = base
-        limit = base + size
-        while cursor + 8_u64 <= limit
-          shade(IyiRoots.base_of(IyiHeap.read64(cursor)))
-          cursor = cursor + 8_u64
+        type_id = IyiHeap.read64(base - 16_u64) & 0xFFFFFFFF_u64
+        entry = layout_entry(type_id)
+        if entry == 0
+          size = IyiHeap.read64(base - IyiHeap::HEADER)
+          cursor = base
+          limit = base + size
+          while cursor + 8_u64 <= limit
+            shade(IyiRoots.base_of(IyiHeap.read64(cursor)))
+            cursor = cursor + 8_u64
+          end
+        else
+          table = layouts_table
+          offsets = table + 8_u64 + IyiHeap.read64(table) * ENTRY + IyiHeap.read64(entry + 32_u64) * 8_u64
+          remaining = IyiHeap.read64(entry + 24_u64)
+          index = 0_u64
+          while index < remaining
+            offset = IyiHeap.read64(offsets + index * 8_u64)
+            shade(IyiRoots.base_of(IyiHeap.read64(base + offset)))
+            index = index + 1_u64
+          end
         end
         recolour(base, BLACK)
       end

@@ -28,14 +28,17 @@ header carries, and what is still white when the queue empties is unreachable.
 The object header is real now: with `P` the pointer a program holds, `P-24` is
 the size, `P-16` the `type_id`, `P-8` the mark word, and `P` the user data.
 
-Marking is **conservative**, and that is a decision rather than a stub. The
-layout table is emitted into the binary (`__iyi_gc_layouts`), and the mark loop
-does not read it, because nothing writes an object's `type_id` yet: `malloc` is
-handed a size and cannot know the type, so that store belongs at the allocation
-site in codegen and is the next step. A table keyed by an id that is always
-zero would be a lookup no test could reach. Conservative marking is what Boehm
-does in production and it errs in the safe direction, since a false positive
-retains a dead object and only a false negative frees a live one.
+Marking is **precise for typed objects and conservative for the rest**.
+Codegen stores the `type_id` into the header at the allocation site
+(`allocate_aggregate`), the mark loop binary-searches the embedded layout
+table (`__iyi_gc_layouts`) and scans exactly the offsets the `TypeLayout`
+names, so an integer field holding an address retains nothing through a
+typed object. A zero id — a `Pointer(T).malloc` buffer, a closure
+environment — and an id the table does not carry both word-scan
+conservatively, which is what Boehm does in production and errs in the
+safe direction: a false positive retains a dead object, only a false
+negative frees a live one. `bench/mark_exercise.sh` proves the precision
+differentially and proves the check fails when the lookup is disabled.
 
 Nothing sweeps. This stage decides what is garbage; Stage 6 reclaims it.
 

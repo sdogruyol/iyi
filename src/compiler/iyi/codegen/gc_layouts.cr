@@ -32,7 +32,6 @@ class Iyi::CodeGenVisitor
 
   def iyi_define_gc_layouts : Nil
     entries = collect_gc_layout_entries
-    return if entries.empty?
 
     # The marker reads the layout table for every object it touches, and a
     # missing entry means a conservative word-scan, never a crash. Sorting by

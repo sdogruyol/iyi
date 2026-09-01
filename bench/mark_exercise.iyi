@@ -112,6 +112,33 @@
     end
   end
 
+  # A typed object, for the precision check: the marker follows `@next` and
+  # `@child` because the layout names their offsets, and never `@disguise`,
+  # because an integer field is not a pointer no matter what it holds.
+  class ProbeNode
+    @next : ProbeNode?
+    @child : Pointer(UInt8)
+    @disguise : UInt64
+
+    def initialize
+      @next = nil
+      @child = Pointer(UInt8).new(0_u64)
+      @disguise = 0_u64
+    end
+
+    def next=(value : ProbeNode?) : Nil
+      @next = value
+    end
+
+    def child=(value : Pointer(UInt8)) : Nil
+      @child = value
+    end
+
+    def disguise=(value : UInt64) : Nil
+      @disguise = value
+    end
+  end
+
   def fresh(size : UInt64) : UInt64
     Pointer(UInt8).malloc(size).address
   end
@@ -164,6 +191,31 @@
       Ledger.expect_dead(fresh(64_u64))
       made = made + 1_u64
     end
+  end
+
+  # The typed chain, in its own frame for the reason `build_garbage` is:
+  # nothing here may leave a decoy's address where the root scan would
+  # legitimately find it. The chain's head lands in `Held.cycle` — a global,
+  # so the nodes are live — and every child and decoy lands in the ledger,
+  # which is a mapping the scan never reaches.
+  @[NoInline]
+  def build_typed(number : UInt64) : Nil
+    head : ProbeNode? = nil
+    made = 0_u64
+    while made < number
+      node = ProbeNode.new
+      child = fresh(48_u64)
+      Ledger.expect_live(child)
+      node.child = Pointer(UInt8).new(child)
+      decoy = fresh(48_u64)
+      Ledger.expect_dead(decoy)
+      node.disguise = decoy
+      node.next = head
+      head = node
+      made = made + 1_u64
+    end
+    anchor = head
+    Held.cycle = anchor.as(Void*).address if anchor.is_a?(ProbeNode)
   end
 
   puts "== the exercise, -Dgc_iyi"
@@ -285,6 +337,44 @@
     raise "deep chain: #{count(bad)} of #{count(Ledger.live_count)} not black, first at index #{count(bad_at)} with colour #{count(bad_colour)}"
   end
   puts "    depth: a #{count(Ledger.live_count)}-object chain is fully marked, so the queue grew and the walk is not the stack"
+
+  # 7. Precision. Sixty-four typed nodes, each holding a live buffer in a
+  # pointer field and a heap address in an integer field. The layout names
+  # the pointer offsets, so every child must come out black — that is the
+  # must-never-miss direction and it is asserted per object. The integer
+  # side is asserted as a majority: a stale word in a register or a stack
+  # slot can legitimately retain one decoy conservatively through the
+  # roots, but it cannot retain most of sixty-four — only the marker
+  # following integer fields does that, and that is exactly the defect
+  # this step exists to catch. Built in its own frame, like the garbage
+  # above, so the addresses are not left where the root scan would
+  # legitimately find them; the chain built after it churns what remains.
+  IyiMark.unmark
+  Ledger.forget
+  Held.head = 0_u64
+  Held.cycle = 0_u64
+  build_typed(64_u64)
+  build_chain(32_u64)
+  IyiMark.mark
+  first_id = IyiHeap.read64(Held.cycle - 16_u64) & 0xFFFFFFFF_u64
+  raise "typed header: a class instance's type id is zero" if first_id == 0
+  require_black(Held.cycle, "typed node")
+  index = 0_u64
+  while index < Ledger.live_count
+    require_black(Ledger.live_at(index), "typed child")
+    index = index + 1_u64
+  end
+  whites = 0_u64
+  index = 0_u64
+  while index < Ledger.dead_count
+    whites = whites + 1_u64 if colour_of(Ledger.dead_at(index)) == IyiMark::WHITE
+    index = index + 1_u64
+  end
+  if whites * 2_u64 <= Ledger.dead_count
+    raise "typed fields: #{count(Ledger.dead_count - whites)} of #{count(Ledger.dead_count)} integer-held addresses were retained, so the marker is following integer fields"
+  end
+  puts "    precision: type id #{count(first_id)} in the header, #{count(Ledger.live_count)} pointer-field children black, #{count(whites)} of #{count(Ledger.dead_count)} integer-held addresses stayed white"
+
 
   puts "    all mark checks passed"
 {% else %}

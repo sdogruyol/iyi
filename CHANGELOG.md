@@ -4,6 +4,28 @@
 
 ### Added
 
+- **The marker reads the map: precise where the header names a type,
+  conservative everywhere else.** The two halves the record said were
+  next, built together because each is what makes the other reachable.
+  Codegen stores an object's `type_id` into the GC header at the
+  allocation site — `allocate_aggregate`, right after the malloc
+  returns, exactly where the prelude's header comment said it belonged —
+  and the mark loop looks the id up in the layout table the compiler
+  already embeds, by binary search, and scans exactly the pointer
+  offsets the `TypeLayout` names. An integer field holding something
+  address-shaped retains nothing through a typed object now. An id of
+  zero — a `Pointer(T).malloc` buffer, a closure environment — keeps the
+  conservative word-scan, and a missing table entry falls back the same
+  way, never a crash. The symbol grew its promised unconditional
+  definition (an empty table rather than an absent one), and its
+  declaration moved to `Void*` after the release build refused a
+  pointer initializer on an `i64` global — the single-module arm caught
+  what the multi-module arm forgave. `bench/mark_exercise.sh` holds it
+  from both sides: sixty-four typed nodes' pointer-field children all
+  black, their integer-held decoys white by a majority no stale root
+  word can fake, and a prelude with the lookup disabled exits 1 naming
+  the retention.
+
 - **A suspended fiber's stack is a root now — Stage 3's fourth task,
   closed.** The recorded gap from the collector's rebase: 0.4.0's
   scheduler parks fibers whose 256 KiB stacks the root walk never
@@ -965,7 +987,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,374 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,441 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2474,7 +2496,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,374-line library and nothing else. Every other
+  written against iyi's own 5,441-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

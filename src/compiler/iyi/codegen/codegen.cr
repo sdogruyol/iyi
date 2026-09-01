@@ -2487,6 +2487,19 @@ module Iyi
         else
           type_ptr = malloc_atomic struct_type
         end
+
+        # iyi: the GC object header's `type_id` (GC_DESIGN.md Stage 5). The
+        # allocator cannot write it — `malloc` is handed a size and nothing
+        # else — so the store belongs here, right after the call returns,
+        # which is what the prelude's header comment promises. `P-16`, a
+        # u32, per `object_header.cr`; the same id `gc_layouts.cr` keys the
+        # embedded table by. Only under `-Dgc_iyi`: every other allocator's
+        # bytes under the pointer are its own, and a store there would
+        # corrupt the bump header or Boehm's heap.
+        if @program.has_flag?("gc_iyi")
+          id_slot = gep llvm_context.int8, type_ptr, -16, "gc_type_id"
+          store type_id(type), id_slot
+        end
       end
 
       pre_initialize_aggregate(type, struct_type, type_ptr)
