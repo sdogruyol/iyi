@@ -602,10 +602,30 @@ jobs:
             -o cross/conc-aarch64 bench/concurrency_exercise.iyi
 
           # The Windows probe: the two shapes whose output has been seen wrong,
-          # a case conversion and a number rendered into a string, and nothing
-          # else. Small enough that a wrong answer names the path.
-          printf 'module probe\n\nputs "hello, iyi!".upcase\nputs "BEEP " + 7.to_s\n' \
-            > cross/strings.iyi
+          # a case conversion and a number rendered into a string — then the
+          # same two shapes 50,000 times, self-checked, because the two-line
+          # form sat green while the defect was live. The suspect is named
+          # now (the prelude's memset strode eight elements per eight bytes,
+          # fixed with the collector's merge): the loop is what makes a
+          # packed-heap trample probable instead of lucky, so twenty green
+          # runs of *this* probe mean more than twenty of the old one.
+          cat > cross/strings.iyi <<'IYI'
+          module probe
+
+          puts "hello, iyi!".upcase
+          puts "BEEP " + 7.to_s
+
+          bad = 0
+          index = 0
+          while index < 50000
+            shout = "hello, iyi!".upcase
+            beep = "BEEP " + index.to_s
+            bad = bad + 1 if shout != "HELLO, IYI!"
+            bad = bad + 1 if beep.size < 6
+            index = index + 1
+          end
+          puts "loop: " + bad.to_s + " bad of 50000"
+          IYI
           ./bin/iyi run cross/strings.iyi > cross/strings-expected.txt
           cat cross/strings-expected.txt
           ( cd cross && ../bin/iyi build --cross-compile \
@@ -804,17 +824,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Windows is not a run target and nothing here is a gate. Three things happen
-  # when you run the same Windows binary twenty times: it prints the right
-  # answer, it prints memory it was never given (`ache\w` where `HELLO, IYI!`
-  # belongs, or `BEEP ` with the digits gone), or it exits `0xC0000005`. All
-  # three have been seen, and which one you get is luck — so there is no
-  # property to assert, only a tally to keep.
+  # Windows is not a run target and nothing here is a gate. Three things have
+  # happened when the same Windows binary ran twenty times: it printed the
+  # right answer, it printed memory it was never given (`ache\w` where
+  # `HELLO, IYI!` belongs, or `BEEP ` with the digits gone), or it exited
+  # `0xC0000005`. The wild write behind the last two has a name now — the
+  # prelude's memset strode eight elements per eight bytes, fixed with the
+  # collector's merge (SPEC III.9 12c tells it whole) — and the probe above
+  # grew a 50,000-iteration self-checked loop so a packed-heap trample is
+  # probable rather than lucky.
   #
-  # This job always succeeds. It exists so the numbers are in every build's log,
-  # and so the day they read twenty right and nothing else, that is visible
-  # without anyone going looking. The claim itself lives in the README and in
-  # SPEC III.9 12c, where it says Windows compiles and links and stops there.
+  # This job still always succeeds. It exists so the numbers are in every
+  # build's log; several clean builds of the strengthened probe in a row are
+  # what would move the README and SPEC III.9 12c, and that day is visible
+  # without anyone going looking.
   windows-probe:
     needs: cross-objects
     runs-on: windows-2022

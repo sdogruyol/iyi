@@ -63,7 +63,7 @@ own reference accepts.
 | warm full build, `hello` / 6,900-line pair | 0.07 s / 0.24 s, against `go build`'s 0.08 s / 0.09 s |
 | front end, `hello.iyi` | **0.036 s** against the 0.050 s target: MET |
 | starting the compiler and doing nothing | 0.018 s of that |
-| iyi's own prelude | 5,292 lines, ceiling 3,734 |
+| iyi's own prelude | 5,296 lines, ceiling 3,734 |
 | compiler | 84,068 lines, none of it written in iyi |
 | artifact format | `.iyimod` v19, checksum per section |
 | samples | 9, of which 5 rebuild from artifacts with their modules' source deleted |
@@ -88,7 +88,7 @@ shape.
 > is a library and the rules are the language, so a program can keep one and
 > change the other: `--crystal` builds against Crystal's standard library, and
 > there `require` reaches the ecosystem while every rule stays where it was.
-> "No standard library worth the name" is still true of iyi's own 5,292 lines
+> "No standard library worth the name" is still true of iyi's own 5,296 lines
 > and no longer true of what a program can have. Part V item 12a is the
 > measurement, nine shards wide.
 
@@ -270,7 +270,7 @@ of binary. It is not made the default on that trade, and the middle needs the
 initialisers to run *later* rather than not at all, which is the `dlsym` table
 above, and a larger piece of work than the number it wins.
 
-**3. A deliberately tiny prelude, written in iyi. Done: 5,292 lines,
+**3. A deliberately tiny prelude, written in iyi. Done: 5,296 lines,
 primitives included.** Not a standard library: integers, booleans, a string,
 one sequence, one dictionary, one range, `puts`. **Its scope is set by what the
 samples call and by nothing else**. A method enters the prelude because an
@@ -792,7 +792,7 @@ Checking it moved two things and left the shape alone.
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
 | Compiler | 24,984 lines, **written in Crystal** | 102,805 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 5,292-line own prelude + 777 in samples |
+| Library | 8,161 lines (3,551 of it core) | 5,296-line own prelude + 777 in samples |
 | Specs | 21,146 lines | 9,064 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
@@ -7567,16 +7567,31 @@ Named honestly, so nobody mistakes this draft for complete.
     Linux's bump allocator over fresh `mmap` pages hands back zeroed memory. It
     cannot be that on its own, because the POSIX path allocates atomically with
     plain `malloc`, which does not clear either, and macOS has never printed
-    anything but the right answer. What macOS may be doing is getting zeroed
-    pages by luck in a fresh process, which would make this a latent assumption
-    everywhere and a visible defect only where the CRT has already dirtied the
-    heap — but that is a hypothesis, not a measurement, and the next step is to
-    find the read rather than to guess at the allocator again.
+    anything but the right answer.
 
-    So Windows is not a run target. What CI keeps is a twenty-run watch that
-    always passes and prints the tally — right, wrong, crashed — so the numbers
-    are in every build's log. There is nothing to gate: no property of running
-    an iyi program on Windows currently holds twenty times out of twenty.
+    **The wild write has a name now, and it was found on Linux.** The
+    prelude's own `memset` — the definition that intercepts the `memset`
+    calls codegen's `llvm.memset` lowers to — advanced its `Pointer(UInt64)`
+    by 8, eight *elements*, 64 bytes, while its counter recorded 8. Every
+    runtime-sized clear wrote one word in eight far past its count and left
+    seven of eight bytes dirty. That is both symptoms in one defect: an
+    atomic allocation "cleared" at one-eighth coverage prints the memory it
+    was never given, and the seven-out-of-eight overwrite past the count is
+    a wild write into whatever neighbours the allocation — on Windows a
+    packed `HeapAlloc` heap with metadata beside the chunks, which is
+    `0xC0000005`. It also says why the platforms differ: darwin never
+    defines its own `memset`, so libSystem's correct one answered there;
+    Linux's bump allocator hid the overwrite in the untouched zero tail of
+    its own mapping until the collector's arena gate burned a full region
+    and found it; Windows had neighbours to trample from the first
+    allocation. Fixed with the collector's merge, all three copies.
+
+    So Windows is still not a run target, but the claim has a suspect fixed
+    and a probe with teeth: the twenty-run watch now runs the two shapes
+    50,000 times, self-checked, so a packed-heap trample is probable rather
+    than lucky. There is nothing to gate until several builds in a row read
+    twenty right and nothing else; the day they do, this paragraph and the
+    README both move.
 
     **wasm32-wasi had the same shape of defect and a smaller fix.** The module
     imports four `wasi_snapshot_preview1` functions and nothing else, and it
@@ -7730,7 +7745,7 @@ Named honestly, so nobody mistakes this draft for complete.
     shards exist and none of them is written to iyi's rules, so "run them
     directly" is not a compatibility problem, it is the four rules: `require`
     against R-1, inference against R-2, monkey patching against R-3, and
-    Crystal's 8,161-line standard library against iyi's own 5,292-line prelude.
+    Crystal's 8,161-line standard library against iyi's own 5,296-line prelude.
 
     What is measurable is narrower and better than that framing suggests, and
     it was measured on **Kemal 1.12.0**, which compiles under this compiler

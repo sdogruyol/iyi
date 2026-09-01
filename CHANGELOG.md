@@ -949,7 +949,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,292 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,296 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2458,7 +2458,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,292-line library and nothing else. Every other
+  written against iyi's own 5,296-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

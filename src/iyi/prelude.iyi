@@ -480,10 +480,12 @@ require "./file"
     # The flag reaches POSIX and stops there, which is deliberate rather than
     # unfinished. Linux binds it over raw syscalls and darwin over libSystem,
     # the two interfaces this file already calls the platform's own. win32 and
-    # wasm32 keep the allocators they have under the flag: win32 has an open
-    # diagnosis for printing memory it was never given, and a new allocator
-    # landing there in the same change would confound that evidence; wasm32
-    # has no mmap, and its watermark arena is a separate design.
+    # wasm32 keep the allocators they have under the flag: win32's diagnosis
+    # for printing memory it was never given now has a fixed suspect — the
+    # memset stride defect recorded at that definition below — and the watch
+    # in CI is what retires it, not a new allocator landing in the same
+    # change; wasm32 has no mmap, and its watermark arena is a separate
+    # design.
     #
     # Requests are rounded to size classes: 16, 32, 64 and doubling to 1 MiB,
     # seventeen classes. A small fixed set is what keeps allocation and free
@@ -1909,9 +1911,11 @@ require "./file"
     # bound because nothing frees, and a program that outlives its memory is
     # what allocating without collecting asks for. `-Dgc_iyi` does not reach
     # this branch, deliberately rather than unfinished: the size-class arena
-    # allocator is POSIX-only in its stage, because this target has an open
-    # diagnosis for printing memory it was never given and a new allocator
-    # landing in the same change would confound that evidence.
+    # allocator is POSIX-only in its stage. This target's diagnosis for
+    # printing memory it was never given has a fixed suspect — the memset
+    # below strode eight elements per eight bytes, trampling `HeapAlloc`'s
+    # packed neighbours and clearing at one-eighth coverage — and CI's
+    # twenty-run watch is what retires the diagnosis, not a new allocator.
     # Same reason as the block above: an LLVM-emitted object names no library
     # for itself, so the three heap functions have to name theirs.
     @[Link("kernel32")]
