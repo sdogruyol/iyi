@@ -713,6 +713,14 @@ require "./file"
       # list was quadratic, seconds per collection where the arithmetic
       # says microseconds.
       FREE_FLAG = 4_u64
+      # Bit 3: this allocation is atomic — the caller promised it holds no
+      # pointers, which is what `__crystal_malloc_atomic64` means on every
+      # allocator. The mark loop honours it the way Boehm honours
+      # `GC_malloc_atomic`: an atomic object with no layout is blackened
+      # and never word-scanned, because scanning it is where a 32 MiB
+      # `Array(Int32)` buffer turned every triggered collection into 20 ms
+      # of `base_of` on integers.
+      ATOMIC_FLAG = 8_u64
       LARGE_USER = 40_u64
 
       OFF_NEXT = 0_u64
@@ -771,7 +779,7 @@ require "./file"
         # cannot sweep the object about to be born, because it does not
         # exist yet, and everything already born is reachable or fair game.
         IyiMark.pressure(size)
-        return take_large(size) if size > TOP
+        return take_large(size, clear) if size > TOP
         index = class_index(size)
         table = directory
         head = table[index]
@@ -779,14 +787,18 @@ require "./file"
           table[index] = read64(head)
           # The type id and the mark word go first, on both paths: they are
           # the collector's words rather than the caller's, and a stale one
-          # is a live object the mark loop misses.
+          # is a live object the mark loop misses. `clear` is the atomic
+          # question worn the other way: the path that does not clear is
+          # exactly the path whose caller promised no pointers.
           write64(head + OFF_TYPE, 0_u64)
-          write64(head + OFF_MARK, 0_u64)
+          write64(head + OFF_MARK, clear ? 0_u64 : ATOMIC_FLAG)
           clear_block(head + HEADER, payload(index)) if clear
           write64(head + OFF_SIZE, size)
           return head
         end
-        carve(table, size, index)
+        head = carve(table, size, index)
+        write64(head + OFF_MARK, ATOMIC_FLAG) unless clear
+        head
       end
 
       def self.carve(table : Pointer(UInt64), size : UInt64, index : Int32) : UInt64
@@ -814,12 +826,13 @@ require "./file"
         base
       end
 
-      def self.take_large(size : UInt64) : UInt64
+      def self.take_large(size : UInt64, clear : Bool) : UInt64
         mapped = size + LARGE_USER
         base = __iyi_mmap(mapped).address
         write64(base + OFF_NEXT, @@large)
         write64(base + OFF_MAP, mapped)
         write64(base + 16 + OFF_SIZE, size)
+        write64(base + 16 + OFF_MARK, ATOMIC_FLAG) unless clear
         @@large = base
         base + 16
       end
@@ -863,16 +876,20 @@ require "./file"
       # place that knows it. The new chunk's type id stays zero, which is
       # right: a reallocated buffer is raw memory whose old map, if it had
       # one, described a different number of bytes, and zero means the mark
-      # loop word-scans it conservatively instead.
+      # loop word-scans it conservatively instead. The ATOMIC promise does
+      # travel: the caller's "no pointers in here" is about the data, and
+      # the data is what the copy carries — dropping the flag on growth is
+      # how an `Array(Int32)` buffer got word-scanned at every doubling.
       def self.realloc(pointer : Void*, size : UInt64) : Void*
         return alloc(size) if pointer.address == 0
         head = pointer.address - HEADER
         old_size = read64(head)
+        atomic = read64(head + OFF_MARK) & ATOMIC_FLAG != 0
         if old_size <= TOP && size <= TOP && class_index(old_size) == class_index(size)
           write64(head + OFF_SIZE, size)
           return pointer
         end
-        new_pointer = alloc(size)
+        new_pointer = Pointer(Void).new(take(size, !atomic) + HEADER)
         source = pointer.as(Pointer(UInt8))
         destination = new_pointer.as(Pointer(UInt8))
         limit = old_size < size ? old_size : size
@@ -885,8 +902,6 @@ require "./file"
         new_pointer
       end
 
-      # The whole payload, word at a time: pointer arithmetic counts
-      # elements here, so eight bytes is one step, not eight.
       def self.clear_block(start : UInt64, count : UInt64) : Nil
         words = Pointer(UInt64).new(start)
         filled = 0_u64
@@ -1658,9 +1673,13 @@ require "./file"
 
       # Scan one object's payload and blacken it. With a layout, the scan is
       # exactly the pointer offsets the compiler wrote down — an integer
-      # field holding something address-shaped retains nothing. Without one
-      # (a buffer, a closure environment, an id the table does not carry),
-      # the bound is the size the header carries, which is the requested
+      # field holding something address-shaped retains nothing. An atomic
+      # allocation with no layout is blackened and never opened: its caller
+      # promised it holds no pointers, and honouring that promise is where
+      # a 32 MiB `Array(Int32)` buffer stopped costing 20 ms of `base_of`
+      # per collection. Everything else without a layout (a pointer-bearing
+      # buffer, a closure environment, an id the table does not carry)
+      # word-scans to the size the header carries, which is the requested
       # size rather than the chunk's: the bytes past the request belong to
       # the caller only through a later realloc, and scanning them would
       # read whatever the last owner left.
@@ -1668,12 +1687,14 @@ require "./file"
         type_id = IyiHeap.read64(base - 16_u64) & 0xFFFFFFFF_u64
         entry = layout_entry(type_id)
         if entry == 0
-          size = IyiHeap.read64(base - IyiHeap::HEADER)
-          cursor = base
-          limit = base + size
-          while cursor + 8_u64 <= limit
-            shade(IyiRoots.base_of(IyiHeap.read64(cursor)))
-            cursor = cursor + 8_u64
+          unless IyiHeap.read64(base - 8_u64) & IyiHeap::ATOMIC_FLAG != 0
+            size = IyiHeap.read64(base - IyiHeap::HEADER)
+            cursor = base
+            limit = base + size
+            while cursor + 8_u64 <= limit
+              shade(IyiRoots.base_of(IyiHeap.read64(cursor)))
+              cursor = cursor + 8_u64
+            end
           end
         else
           table = layouts_table

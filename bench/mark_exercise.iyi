@@ -146,8 +146,14 @@
     end
   end
 
+  # A pointer-element buffer, because these are the exercise's graph nodes
+  # and `link` writes addresses into them. A `Pointer(UInt8)` buffer is an
+  # *atomic* allocation — its caller promises no pointers — and the marker
+  # honours that promise by never opening one, exactly as Boehm never scans
+  # `GC_malloc_atomic` memory. A graph built in atomic nodes is invisible
+  # past its roots, under either collector.
   def fresh(size : UInt64) : UInt64
-    Pointer(UInt8).malloc(size).address
+    Pointer(Pointer(Void)).malloc(size.unsafe_div(8_u64)).address
   end
 
   def link(parent : UInt64, slot : UInt64, child : UInt64) : Nil

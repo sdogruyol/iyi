@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The header says atomic, and the default-flip question has its
+  numbers.** `bench/gc_default.py` is the measurement the collector's
+  record demanded before any default moves: the same programs, iyi's own
+  prelude, three allocators, time and peak RSS. The first reading found a
+  real defect — the live-set row ran ten times slower under `-Dgc_iyi`
+  than under the bump pointer, because the header had no way to say
+  *atomic*: a 32 MiB `Array(Int32)` buffer, allocated through
+  `__crystal_malloc_atomic64` on the promise it holds no pointers, was
+  word-scanned at every triggered collection, twenty milliseconds of
+  `base_of` on integers. `ATOMIC_FLAG` is mark-word bit 3, set exactly
+  where `clear` is false — the not-clearing path and the no-pointers
+  promise are the same path — carried across `realloc` with the data the
+  promise is about, and honoured by the marker the way Boehm honours
+  `GC_malloc_atomic`: blackened, never opened. The row fell from 0.187 s
+  to 0.017 s, level with the bump pointer.
+
+  The table after the fix, best of five, worst peak RSS: the owned
+  collector wins or ties every time column — churn at 0.048 s against
+  the bump pointer's 0.125 s and Boehm's 0.091 s — and holds RSS at the
+  live set (15–34 MiB) where the bump pointer holds it at the garbage
+  (551–767 MiB). The flip stays a decision for a release of its own;
+  what the table changes is that the evidence now argues for it.
+  `mark_exercise`'s graph nodes moved to pointer-element buffers on the
+  way, because a graph built in atomic nodes is invisible past its roots
+  under either collector — the exercise was leaning on the scan the
+  promise forbids.
+
 ## 0.7.0 — 2026-09-01
 
 **The language owns a collector, and it runs itself.** Behind `-Dgc_iyi`,
@@ -1050,7 +1081,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,517 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,538 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2559,7 +2590,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,517-line library and nothing else. Every other
+  written against iyi's own 5,538-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

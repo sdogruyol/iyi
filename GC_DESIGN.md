@@ -54,6 +54,26 @@ mark word's FREE flag: the free-list walk this design called "fine until a
 profile asks" made every sweep quadratic the day one did, 106 seconds of
 exercise against 0.1 after the flag.
 
+The default-allocator question now has its measurement (`bench/gc_default.py`,
+release builds, best of five, worst peak RSS of the same five):
+
+| workload | default (bump) | `-Dgc_iyi` | `-Dgc_boehm` |
+|---|---|---|---|
+| arithmetic (no allocation) | 0.038 s / 15 MiB | 0.039 s / 15 MiB | 0.046 s / 15 MiB |
+| live set (8M-element array) | 0.018 s / 66 MiB | 0.017 s / 84 MiB | 0.018 s / 74 MiB |
+| churn (512 MiB, ~64 B live) | 0.125 s / 551 MiB | **0.048 s / 15 MiB** | 0.091 s / 15 MiB |
+| string churn (40k rebuilds) | 0.387 s / 767 MiB | **0.218 s / 34 MiB** | 0.257 s / 15 MiB |
+
+The owned collector wins or ties every time column and holds RSS at the live
+set where the bump pointer holds it at the garbage. The first reading was not
+this one: the live-set row started at 0.187 s, ten times the bump pointer,
+and the cause was the header having no way to say *atomic* — a 32 MiB
+`Array(Int32)` buffer was word-scanned at every triggered collection.
+`ATOMIC_FLAG` (mark-word bit 3, set where `clear` is false, carried across
+`realloc`) is the fix, and it is Boehm's own contract: `GC_malloc_atomic`
+memory is never opened. The flip itself stays a decision for a release of
+its own; what this table changes is that the evidence now argues for it.
+
 Stage 1: the artifact carries a pointer map per type it owns (`.iyimod` format
 v43, `Layouts` section 64), and the object header and its CAS-safe mark word
 exist and are tested as a unit. Stage 1's own tasks 3 and 4, work distribution
