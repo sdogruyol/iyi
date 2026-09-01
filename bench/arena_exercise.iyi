@@ -133,6 +133,13 @@ verify(nothing, 64, 9, "realloc of null")
 puts "realloc: same-class, cross-class and null all hold their bytes"
 
 {% if flag?(:gc_iyi) %}
+  # The allocation-pressure trigger is off for this exercise: it
+  # choreographs colours and free lists across explicit collections,
+  # and a string interpolation running a collection mid-check would be
+  # the trigger working, measured as a flake.
+  # bench/collect_trigger.sh is where the trigger itself is proven.
+  IyiMark.auto = false
+
   # --- Size classes: a request lands in its class, and the class is the payload ---
   requests = [1, 15, 16, 17, 4095, 4096]
   expected = [16, 16, 16, 32, 4096, 4096]

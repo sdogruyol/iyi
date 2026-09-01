@@ -4,6 +4,42 @@
 
 ### Added
 
+- **The collector runs itself: allocation pressure triggers a collection.**
+  Until now every collection was a call the exercises made, which is a verb,
+  not a collector. `IyiHeap.take` — the one funnel every `-Dgc_iyi`
+  allocation passes through — now reports each request's size, and when the
+  bytes allocated since the last collection cross the budget, one runs,
+  before the carve, so the object about to be born cannot be swept while it
+  has no root. The budget after a collection is twice what survived it,
+  floored at a MiB: a program whose live set is L pays one collection per L
+  bytes of garbage — the amortised O(1) every tracing collector prices at —
+  and a program that never crosses a MiB never pays at all.
+  `IyiMark.auto = false` is the door the phase exercises use, the same
+  switch Boehm spells `GC_disable`, because a test choreographing colours
+  cannot have a string interpolation's allocation collecting mid-check.
+
+  The trigger's steady state found the sweep's quadratic. The freed-chunk
+  check was a walk of the class's free list — the design's own comment
+  called the O(1) form "not a thing to build before a profile asks" — and
+  the first run of the trigger exercise took 106 seconds, one long free
+  list walked once per chunk per sweep. The check is now one load: `free`
+  sets a FREE flag in the chunk's own mark word (bit 2, the flags the
+  header reserved), `take` clears it with the mark word it already zeroes,
+  and the same exercise runs in 0.1 seconds.
+
+  `bench/collect_trigger.sh` is the gate, and nobody in it calls
+  `collect`: a quarter MiB of churn triggers nothing, 64 MiB triggers
+  collections and the heap stays at three arenas with a rooted survivor's
+  bytes intact, the same churn against a 4 MiB live set collects an eighth
+  as often, and a parked fiber's only reference lives through the pressure
+  — the fiber-stack walk carrying weight under a trigger it cannot see
+  coming. Two failure proofs: the pressure report removed leaks by name,
+  and a budget pinned to the floor fails the growth check. A speed step
+  keeps the quadratic from returning. And the collector's gates are in CI
+  now — found unwired while adding this one: all five merged green on the
+  machine that built them and none was named in the workflow, which is the
+  exact defect the workflow exists to prevent.
+
 - **The marker reads the map: precise where the header names a type,
   conservative everywhere else.** The two halves the record said were
   next, built together because each is what makes the other reachable.
@@ -987,7 +1023,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,441 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,517 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2496,7 +2532,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,441-line library and nothing else. Every other
+  written against iyi's own 5,517-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

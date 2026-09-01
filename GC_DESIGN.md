@@ -40,7 +40,19 @@ safe direction: a false positive retains a dead object, only a false
 negative frees a live one. `bench/mark_exercise.sh` proves the precision
 differentially and proves the check fails when the lookup is disabled.
 
-Nothing sweeps. This stage decides what is garbage; Stage 6 reclaims it.
+Stage 6 sweeps what this stage decided, and the collector runs *itself*: an
+allocation-pressure trigger in the allocator's one funnel runs a collection
+when the bytes allocated since the last one cross the budget, and the budget
+after each collection is twice what survived it, floored at a MiB — churn
+against a small live set collects often, against a big one rarely, and a
+program under a MiB never pays. `bench/collect_trigger.sh` proves it with
+nobody calling `collect`: the heap stays bounded, a rooted survivor and a
+parked fiber's only reference both live through triggered collections, and
+the checks fail when the trigger or the budget growth is removed. The
+trigger's steady state is also what turned the freed-chunk check into the
+mark word's FREE flag: the free-list walk this design called "fine until a
+profile asks" made every sweep quadratic the day one did, 106 seconds of
+exercise against 0.1 after the flag.
 
 Stage 1: the artifact carries a pointer map per type it owns (`.iyimod` format
 v43, `Layouts` section 64), and the object header and its CAS-safe mark word
@@ -54,13 +66,13 @@ by their own mapping and released with `munmap`, and the two properties Stage 3
 needs: a pointer resolves to its arena and class, and the arena list walks. It
 costs no symbol and no library beyond `munmap`, so the dependency floor holds.
 
-What none of it does yet: no object is allocated with the header, nothing marks,
-nothing collects, and nothing calls `free` except the exercise. `-Dgc_boehm` is
-still the only way to get collection and every default path still allocates and
-never frees. Windows and wasm32 keep their existing allocators on purpose, the
-first because its binaries currently print uninitialized memory and a new
-allocator there would confound that diagnosis, the second because it has no
-mmap and its watermark arena is a separate design.
+What it does not do yet: collection is opt-in behind `-Dgc_iyi`, and moving
+the default is a measurement and a decision, not a side effect. Windows and
+wasm32 keep their existing allocators — the first's memory diagnosis now has
+a fixed suspect (the prelude memset's stride) and CI's watch is what retires
+it, the second has no mmap and its watermark arena is a separate design.
+Threads, and with them Stages 4, 7, 8 and 9, wait where the section below
+says they wait.
 
 ## What the staging above got wrong, and what the rebase onto 0.6.0 corrected
 

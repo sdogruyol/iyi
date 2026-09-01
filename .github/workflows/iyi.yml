@@ -254,6 +254,21 @@ jobs:
       - name: A defer costs nanoseconds, and stays priced
         run: bash bench/defer_cost.sh
 
+      # The collector's own gates (GC_DESIGN.md Stages 2, 3, 5, 6 and the
+      # allocation-pressure trigger). Each drives its exercise plain and
+      # optimised, audits what the `-Dgc_iyi` binary asks the machine for,
+      # and proves its checks can fail. Found unwired while building the
+      # trigger: the collector merged with these gates green on the machine
+      # that built it and none of them named in this file — which is the
+      # exact defect this file exists to prevent.
+      - name: The collector holds, all five gates
+        run: |
+          bash bench/arena_exercise.sh
+          bash bench/root_exercise.sh
+          bash bench/mark_exercise.sh
+          bash bench/sweep_exercise.sh
+          bash bench/collect_trigger.sh
+
       # The rebuild loop, held: cheap on both arms, and the artifact
       # read inside its band — the corrected prediction is in SPEC.md.
       - name: The edit-rebuild loop stays cheap

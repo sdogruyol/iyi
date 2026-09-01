@@ -704,6 +704,15 @@ require "./file"
       OFF_SIZE = 0_u64
       OFF_TYPE = 8_u64
       OFF_MARK = 16_u64
+      # Bit 2 of the mark word: this chunk is on its class's free list. Set
+      # by `free`, cleared with the whole mark word when `take` hands the
+      # chunk back out, and what makes "is this chunk free?" one load
+      # instead of a walk of the class's list — the O(1) form the root
+      # walk's comment said Stage 6 could add when a profile asked. The
+      # trigger's steady state asked: a sweep over a heap with a long free
+      # list was quadratic, seconds per collection where the arithmetic
+      # says microseconds.
+      FREE_FLAG = 4_u64
       LARGE_USER = 40_u64
 
       OFF_NEXT = 0_u64
@@ -758,6 +767,10 @@ require "./file"
       end
 
       def self.take(size : UInt64, clear : Bool) : UInt64
+        # The pressure report, before the carve: a collection triggered here
+        # cannot sweep the object about to be born, because it does not
+        # exist yet, and everything already born is reachable or fair game.
+        IyiMark.pressure(size)
         return take_large(size) if size > TOP
         index = class_index(size)
         table = directory
@@ -818,6 +831,7 @@ require "./file"
         if size <= TOP
           index = class_index(size)
           table = directory
+          write64(head + OFF_MARK, read64(head + OFF_MARK) | FREE_FLAG)
           write64(head, table[index])
           table[index] = head
         else
@@ -1038,8 +1052,9 @@ require "./file"
     #    suspended fiber from its saved stack pointer to its stack top.
     #    This was a recorded gap between 0.4.0's scheduler landing and
     #    this walk: an object reachable only from a parked fiber's stack
-    #    would have been freed live, latent only because nothing but the
-    #    exercises triggers a collection.
+    #    would have been freed live — latent then because only the
+    #    exercises collected, and closed before the allocation-pressure
+    #    trigger made any allocation a collection point.
     #
     # What is NOT here, for the same reason: nothing suspends a thread. Stage
     # 4's `SIGSTOP` on Linux and Mach `thread_suspend` on darwin stop threads
@@ -1376,11 +1391,11 @@ require "./file"
       # list was handed out and given back, and reporting it live would keep
       # a dead object alive forever, since nothing would ever free it twice.
       #
-      # The free-list walk is linear in the chunks freed for that one class,
-      # and it is only reached by a word that already landed inside an arena,
-      # which a word that is not a pointer almost never does. A per-arena
-      # allocation bitmap is the O(1) form and it is Stage 6's to add if
-      # sweeping wants one, not a thing to build before a profile asks.
+      # The freed check is one load — the FREE flag in the chunk's own mark
+      # word. It began as a walk of the class's free list, which the comment
+      # here called fine "before a profile asks": the trigger's steady state
+      # asked, a long free list made every sweep quadratic, and the flag is
+      # the per-chunk bit the same comment predicted.
       def self.base_of(word : UInt64) : UInt64
         return 0_u64 if word == 0
         candidate = Pointer(Void).new(word)
@@ -1398,13 +1413,15 @@ require "./file"
         0_u64
       end
 
+      # One load: `IyiHeap.free` set the flag when the chunk went on its
+      # list and `take` zeroes the mark word when it comes back off. The
+      # list walk this used to be was linear in the chunks freed for the
+      # class, which made the sweep over them quadratic once the trigger
+      # gave every steady-state heap a long free list. The `chunk`
+      # parameter stays: a caller that knows the stride names it, and the
+      # signature is the check's identity in the gates that break it.
       def self.free_listed?(head : UInt64, chunk : UInt64) : Bool
-        node = IyiHeap.directory[IyiHeap.class_index(chunk - IyiHeap::HEADER)]
-        while node != 0
-          return true if node == head
-          node = IyiHeap.read64(node)
-        end
-        false
+        IyiHeap.read64(head + IyiHeap::OFF_MARK) & IyiHeap::FREE_FLAG != 0
       end
 
       # Every 8-aligned word in [low, high), with the ones that validate
@@ -1550,6 +1567,7 @@ require "./file"
       @@swept : UInt64 = 0_u64
       @@kept : UInt64 = 0_u64
       @@bytes_freed : UInt64 = 0_u64
+      @@bytes_kept : UInt64 = 0_u64
       @@collections : UInt64 = 0_u64
 
       def self.colour(base : UInt64) : UInt64
@@ -1739,6 +1757,7 @@ require "./file"
         @@swept = 0_u64
         @@kept = 0_u64
         @@bytes_freed = 0_u64
+        @@bytes_kept = 0_u64
 
         arena = IyiHeap.first_arena
         while arena != 0
@@ -1753,6 +1772,7 @@ require "./file"
                 @@swept = @@swept + 1_u64
                 IyiHeap.free(Pointer(Void).new(base))
               else
+                @@bytes_kept = @@bytes_kept + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
                 recolour(base, WHITE)
                 @@kept = @@kept + 1_u64
               end
@@ -1771,6 +1791,7 @@ require "./file"
             @@swept = @@swept + 1_u64
             IyiHeap.free(Pointer(Void).new(base))
           else
+            @@bytes_kept = @@bytes_kept + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
             recolour(base, WHITE)
             @@kept = @@kept + 1_u64
           end
@@ -1780,10 +1801,61 @@ require "./file"
         @@collections = @@collections + 1_u64
       end
 
-      # One collection: decide, then reclaim.
+      # The allocation-pressure trigger — what makes this a collector rather
+      # than a verb the exercises call. `IyiHeap.take` reports every
+      # allocation's requested size here, and when the bytes allocated since
+      # the last collection cross the budget, one collection runs — *before*
+      # the carve, so the object about to be born cannot be swept while it
+      # has no root. The budget after a collection is twice what survived
+      # it, floored at a MiB: a program whose live set is L pays one
+      # collection per L bytes of garbage, which is the amortised O(1) every
+      # tracing collector prices at, and a program that never crosses a MiB
+      # never pays at all. The guard is against re-entry: nothing in mark or
+      # sweep allocates from this heap (the queue is its own mapping), and
+      # the flag is what keeps that a fact the trigger does not depend on.
+      #
+      # `auto = false` is the phase exercises' door: a test choreographing
+      # colours across explicit collections cannot have a string
+      # interpolation's allocation running one in the middle. It is the same
+      # switch Boehm spells GC_disable, and a program that turns it off owns
+      # its own memory until it turns it back on.
+      MIN_BUDGET = 1048576_u64
+
+      @@allocated_since : UInt64 = 0_u64
+      @@budget : UInt64 = 0_u64
+      @@collecting : Bool = false
+      @@auto : Bool = true
+
+      def self.auto=(value : Bool) : Nil
+        @@auto = value
+      end
+
+      def self.pressure(size : UInt64) : Nil
+        return if @@collecting
+        @@allocated_since = @@allocated_since + size
+        return unless @@auto
+        budget = @@budget
+        budget = MIN_BUDGET if budget == 0
+        return if @@allocated_since < budget
+        @@collecting = true
+        collect
+        @@collecting = false
+      end
+
+      # One collection: decide, reclaim, and set the next budget. Explicit
+      # calls reset the pressure clock too — a collection is a collection,
+      # whoever asked for it.
       def self.collect : Nil
         mark
         sweep
+        @@allocated_since = 0_u64
+        doubled = @@bytes_kept * 2_u64
+        @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
+      end
+
+      def self.budget : UInt64
+        budget = @@budget
+        budget == 0 ? MIN_BUDGET : budget
       end
 
       # What the last sweep did. GC_DESIGN.md Stage 6 asks for statistics and
@@ -1801,6 +1873,10 @@ require "./file"
 
       def self.bytes_freed : UInt64
         @@bytes_freed
+      end
+
+      def self.bytes_kept : UInt64
+        @@bytes_kept
       end
 
       def self.collections : UInt64

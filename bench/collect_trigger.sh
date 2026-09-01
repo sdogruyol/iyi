@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# The allocation-pressure trigger, driven. Runs the trigger exercise plain
+# and optimised, checks it reached its last line, and proves the checks fail
+# in the two directions that matter: a heap where nothing triggers, and a
+# budget that never grows with the live set.
+#
+#   bash bench/collect_trigger.sh
+#
+# Needs `make` first. Exits non-zero if any step fails.
+
+set -u
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+IYI="$REPO/bin/iyi"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+status=0
+
+run_case() {
+  local label="$1" name="$2"
+  shift 2
+  if ! "$IYI" build "$@" -o "$WORK/$name" "$REPO/bench/collect_trigger.iyi" \
+       >"$WORK/$name.build.log" 2>&1; then
+    echo "$label: build failed"
+    sed -n '1,12p' "$WORK/$name.build.log"
+    status=1
+    return 1
+  fi
+  "$WORK/$name" >"$WORK/$name.out" 2>&1
+  local exit_code=$?
+  sed 's/^/  /' "$WORK/$name.out"
+  if [ "$exit_code" -ne 0 ]; then
+    echo "$label: exited $exit_code"
+    status=1
+    return 1
+  fi
+  return 0
+}
+
+echo "== the exercise, -Dgc_iyi"
+run_case "the exercise" trigger -Dgc_iyi
+if ! grep -q "all trigger checks passed" "$WORK/trigger.out" 2>/dev/null; then
+  echo "  MISSING: the exercise did not reach the end"
+  status=1
+fi
+
+echo
+echo "== every check reported"
+for phrase in quiet trigger bounded_or_budget fiber; do
+  case "$phrase" in
+    bounded_or_budget) grep -q "budget:" "$WORK/trigger.out" || { echo "  MISSING: budget"; status=1; } ;;
+    *) grep -q "$phrase:" "$WORK/trigger.out" || { echo "  MISSING: $phrase"; status=1; } ;;
+  esac
+done
+[ "$status" -eq 0 ] && echo "  quiet, trigger, budget and fiber all reported"
+
+echo
+echo "== the same program with optimisation on"
+run_case "release" trigger-release -Dgc_iyi --release
+if ! grep -q "all trigger checks passed" "$WORK/trigger-release.out" 2>/dev/null; then
+  echo "  MISSING: the optimised build did not reach the end"
+  status=1
+fi
+
+echo
+echo "== the same program without the flag"
+run_case "no flag" trigger-noflag
+
+echo
+echo "== the exercise is fast enough to be a gate"
+# The first run of this exercise took 106 seconds, because the freed check
+# was a free-list walk and the trigger's steady state made every sweep
+# quadratic. The FREE flag made it one load; this step is what keeps that
+# from quietly regressing. Ten seconds is fifty times the measured 0.2 and
+# far under the quadratic's 100.
+started="$(date +%s)"
+"$WORK/trigger" > /dev/null 2>&1
+elapsed="$(( $(date +%s) - started ))"
+if [ "$elapsed" -gt 10 ]; then
+  echo "  the exercise took ${elapsed}s, so a sweep or the freed check has gone quadratic again"
+  status=1
+else
+  echo "  ${elapsed}s for 132 MiB of churn and its collections"
+fi
+
+echo
+echo "== the checks fail when the trigger is broken"
+prove_fails() {
+  local label="$1" dir="$2" phrase="$3" script="$4"
+  mkdir -p "$WORK/$dir/iyi"
+  cp -R "$REPO/src/iyi/." "$WORK/$dir/iyi/"
+  awk "$script" "$REPO/src/iyi/prelude.iyi" > "$WORK/$dir/iyi/prelude.iyi"
+  if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build -Dgc_iyi \
+       -o "$WORK/$dir/program" "$REPO/bench/collect_trigger.iyi" \
+       >"$WORK/$dir/build.log" 2>&1; then
+    echo "  $label: the patched prelude did not build"
+    sed -n '1,12p' "$WORK/$dir/build.log"
+    status=1
+    return
+  fi
+  "$WORK/$dir/program" >"$WORK/$dir/out" 2>&1
+  local exit_code=$?
+  if [ "$exit_code" -eq 0 ]; then
+    echo "  $label: the exercise still passed, so it does not test this"
+    status=1
+    return
+  fi
+  if ! grep -q "$phrase" "$WORK/$dir/out"; then
+    echo "  $label: failed, but not at the expected check"
+    sed -n '$p' "$WORK/$dir/out"
+    status=1
+    return
+  fi
+  printf '  %s: exits %s at "%s"\n' "$label" "$exit_code" \
+    "$(grep -m1 "$phrase" "$WORK/$dir/out" | sed 's/^iyi: panic: //')"
+}
+
+# The pressure report removed from the hot path: nothing ever triggers, and
+# the churn's check names the leak.
+prove_fails "nothing triggers" notrigger "trigger:" \
+  '{ sub(/IyiMark\.pressure\(size\)/, "# removed"); print }'
+
+# The budget pinned at the floor: the live set stops mattering, and the same
+# churn buys the same collections either way.
+prove_fails "budget never grows" nogrow "budget:" \
+  '{ sub(/@@budget = doubled < MIN_BUDGET \? MIN_BUDGET : doubled/, "@@budget = MIN_BUDGET"); print }'
+
+echo
+if [ "$status" -eq 0 ]; then
+  echo "Trigger: collections come from allocation pressure alone, the heap"
+  echo "stays bounded, the budget grows with what survives, a parked fiber's"
+  echo "reference lives through it, and the checks fail when the trigger is"
+  echo "broken."
+else
+  echo "Trigger: something above failed."
+fi
+exit "$status"
