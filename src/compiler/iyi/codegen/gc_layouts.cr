@@ -26,6 +26,13 @@ require "./codegen"
 # neither.
 class Iyi::Program
   def iyi_gc_arena? : Bool
+    # Own-prelude builds only: a `--crystal` program allocates through
+    # Boehm, its types include the standard library's own lowerings, and
+    # both halves of this gate would be wrong there — the layout walk
+    # crashes on shapes the arena never allocates, and the id store would
+    # scribble into Boehm's heap. CI taught this line by turning every
+    # crystal-mode build red the first time the predicate forgot it.
+    return false unless iyi_prelude?
     return false if has_flag?("gc_boehm") || has_flag?("gc_none")
     (has_flag?("linux") && (has_flag?("x86_64") || has_flag?("aarch64"))) ||
       has_flag?("darwin")
