@@ -1,0 +1,13 @@
+# Breaks R-1: a module is the unit of compilation and `import` forms a DAG, so
+# the graph has to be acyclic for anything else to hold. A cycle has no
+# initialisation order, since a module initialises after every module it
+# imports and here each would have to follow the other, and the acyclicity is
+# also what makes at most one module able to define any given impl. `dep/loop_a`
+# and `dep/loop_b` import each other.
+module diagnostics/r1_import_cycle
+
+import dep/loop_a
+
+using dep/loop_a
+
+puts a

@@ -1,0 +1,179 @@
+---
+import Page from "../layouts/Page.astro";
+import Measure from "../components/Measure.astro";
+import Stamped from "../components/Stamped.astro";
+import facts from "../generated/facts.json";
+
+const bin = facts.recorded.hello_binary;
+const lib = facts.recorded.library_size;
+
+const massRatio = bin.crystal.kb / bin.iyi.kb;
+const crystalSide = 216;
+const iyiSide = crystalSide / Math.sqrt(massRatio);
+---
+
+<Page
+  title="Why iyi"
+  summary="Four things, one rule. Developer, agentic, portability, performance and efficiency, each with the measurement that stands behind it."
+>
+  <section class="spread hero">
+    <div class="to-wide">
+      <p class="label">Why</p>
+      <h1>Four things, and one rule behind all of them.</h1>
+      <p class="lede">
+        Developer experience, agentic experience, portability, performance and
+        efficiency are one design decision seen from four sides. A module is the
+        unit of compilation and it is compiled against its dependencies'
+        declarations, never their bodies. So a build reads less, a program
+        carries less, a tool can read an interface without a repository, and a
+        person waits less. Everything below is that rule and what it costs.
+      </p>
+    </div>
+  </section>
+
+  <section class="spread band">
+    <div class="to-wide">
+      <hr class="rule" />
+      <h2 class="section-head">Efficiency, which is mostly subtraction</h2>
+      <p class="section-sub">
+        A program links what it uses, and iyi's own library is{" "}
+        <Measure of="prelude" /> lines against Crystal's{" "}
+        {lib.crystal.toLocaleString("en-GB")}. The whole library is{" "}
+        <Measure of="prelude_kb" unit="KB" /> on disk beside the binary.
+      </p>
+    </div>
+
+    <div class="to-wide">
+      <Stamped
+        claim={`${bin.iyi.kb} KB against ${bin.crystal.kb.toLocaleString("en-GB")} KB, for the same program.`}
+        subject={bin.subject}
+        machine={bin.machine}
+        command={bin.command}
+        outcome="win"
+      >
+        <div class="mass">
+          <figure class="mass-item">
+            <div class="square iyi" style={`width:${iyiSide}px;height:${iyiSide}px`}></div>
+            <figcaption>
+              <span class="mass-name">iyi</span>
+              <span class="mass-val">{bin.iyi.kb} KB</span>
+              <span class="mass-val dim">starts in {bin.iyi.ms} ms</span>
+            </figcaption>
+          </figure>
+          <figure class="mass-item">
+            <div class="square crystal" style={`width:${crystalSide}px;height:${crystalSide}px`}></div>
+            <figcaption>
+              <span class="mass-name">Crystal's library</span>
+              <span class="mass-val">{bin.crystal.kb.toLocaleString("en-GB")} KB</span>
+              <span class="mass-val dim">starts in {bin.crystal.ms} ms</span>
+            </figcaption>
+          </figure>
+        </div>
+        <p class="mass-caption">
+          Drawn at true area, not true width. A difference this large rendered
+          as length would flatter it.
+        </p>
+      </Stamped>
+    </div>
+  </section>
+
+  <section class="spread band">
+    <div class="to-wide">
+      <hr class="rule" />
+      <h2 class="section-head">Portability, compiles for nine, runs on four</h2>
+      <p class="section-sub">
+        An iyi program produces code for <Measure of="targets" /> targets and is
+        run on four of them every build: x86-64 glibc, x86-64 musl, aarch64 under
+        emulation, and wasm32-wasi under wasmtime. The object is cross-compiled
+        here and linked there with the target's own toolchain.
+      </p>
+      <p class="section-sub">
+        The wasm32 build is one self-contained module already, which is also why
+        the samples run in your browser on the playground.
+      </p>
+    </div>
+  </section>
+
+  <style>
+    .hero {
+      padding-block: clamp(2.5rem, 6vw, 4.5rem) 1rem;
+    }
+    .hero h1 {
+      font-size: var(--step-4);
+      font-variation-settings: "opsz" 72;
+      font-weight: 600;
+      letter-spacing: -0.022em;
+      max-width: 26ch;
+      margin-block: 0.7rem 1.1rem;
+    }
+    .lede {
+      font-size: var(--step-1);
+      line-height: 1.52;
+      max-width: 58ch;
+      color: var(--graphite);
+    }
+    .band {
+      padding-block-start: 2.6rem;
+    }
+    .section-head {
+      margin-block: 1.1rem 0.5rem;
+      font-variation-settings: "opsz" 48;
+    }
+    .section-sub {
+      color: var(--graphite);
+      max-width: 62ch;
+      margin-block-end: 1.2rem;
+    }
+    .mass {
+      display: flex;
+      align-items: flex-end;
+      gap: clamp(1.5rem, 5vw, 3.5rem);
+      flex-wrap: wrap;
+      padding-block: 0.5rem;
+    }
+    .mass-item {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      align-items: flex-start;
+    }
+    .square {
+      border: var(--hair) solid var(--ink);
+      flex: none;
+    }
+    .square.iyi {
+      background: var(--ink);
+    }
+    .square.crystal {
+      background-image: repeating-linear-gradient(
+        45deg,
+        var(--hairline) 0 1px,
+        transparent 1px 11px
+      );
+    }
+    .mass-item figcaption {
+      display: flex;
+      flex-direction: column;
+      font-family: var(--font-mono);
+      font-size: var(--step--2);
+      line-height: 1.5;
+    }
+    .mass-name {
+      color: var(--ink);
+      font-weight: 600;
+    }
+    .mass-val {
+      color: var(--graphite);
+    }
+    .mass-val.dim {
+      color: var(--mute);
+    }
+    .mass-caption {
+      font-family: var(--font-mono);
+      font-size: var(--step--2);
+      color: var(--mute);
+      margin-block-start: 0.8rem;
+    }
+  </style>
+</Page>

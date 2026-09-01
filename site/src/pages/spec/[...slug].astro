@@ -1,0 +1,442 @@
+---
+// One page per section of SPEC.md, cut at the headings SPEC.md itself uses and
+// written by scripts/reference.mjs. No text on this page was typed by hand: the
+// heading, the status, the body and the byte counts all come out of the
+// generated index, and the body is the file's own bytes.
+//
+// The rail carries the part the section belongs to, the way reference docs do
+// it: a reader who lands on III.10 from a search result can see the shape of
+// Part III without going back to the contents.
+
+import Page from "../../layouts/Page.astro";
+import Record from "../../components/Record.astro";
+import reference from "../../generated/reference/index.json";
+
+export function getStaticPaths() {
+  // Eager, because these are the pages: every section is rendered at build
+  // time and there is no request to defer to.
+  const files = import.meta.glob("../../generated/reference/spec/*.md", {
+    eager: true,
+  });
+
+  const bySlug = new Map(
+    Object.entries(files).map(([path, entry]) => [
+      path.split("/").pop().replace(/\.md$/, ""),
+      entry,
+    ]),
+  );
+
+  const { sections } = reference.spec;
+  const brief = ({ slug, title, title_html, proposed }) => ({
+    slug,
+    title,
+    title_html,
+    proposed,
+  });
+
+  return sections.map((section, n) => {
+    const entry = bySlug.get(section.slug);
+    if (!entry) {
+      // Loud, because the alternative is a section of the specification that
+      // silently has no page.
+      throw new Error(
+        `SPEC.md section "${section.heading}" has no generated markdown at ` +
+          `${section.file}. Run "node scripts/reference.mjs".`,
+      );
+    }
+
+    // Two different pages share this route. A part is a landing page: its
+    // sections are its content, listed in the main column, which is how
+    // reference docs treat a group. A section is a page of prose: its siblings
+    // belong in the rail beside it, where a sidebar goes.
+    const part = sections.find((x) => x.slug === section.parent) ?? null;
+    const children = sections.filter((x) => x.parent === section.slug);
+    const siblings = part
+      ? sections.filter((x) => x.parent === part.slug)
+      : [];
+
+    return {
+      params: { slug: section.slug },
+      props: {
+        section,
+        entry,
+        part: part ? brief(part) : null,
+        children: children.map((x) => ({ ...brief(x), bytes: x.bytes })),
+        siblings: siblings.map((x) => brief(x)),
+        previous: n > 0 ? brief(sections[n - 1]) : null,
+        next: n + 1 < sections.length ? brief(sections[n + 1]) : null,
+      },
+    };
+  });
+}
+
+const { section, entry, part, children, siblings, previous, next } = Astro.props;
+const { Content } = entry;
+
+const base = import.meta.env.BASE_URL;
+const href = (path) =>
+  `${base.replace(/\/$/, "")}/${String(path).replace(/^\//, "")}`;
+const sectionHref = (slug) => href(`spec/${slug}/`);
+
+const count = new Intl.NumberFormat("en-GB");
+const eyebrow = part ? part.title : "iyi language specification";
+---
+
+<Page
+  title={`${section.title} · iyi specification`}
+  summary={`${section.heading}, from SPEC.md at ${reference.commit}.`}
+>
+  <article class="spread">
+    <Record
+      eyebrow={eyebrow}
+      titleHtml={section.title_html}
+      source={reference.spec.source}
+      sourceBytes={reference.spec.bytes}
+      bytes={section.bytes}
+      commit={reference.commit}
+      generator={reference.generator}
+      line={section.line}
+    >
+      <Fragment slot="mark">
+        {
+          section.status_html && (
+            <p class="status">
+              <span class="status-label">status in {reference.spec.source}</span>
+              <span
+                class:list={["status-text", { proposed: section.proposed }]}
+                set:html={section.status_html}
+              />
+            </p>
+          )
+        }
+        {
+          section.proposed && (
+            <p class="mark">
+              <span set:html={reference.proposed_note.html} />{" "}
+              <span class="mark-cite">{reference.proposed_note.source}</span>
+            </p>
+          )
+        }
+      </Fragment>
+
+      <Content />
+
+      <Fragment slot="after">
+        {
+          children.length > 0 && (
+            <section class="contents">
+              <p class="label">sections in this part</p>
+              <ol>
+                {children.map((child) => (
+                  <li>
+                    <a class="name" href={sectionHref(child.slug)}>
+                      <span set:html={child.title_html} />
+                    </a>
+                    {child.proposed && <span class="flag">proposed</span>}
+                    <span class="bytes">{count.format(child.bytes)} B</span>
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )
+        }
+
+        <nav class="onward" aria-label="Adjacent sections">
+          <hr class="rule" />
+          <ul>
+            {
+              previous && (
+                <li>
+                  <span class="label">before</span>
+                  <a href={sectionHref(previous.slug)}>
+                    <span set:html={previous.title_html} />
+                  </a>
+                </li>
+              )
+            }
+            {
+              next && (
+                <li>
+                  <span class="label">after</span>
+                  <a href={sectionHref(next.slug)}>
+                    <span set:html={next.title_html} />
+                  </a>
+                </li>
+              )
+            }
+            <li>
+              <span class="label">contents</span>
+              <a href={href("spec/")}>{reference.spec.title}</a>
+              <span class="bytes"
+                >{count.format(reference.spec.sections.length)} sections</span
+              >
+            </li>
+          </ul>
+        </nav>
+      </Fragment>
+    </Record>
+
+    {
+      part && siblings.length > 0 && (
+        <nav class="partnav" aria-label="This part of the specification">
+          <p class="label">in this part</p>
+          <a class="partnav-head" href={sectionHref(part.slug)}>
+            <span set:html={part.title_html} />
+          </a>
+          <ol>
+            {siblings.map((sibling) => (
+              <li aria-current={sibling.slug === section.slug ? "page" : null}>
+                <a href={sectionHref(sibling.slug)}>
+                  <span set:html={sibling.title_html} />
+                </a>
+                {sibling.proposed && <span class="flag">proposed</span>}
+              </li>
+            ))}
+          </ol>
+        </nav>
+      )
+    }
+  </article>
+</Page>
+
+<style>
+  /* The status is the document's own word for how settled the section is, and
+   * it is quoted rather than paraphrased, so it is set in the machine's voice. */
+  .status {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    line-height: 1.5;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.15rem 0.6rem;
+    align-items: baseline;
+  }
+
+  .status-label {
+    font-size: var(--step--2);
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--mute);
+  }
+
+  .status-text {
+    color: var(--ink);
+  }
+
+  /* PROPOSED is the one status that gets the signal colour, and it gets it for
+   * the reason README.md gives: these are the parts that will move. The colour
+   * marks a caveat, never a win, and it is the whole marker: a chip saying
+   * PROPOSED beside a status that already reads PROPOSED says it twice. */
+  .status-text.proposed {
+    color: var(--signal);
+    font-weight: 500;
+  }
+
+  .mark {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    line-height: 1.55;
+    color: var(--graphite);
+    margin-block-start: 0.55rem;
+    border-inline-start: var(--hair) solid var(--signal);
+    padding-inline-start: 0.7rem;
+    max-width: 58ch;
+  }
+
+  .mark-cite {
+    color: var(--mute);
+  }
+
+  /* A part's contents ---------------------------------------------------- */
+
+  /* A part heading in SPEC.md is often followed straight away by its first
+   * section, so a part page has little or no prose of its own. Its sections
+   * are its content, and they belong in the main column rather than only in
+   * the rail. */
+  .contents {
+    margin-block-start: 0.4rem;
+    order: 0;
+  }
+
+  .contents ol {
+    list-style: none;
+    margin: 0.6rem 0 0;
+    padding: 0;
+  }
+
+  .contents li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.2rem 0.6rem;
+    padding-block: 0.38rem;
+    border-block-end: var(--hair) solid var(--hairline);
+  }
+
+  .contents .name {
+    flex: 1 1 24ch;
+    text-decoration: none;
+    border-block-end: var(--hair) solid transparent;
+  }
+
+  .contents .name:hover {
+    border-block-end-color: var(--signal);
+  }
+
+  /* The rail ------------------------------------------------------------- */
+
+  /* Explicitly placed in the rail beside the prose. The header above spans
+   * both columns as row 1, so the record and this nav are row 2 together. */
+  .partnav {
+    grid-column: rail;
+    grid-row: 2;
+    align-self: start;
+    position: sticky;
+    top: 1.4rem;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    line-height: 1.45;
+    border-inline-start: var(--hair) solid var(--hairline);
+    padding-inline-start: 0.7rem;
+    /* The rail is --rail wide and the titles in it are the source's, so their
+     * length is not a choice. Measured at 1440: the nav, its list and one item
+     * each ran 7px past the rail because `III.3 `method_missing`` renders a
+     * code chip and base.css sets `white-space: nowrap` on inline code, which
+     * only base.css's own prose column is wide enough for. */
+    overflow-wrap: break-word;
+  }
+
+  .partnav :global(code) {
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
+  .partnav .label {
+    display: block;
+    margin: 0 0 0.35rem;
+  }
+
+  .partnav-head {
+    display: block;
+    color: var(--ink);
+    text-decoration: none;
+    border-block-end: var(--hair) solid var(--hairline);
+    padding-block-end: 0.4rem;
+  }
+
+  .partnav-head:hover {
+    border-block-end-color: var(--signal);
+  }
+
+  .partnav ol {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    counter-reset: none;
+  }
+
+  .partnav li {
+    margin-block-end: 0.42rem;
+  }
+
+  .partnav a {
+    color: var(--graphite);
+    text-decoration: none;
+  }
+
+  .partnav a:hover {
+    color: var(--ink);
+  }
+
+  /* The page you are on is marked by weight and by the tittle the rules use,
+   * not by colour: the signal colour is reserved for a caveat. */
+  .partnav [aria-current="page"] > a {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .partnav [aria-current="page"] {
+    position: relative;
+  }
+
+  .partnav [aria-current="page"]::before {
+    content: "";
+    position: absolute;
+    left: calc(-0.7rem - var(--hair) - var(--tittle) / 2);
+    top: 0.55em;
+    width: var(--tittle);
+    height: var(--tittle);
+    border-radius: 50%;
+    background: var(--ink);
+  }
+
+  @media (max-width: 62rem) {
+    /* One column, so the rail cannot sit beside anything. The part list goes
+     * after the section rather than in front of it. */
+    .partnav {
+      grid-column: main;
+      grid-row: auto;
+      order: 1;
+      position: static;
+      margin-block-start: 2rem;
+    }
+  }
+
+  /* Onward --------------------------------------------------------------- */
+
+  .onward {
+    margin-block-start: 2.6rem;
+    order: 2;
+  }
+
+  .onward ul {
+    list-style: none;
+    margin: 1rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.65rem;
+  }
+
+  .onward li {
+    display: grid;
+    grid-template-columns: 8ch minmax(0, 1fr) auto;
+    gap: 0.9rem;
+    align-items: baseline;
+  }
+
+  .onward .label {
+    color: var(--mute);
+  }
+
+  .onward a {
+    text-decoration: none;
+    border-block-end: var(--hair) solid var(--hairline);
+  }
+
+  .onward a:hover {
+    border-block-end-color: var(--signal);
+  }
+
+  .flag,
+  .bytes {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--mute);
+    letter-spacing: 0.06em;
+  }
+
+  .flag {
+    color: var(--signal);
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    margin-inline-start: 0.4rem;
+  }
+
+  @media (max-width: 40rem) {
+    .onward li {
+      grid-template-columns: 1fr;
+      gap: 0.15rem;
+    }
+  }
+</style>

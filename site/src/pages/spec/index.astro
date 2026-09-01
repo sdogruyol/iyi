@@ -1,0 +1,258 @@
+---
+// The contents of SPEC.md, in the order SPEC.md holds them. Every row is a
+// heading in that file and a page of this site; nothing on this page is a
+// summary of anything.
+
+import Page from "../../layouts/Page.astro";
+import Record from "../../components/Record.astro";
+import reference from "../../generated/reference/index.json";
+
+const { spec, changelog, commit, generator, proposed_note } = reference;
+
+const base = import.meta.env.BASE_URL;
+const href = (path) =>
+  `${base.replace(/\/$/, "")}/${String(path).replace(/^\//, "")}`;
+
+const count = new Intl.NumberFormat("en-GB");
+
+// A part and the sections under it, which is the shape SPEC.md already has:
+// `##` opens a part, `###` is a section of it, and a `####` sub-question stays
+// on its section's page.
+const parts = [];
+for (const section of spec.sections) {
+  if (section.level <= 2) {
+    parts.push({ head: section, sections: [] });
+  } else {
+    if (parts.length === 0) {
+      throw new Error(
+        `${spec.source} opens with "${section.heading}" at level ` +
+          `${section.level}, so there is no part for it to belong to`,
+      );
+    }
+    parts[parts.length - 1].sections.push(section);
+  }
+}
+
+const listed = parts.reduce((n, part) => n + 1 + part.sections.length, 0);
+if (listed !== spec.sections.length) {
+  throw new Error(
+    `${spec.source} has ${spec.sections.length} sections and this contents ` +
+      `page lists ${listed}`,
+  );
+}
+---
+
+<Page
+  title={`${spec.title} · iyi`}
+  summary={`The contents of ${spec.source} at ${commit}, one page per section.`}
+>
+  <article class="spread">
+    <Record
+      eyebrow="the design record"
+      titleHtml={spec.title_html}
+      claim="Not hand-edited: every row below is a heading in that file, and every heading is a page."
+      source={spec.source}
+      sourceBytes={spec.bytes}
+      commit={commit}
+      generator={generator}
+    >
+      <Fragment slot="evidence">
+        <dt>sections</dt>
+        <dd>{count.format(spec.sections.length)}</dd>
+        <dt>proposed</dt>
+        <dd>{count.format(spec.proposed)}</dd>
+        <dt>cut at heading level</dt>
+        <dd>{count.format(spec.cut_at)}</dd>
+      </Fragment>
+
+      <Fragment slot="mark">
+        <p class="mark">
+          <span class="badge">proposed</span>
+          <span class="mark-note" set:html={proposed_note.html} />
+          <span class="mark-cite">{proposed_note.source}</span>
+        </p>
+      </Fragment>
+
+      <Fragment slot="after">
+        <ol class="contents">
+          {
+            parts.map((part) => (
+              <li class="part">
+                <p class="row">
+                  <a class="name" href={href(`spec/${part.head.slug}/`)}>
+                    <span set:html={part.head.title_html} />
+                  </a>
+                  {part.head.proposed && <span class="flag">proposed</span>}
+                  {/* A part whose heading is followed straight away by its
+                      first section has a body of no bytes, and printing 0 B
+                      against Part II reads as a fault rather than as the
+                      truth. Where a part has sections, how many is the useful
+                      exact number; where it has none, its own extent is. */}
+                  <span class="bytes">
+                    {part.sections.length > 0
+                      ? `${count.format(part.sections.length)} sections`
+                      : `${count.format(part.head.bytes)} B`}
+                  </span>
+                </p>
+
+                {part.sections.length > 0 && (
+                  <ol class="sections">
+                    {part.sections.map((section) => (
+                      <li>
+                        <p class="row">
+                          <a class="name" href={href(`spec/${section.slug}/`)}>
+                            <span set:html={section.title_html} />
+                          </a>
+                          {section.proposed && (
+                            <span class="flag">proposed</span>
+                          )}
+                          <span class="bytes">
+                            {count.format(section.bytes)} B
+                          </span>
+                        </p>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </li>
+            ))
+          }
+        </ol>
+
+        <nav class="onward" aria-label="The release record">
+          <hr class="rule" />
+          <p>
+            <span class="label">what shipped from this design</span>
+            <a href={href("changelog/")}>{changelog.title}</a>
+            <span class="bytes"
+              >{count.format(changelog.releases.length)} releases</span
+            >
+          </p>
+        </nav>
+      </Fragment>
+    </Record>
+  </article>
+</Page>
+
+<style>
+  /* PROPOSED is the one status marked in the signal colour, on the authority of
+   * the sentence quoted here: these are the parts that will move. */
+  .mark {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    line-height: 1.55;
+    color: var(--graphite);
+    margin: 0;
+    border-inline-start: var(--hair) solid var(--signal);
+    padding-inline-start: 0.7rem;
+    max-width: 58ch;
+  }
+
+  .badge,
+  .flag {
+    color: var(--signal);
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    font-weight: 500;
+  }
+
+  .badge {
+    display: inline-block;
+    border: var(--hair) solid var(--signal);
+    border-radius: 2px;
+    padding: 0.05rem 0.35rem;
+    margin-inline-end: 0.45rem;
+  }
+
+  .mark-cite {
+    color: var(--mute);
+  }
+
+  .mark-cite::before {
+    content: " ";
+  }
+
+  /* Contents ------------------------------------------------------------- */
+
+  .contents,
+  .sections {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .contents {
+    margin-block-start: 1.4rem;
+  }
+
+  .part {
+    margin-block-end: 1.9rem;
+  }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.2rem 0.6rem;
+    margin: 0;
+  }
+
+  /* The part's own row is the heavier one, because it is a part. */
+  .part > .row {
+    padding-block-end: 0.3rem;
+    border-block-end: var(--hair) solid var(--ink);
+    font-size: var(--step-1);
+  }
+
+  .sections li > .row {
+    padding-block: 0.34rem;
+    border-block-end: var(--hair) solid var(--hairline);
+  }
+
+  .name {
+    text-decoration: none;
+    border-block-end: var(--hair) solid transparent;
+    flex: 1 1 24ch;
+  }
+
+  .name:hover {
+    border-block-end-color: var(--signal);
+  }
+
+  /* A byte count is exact and reproducible anywhere, so it is set flat and
+   * inline. Nothing about it depends on the machine that read the file. */
+  .bytes {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--mute);
+    letter-spacing: 0.04em;
+    flex: 0 0 auto;
+  }
+
+  .onward {
+    margin-block-start: 2.2rem;
+  }
+
+  .onward p {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.2rem 0.9rem;
+    margin-block-start: 1rem;
+  }
+
+  .onward .label {
+    color: var(--mute);
+  }
+
+  .onward a {
+    text-decoration: none;
+    border-block-end: var(--hair) solid var(--hairline);
+  }
+
+  .onward a:hover {
+    border-block-end-color: var(--signal);
+  }
+</style>

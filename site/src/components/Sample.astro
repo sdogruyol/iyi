@@ -1,0 +1,208 @@
+---
+/**
+ * A listing of a real sample program. The text is read out of
+ * `samples/iyi/...` by `scripts/samples.mjs` at build time and is never typed
+ * into a page, so a sample that changes in the repository changes here and a
+ * sample that is renamed fails the build.
+ *
+ * Three ways to select part of a file, in order of preference:
+ *
+ *   region  a named top-level declaration, "impl Greet for User". Survives an
+ *           edit above it, which is why it is first.
+ *   from    the first line containing it. Add `block` to run through the `end`
+ *           that closes it, matched on the opener's own indentation, or `to` to
+ *           run through the first later line containing another string. Content
+ *           anchored, so both survive an edit above them.
+ *   lines   "63-69". A guess about a file nobody edits with this site in mind,
+ *           so it requires `must` and fails the build when the guess rots.
+ *
+ * `must` is available on all three: a substring the selection has to contain.
+ *
+ * THE TOKENS ARE THE COMPILER'S. This component used to carry a hand written
+ * scanner, and it does not any more: token classes come from
+ * `site/records/highlight.json`, which is `Crystal::SyntaxHighlighter::HTML`
+ * run inside the iyi fork's own compiler over every file this site lists. So
+ * the tokens on the page are the tokens the compiler saw, there is exactly one
+ * grammar in this repository, and a keyword the site did not know about cannot
+ * exist. The one thing the lexer cannot do is separate iyi's keywords from
+ * Crystal's, because to a lexer they are all keywords, and that separation is
+ * the whole argument a listing here is making; so the recorder adds `tok-rule`
+ * to those spans after the lexer has fixed the token boundaries, and
+ * `styles/code.css` carries weight 700 for it against 500 for a bare keyword.
+ * `src/lib/highlight.ts` reflows the record line by line so a subrange of a
+ * file can be selected without emitting unbalanced markup.
+ *
+ * A file the record does not cover is a build failure, not a plain text
+ * render. Falling back would make one listing on the site the only one without
+ * the emphasis that carries the argument, and it would do it silently.
+ */
+import samples from "../generated/samples/index.json";
+import { highlightedLines, recordedText } from "../lib/highlight";
+
+interface Props {
+  path: string;
+  region?: string;
+  from?: string;
+  to?: string;
+  block?: boolean;
+  lines?: string;
+  must?: string;
+  caption?: string;
+}
+
+const { path, region, from, to, block, lines, must, caption } = Astro.props;
+
+const key = path.replace(/^samples\//, "");
+const sample = (samples as Record<string, Sample>)[key];
+
+type Sample = {
+  path: string;
+  text: string;
+  lines: number;
+  regions: Record<string, { start: number; end: number }>;
+  ambiguous: string[];
+};
+
+if (!sample) {
+  throw new Error(
+    `Sample: there is no "${path}" under samples/. The tree has ` +
+      `${Object.keys(samples).join(", ")}. A listing on this site is read out ` +
+      `of the file it claims to be, so a name that does not resolve is a ` +
+      `build failure rather than a blank.`,
+  );
+}
+
+const all = sample.text.replace(/\n$/, "").split("\n");
+
+// Resolve ------------------------------------------------------------------
+
+let start = 1;
+let end = all.length;
+let whole = true;
+
+if (region !== undefined) {
+  const span = sample.regions[region];
+  if (!span) {
+    if (sample.ambiguous.includes(region)) {
+      throw new Error(
+        `Sample: "${region}" is declared more than once in ${sample.path}, so ` +
+          `naming it selects nothing. Overloads have to be selected with ` +
+          `from/to.`,
+      );
+    }
+    throw new Error(
+      `Sample: ${sample.path} declares no "${region}". It declares ` +
+        `${Object.keys(sample.regions).join(", ")}.`,
+    );
+  }
+  start = span.start;
+  end = span.end;
+  whole = false;
+} else if (from !== undefined) {
+  const at = all.findIndex((line) => line.includes(from));
+  if (at === -1) {
+    throw new Error(`Sample: no line of ${sample.path} contains "${from}".`);
+  }
+  start = at + 1;
+  if (block) {
+    // Extend to the `end` that closes what `from` opened, found by matching
+    // the opener's own indentation. Content anchored like `from` itself, so a
+    // block that moves or grows still selects exactly the block.
+    const indent = /^\s*/.exec(all[at])?.[0] ?? "";
+    const closer = `${indent}end`;
+    const close = all.findIndex((line, i) => i > at && line === closer);
+    if (close === -1) {
+      throw new Error(
+        `Sample: ${sample.path} opens a block at line ${start} with "${from}" ` +
+          `and no later line is exactly "${closer}", so the block cannot be ` +
+          `closed. Widen the selection or use from/to.`,
+      );
+    }
+    end = close + 1;
+  } else if (to !== undefined) {
+    const close = all.findIndex((line, i) => i > at && line.includes(to));
+    if (close === -1) {
+      throw new Error(
+        `Sample: ${sample.path} has "${from}" at line ${start} but no later ` +
+          `line containing "${to}".`,
+      );
+    }
+    end = close + 1;
+  } else {
+    end = start;
+  }
+  whole = false;
+} else if (lines !== undefined) {
+  if (must === undefined) {
+    throw new Error(
+      `Sample: selecting ${sample.path} by line number requires "must", a ` +
+        `substring the selection has to contain. Without it a line that moves ` +
+        `silently shows the wrong code.`,
+    );
+  }
+  const m = /^(\d+)(?:-(\d+))?$/.exec(lines.trim());
+  if (!m) throw new Error(`Sample: "${lines}" is not a line or a line range.`);
+  start = Number(m[1]);
+  end = m[2] ? Number(m[2]) : start;
+  if (start < 1 || end > all.length || end < start) {
+    throw new Error(
+      `Sample: ${sample.path} has ${all.length} lines, so ${lines} is not in it.`,
+    );
+  }
+  whole = false;
+}
+
+const selected = all.slice(start - 1, end).join("\n");
+
+if (must !== undefined && !selected.includes(must)) {
+  throw new Error(
+    `Sample: ${sample.path} lines ${start} to ${end} do not contain "${must}". ` +
+      `The file changed under this selection, so the page would have shown ` +
+      `code the lesson is not talking about.`,
+  );
+}
+
+// Highlight ----------------------------------------------------------------
+
+// The tokens come out of the record, one balanced HTML string per line, so the
+// same line range the selection above computed is the range taken here. No
+// scanning happens in this file.
+//
+// First the record is proved to still describe the file. The samples index read
+// the file off disk; the record was made from it on the recording machine. If
+// the file has been edited since, the tokens would be the compiler's reading of
+// a program that no longer exists, painted over text that does. That is a
+// listing that is silently wrong, which is worse than a build that stops.
+const recorded = recordedText(sample.path);
+if (recorded !== sample.text) {
+  throw new Error(
+    `Sample: ${sample.path} has changed since site/records/highlight.json was ` +
+      `recorded, so the recorded tokens describe a different program than the ` +
+      `text on disk. Rendering it would paint one program's tokens over ` +
+      `another program's characters. Regenerate the record.`,
+  );
+}
+
+const inked = highlightedLines(sample.path);
+if (inked.length < end) {
+  throw new Error(
+    `Sample: the record for ${sample.path} holds ${inked.length} lines and ` +
+      `this listing selects up to line ${end}.`,
+  );
+}
+
+const code = inked.slice(start - 1, end).join("\n");
+
+// The count is read off the file, never typed. Structural: it is the same on
+// every machine, so it is set flat with no frame and no apology.
+const shown =
+  caption ?? (whole ? `${sample.lines} lines` : `lines ${start} to ${end}`);
+---
+
+<figure class="source">
+  <figcaption class="source-head">
+    <span class="path">{sample.path}</span>
+    <span>{shown}</span>
+  </figcaption>
+  <pre><code set:html={code} /></pre>
+</figure>

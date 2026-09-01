@@ -456,6 +456,16 @@ jobs:
       - name: The numbers the docs state
         run: python3 bench/doc_numbers.py --list
 
+      # The website documents argue by citation: the art direction points at
+      # the stylesheet carrying a colour, the stack document at the script
+      # generating a number, the feasibility report at the compiler line that
+      # stops a browser type checking. A path that does not resolve reads as
+      # evidence and is not, which is the same defect as a stale number. Two
+      # were already wrong when this was written, both pointing at `scripts/`
+      # for files that live under `site/scripts/`.
+      - name: The paths the website documents cite
+        run: python3 bench/website_citations.py
+
   targets:
     needs: build
     runs-on: ubuntu-24.04

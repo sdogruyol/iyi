@@ -63,7 +63,7 @@ own reference accepts.
 | warm full build, `hello` / 6,900-line pair | 0.07 s / 0.24 s, against `go build`'s 0.08 s / 0.09 s |
 | front end, `hello.iyi` | **0.036 s** against the 0.050 s target: MET |
 | starting the compiler and doing nothing | 0.018 s of that |
-| iyi's own prelude | 4,044 lines, ceiling 3,734 |
+| iyi's own prelude | 5,292 lines, ceiling 3,734 |
 | compiler | 84,068 lines, none of it written in iyi |
 | artifact format | `.iyimod` v19, checksum per section |
 | samples | 9, of which 5 rebuild from artifacts with their modules' source deleted |
@@ -88,7 +88,7 @@ shape.
 > is a library and the rules are the language, so a program can keep one and
 > change the other: `--crystal` builds against Crystal's standard library, and
 > there `require` reaches the ecosystem while every rule stays where it was.
-> "No standard library worth the name" is still true of iyi's own 4,044 lines
+> "No standard library worth the name" is still true of iyi's own 5,292 lines
 > and no longer true of what a program can have. Part V item 12a is the
 > measurement, nine shards wide.
 
@@ -270,7 +270,7 @@ of binary. It is not made the default on that trade, and the middle needs the
 initialisers to run *later* rather than not at all, which is the `dlsym` table
 above, and a larger piece of work than the number it wins.
 
-**3. A deliberately tiny prelude, written in iyi. Done: 4,044 lines,
+**3. A deliberately tiny prelude, written in iyi. Done: 5,292 lines,
 primitives included.** Not a standard library: integers, booleans, a string,
 one sequence, one dictionary, one range, `puts`. **Its scope is set by what the
 samples call and by nothing else**. A method enters the prelude because an
@@ -791,9 +791,9 @@ Checking it moved two things and left the shape alone.
 
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
-| Compiler | 24,984 lines, **written in Crystal** | 102,090 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 4,044-line own prelude + 777 in samples |
-| Specs | 21,146 lines | 8,596 for iyi |
+| Compiler | 24,984 lines, **written in Crystal** | 102,805 lines, Crystal, forked |
+| Library | 8,161 lines (3,551 of it core) | 5,292-line own prelude + 777 in samples |
+| Specs | 21,146 lines | 9,064 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
 | Own status line | *"pre-alpha: we are still designing the language"* | design largely settled, 0.2.0 released, a language written in it |
@@ -1133,6 +1133,20 @@ optimisation the back end runs. `gcry` has measured that half and found it is
 not even an RSS win. So the prerequisite stands and the bill is a table, not an
 epic. See III.9.
 
+**The table is now written.** `.iyimod` format v43 carries a `Layouts` section:
+per type this module owns, its allocation size, its unrounded instance size, and
+the byte offsets of its pointer fields, taken from the target's own data layout
+rather than added up by hand. `Probe::Shapes::Pair`, three fields of `String`,
+`String` and `Int32`, reads back as 24 bytes, scan cap 20, offsets `[0, 8]`, and
+the padding in those numbers is the evidence they came from the back end.
+
+Two things that table is not. It is per instantiation, not per GC shape: one
+entry serving `Box(String)` and `Box(Pointer)` together is R-4's own keying and
+nothing implements it, so a generic never instantiated in a module contributes
+nothing there. And `noscan_offsets` is empty everywhere, because what "not
+traced" means is Stage 6's to define and a guess now would risk a later stage
+reading it as "do not retain" and collecting live buffers.
+
 ### II.6 Traits × the standard library: **SETTLED by porting `Enumerable`**
 
 `Enumerable` is the load-bearing abstraction of Crystal's stdlib: 2,350 lines,
@@ -1264,8 +1278,8 @@ much better error for the caller.
 separates it from `forall`: `forall` introduces a name and may bound it, `where`
 bounds an associated type the enclosing trait already introduced. The check runs
 where the call is matched, because by then the associated type is a type, and it
-reports `Int32 does not implement Comparable, required by `where Elem :
-Comparable` in `max``. The unbounded methods of the same trait stay available
+reports `` Int32 does not implement Comparable, required by `where Elem :
+Comparable` in `max` ``. The unbounded methods of the same trait stay available
 whatever the element type is; only the bounded one is withheld.
 
 **3a. A trait needs to require another trait.** `Comparable` reaching 21 more
@@ -7716,7 +7730,7 @@ Named honestly, so nobody mistakes this draft for complete.
     shards exist and none of them is written to iyi's rules, so "run them
     directly" is not a compatibility problem, it is the four rules: `require`
     against R-1, inference against R-2, monkey patching against R-3, and
-    Crystal's 8,161-line standard library against iyi's own 4,044-line prelude.
+    Crystal's 8,161-line standard library against iyi's own 5,292-line prelude.
 
     What is measurable is narrower and better than that framing suggests, and
     it was measured on **Kemal 1.12.0**, which compiles under this compiler

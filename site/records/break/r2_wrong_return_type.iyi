@@ -1,0 +1,10 @@
+# Breaks R-2 the other way: the type is written, and the body does not honour
+# it. An exported signature is a promise to every consumer that reads the
+# artifact instead of the body, so the body is the thing that has to give.
+module diagnostics/r2_wrong_return_type
+
+pub def total(numbers : Array(Int32)) : Int32
+  numbers.join(",")
+end
+
+puts total([1, 2, 3])

@@ -1,0 +1,130 @@
+---
+title: Traits, and the end of open classes
+order: 4
+summary: A trait names requirements and an impl satisfies them. The orphan rule decides where that impl is allowed to live, and `forall` binds the parameters an impl or a method quantifies over.
+rule: R-3
+sample: samples/iyi/hello.iyi
+breaks: r3-orphan-impl
+breaksAlso:
+  - site/records/break/dep/greeter.iyi
+  - site/records/break/dep/user.iyi
+bought: >-
+  A type's method set is knowable from the module that declared it, so coherence
+  is checked locally with no global pass and two modules cannot write the same
+  impl and find out at link time. A missed requirement also lands where you wrote
+  the impl rather than downstream at whoever called it.
+sources:
+  - file: samples/iyi/hello.iyi
+    note: the trait, three impls, the orphan rule note, the rejected alternatives, and the bound on a method
+  - file: samples/iyi/generics.iyi
+    note: forall on an impl, positional parameter names, and the impls iyi refuses
+  - file: samples/iyi/modules.iyi
+    note: the cross module case, where the choice of host module costs something
+  - file: README.md
+    note: what the Kemal port can say that Kemal cannot
+---
+
+import Sample from "../../components/Sample.astro";
+
+Step two asked what a declaration has to say. This step is about what a
+declaration has to be able to promise.
+
+An artifact carrying a module's declarations only works if a type's method set is
+knowable from the module that declared it. In Crystal it is not, because any file
+can reopen any class. So iyi does not have open classes, and this is what it has
+instead.
+
+A trait names requirements. `abstract def` marks one an implementer has to
+provide.
+
+<Sample path="samples/iyi/hello.iyi" region="trait Greet" />
+
+A type gets that trait by having an impl. Not by inheriting, not by including, not
+by happening to have a method with the right name.
+
+<Sample path="samples/iyi/hello.iyi" region="impl Greet for User" />
+
+<Sample path="samples/iyi/hello.iyi" region="impl Greet for Robot" />
+
+Two types, one trait, and they now dispatch through it together. It runs the
+other way too: the same sample writes `impl Loud for User`, and that body calls
+the `greet` the first impl provided. A type can implement as many traits as it
+likes, and a trait can be implemented by as many types as like it.
+
+## Where an impl is allowed to live
+
+R-3 is one sentence: an `impl Trait for Type` goes in the module that defines the
+trait or the module that defines the type. Nowhere else.
+
+In `hello.iyi` both are in the same file, so the rule costs nothing and you would
+not notice it. `samples/iyi/modules.iyi` is where you notice. `Greet` comes from
+`app/greeter` and `User` is declared locally, so exactly two modules could host
+that impl and you have to pick one. A third module that imports both is refused,
+and that refusal is the point: it is what makes two modules unable to write the
+same impl and discover it at link time.
+
+Coherence checked locally, with no global pass. That is the whole trade, and it
+is what an artifact needs.
+
+Two doors that look open are not. `include Greet` inside a struct does not work,
+because a type acquires a trait by having an impl whose location R-3 can check,
+and `include` has no such rule. `using` does not reach a trait's methods either:
+a trait exports no names, because a trait method resolves from the receiver
+rather than from your scope.
+
+There is a nice side effect. Leave a requirement unmet and the error lands where
+you wrote the impl, not somewhere downstream where a caller trips over it. The
+module that declares the impl is the module that has to be right.
+
+## forall, and why it is not noise
+
+An impl over a generic type has to say which names are parameters.
+
+<Sample path="samples/iyi/generics.iyi" region="impl Show for Box(T)" />
+
+Drop the `forall T` and the meaning of the impl would depend on your imports:
+`T` might be a fresh parameter, or it might be some type that happens to be in
+scope, and a library could flip which one by adding an export. Rust asks for the
+same binder for the same reason.
+
+The names belong to the impl, and they bind positionally. `Pair(A, B)` declares
+its parameters, and an impl of it may call them `X` and `Y`, because an impl
+states arity rather than vocabulary. Crystal makes a reopened generic repeat the
+declared names, which leaks one declaration's naming into every impl of it.
+
+The same binder shows up on a method, where it can carry a bound.
+
+<Sample path="samples/iyi/hello.iyi" region="def announce" />
+
+`announce` exists for every `T`. The bound is checked where `T` binds, so calling
+it with a type that has no `Greet` impl is rejected at that call, and the sample
+writes out the message you would get.
+
+This is the shape the Kemal port needed. A handler's return type is a type
+parameter bounded by a trait, so the framework's promise, give me something I can
+turn into a body, gets checked on the line where the mistake is, by a module that
+has never heard of your types. README.md is unkind and accurate about the
+comparison: Kemal accepts the same block and serves an empty body, on every
+request, forever.
+
+## What this does not do yet
+
+A bound on an impl is a different mechanism and it is not implemented.
+`impl Show for Box(T) forall T : Show` parses and is rejected. A bound there makes
+the impl conditional, so `Box(Int32)` would implement `Show` only if `Int32` did,
+which has to be checked where the type is instantiated rather than where the impl
+is written. The bound on `announce` above works precisely because nothing about it
+is conditional.
+
+Two more are refused on purpose rather than for want of effort. A specialised
+impl, `impl Show for Box(Int32)`, needs a rule for which impl wins that stays
+sound when the two live in separately compiled modules. A blanket impl,
+`impl Show for T forall T : Show`, is refused for the same reason open classes
+are: it lets a distant module add methods to every type in the program.
+
+## Put the impl in the wrong module
+
+Back to the location rule, because it is the one you will hit first and the
+refusal is the most useful thing in this step. Here are three modules: one owns
+the trait, one owns the type, and the third owns neither and writes the impl
+anyway. Watch which two the compiler offers you.

@@ -1,0 +1,8 @@
+# Half of a deliberate import cycle. See `../r1_import_cycle.iyi`.
+module dep/loop_a
+
+import dep/loop_b
+
+pub def a : String
+  "a"
+end

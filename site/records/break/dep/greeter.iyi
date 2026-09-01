@@ -1,0 +1,19 @@
+# A module the break programs import. Its surface is deliberately narrow: one
+# exported function, one exported trait, and one function left unexported so a
+# consumer has something it is not allowed to reach.
+module dep/greeter
+
+pub trait Greet
+  abstract def greet : String
+end
+
+pub def polite(name : String) : String
+  "#{greeting}, #{name}."
+end
+
+# No `pub`, so this is the module's own business. It is not in the module's
+# declarations, which is what makes reaching for it from another module an
+# error rather than a style question (SPEC.md R-1, IV.2).
+def greeting : String
+  "Hello"
+end

@@ -1,0 +1,382 @@
+# The Stage 2 arena allocator, exercised rather than asserted — the program
+# half of GC_DESIGN.md's Stage 2 verification ("allocate and free objects of
+# various sizes; verify no corruption; inspect arena structure; measure
+# allocation speed"). `bench/arena_exercise.sh` drives it.
+#
+#   ./bin/iyi run bench/arena_exercise.iyi
+#   ./bin/iyi run -Dgc_iyi bench/arena_exercise.iyi
+#
+# Built twice: with `-Dgc_iyi` every check below runs against the size-class
+# arena allocator, and without it the allocator-independent checks run against
+# the default bump allocator, so the same program proves the default path
+# still works. The checks that only an arena can answer (free, clearing,
+# classes, addressability, large-object release) compile out without the
+# flag. Every check raises with the block and offset on a wrong byte, and a
+# panic exits non-zero, which is what the driver keys on.
+#
+# Since Stage 5, the size rides twenty-four bytes under the pointer instead of
+# eight: the eight-byte size moved down to make room for the sixteen-byte
+# object header (type id and mark word) in between. The checks that read the
+# class back out of the arena's chunk size subtract twenty-four now, and a
+# section below says the header's own bytes behave.
+#
+# Not under `samples/`: the sample count is a gated number and samples are
+# explanations, not torture tests.
+
+# The stopwatch. Linux reads CLOCK_MONOTONIC with a raw syscall for the
+# prelude's own reason (libc is not bound there); darwin asks libSystem,
+# which is the platform's documented interface. Either way the answer is
+# nanoseconds; what it costs is two allocations of sixteen bytes, once per
+# call, which a per-allocation measurement can afford at the ends of a run.
+{% if flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
+  def monotonic_ns : UInt64
+    stamp = Pointer(UInt64).malloc(2_u64)
+    result = uninitialized Int64
+    {% if flag?(:x86_64) %}
+      # clock_gettime, CLOCK_MONOTONIC = 1.
+      asm("syscall" : "={rax}"(result)
+                    : "{rax}"(228_i64), "{rdi}"(1_i64), "{rsi}"(stamp.as(Void*))
+                    : "rcx", "r11", "memory"
+                    : "volatile")
+    {% else %}
+      asm("svc #0" : "={x0}"(result)
+                   : "{x8}"(113_i64), "{x0}"(1_i64), "{x1}"(stamp.as(Void*))
+                   : "memory"
+                   : "volatile")
+    {% end %}
+    stamp[0] * 1000000000_u64 + stamp[1]
+  end
+{% elsif flag?(:darwin) %}
+  lib LibC
+    fun clock_gettime(clock_id : Int32, stamp : Void*) : Int32
+  end
+
+  def monotonic_ns : UInt64
+    stamp = Pointer(UInt64).malloc(2_u64)
+    # CLOCK_MONOTONIC is 6 on darwin, not the 1 Linux uses: measured against
+    # this machine's libSystem, where 1 answers EINVAL and 6 counts up from
+    # boot without running while the machine is asleep.
+    LibC.clock_gettime(6, stamp.as(Void*))
+    stamp[0] * 1000000000_u64 + stamp[1]
+  end
+{% end %}
+
+# Every byte of a block gets a value distinct to the block and the offset:
+# the seed names the block, and 31 is coprime with 256, so the offset term
+# walks every residue. A chunk handed to two owners, or a cleared chunk that
+# was not, cannot survive eight blocks of this unchanged by accident.
+def fill(pointer : Pointer(UInt8), size : Int32, seed : Int32) : Nil
+  index = 0
+  while index < size
+    pointer[index] = ((seed + index * 31) % 256).to_u8
+
+    index = index + 1
+  end
+end
+
+def verify(pointer : Pointer(UInt8), size : Int32, seed : Int32, tag : String) : Nil
+  index = 0
+  while index < size
+    expected = ((seed + index * 31) % 256).to_u8
+    actual = pointer[index]
+    if actual != expected
+      raise "#{tag}: byte #{index}: expected #{expected.to_i32}, got #{actual.to_i32}"
+    end
+    index = index + 1
+  end
+end
+
+sizes = [24, 100, 500, 2000, 9000, 48, 300, 1200]
+
+# --- Survival: patterns written are patterns read back, both allocators ---
+blocks = [] of Pointer(UInt8)
+seeds = [] of Int32
+index = 0
+while index < 256
+  size = sizes[index % sizes.size]
+  block = Pointer(UInt8).malloc(size.to_u64)
+  seed = index * 7 + 1
+  fill(block, size, seed)
+  blocks << block
+  seeds << seed
+  index = index + 1
+end
+index = 0
+while index < blocks.size
+  verify(blocks[index], sizes[index % sizes.size], seeds[index], "survival block #{index}")
+  index = index + 1
+end
+puts "survival: #{blocks.size} blocks across #{sizes.size} sizes hold their patterns"
+
+# --- Alignment: every pointer 8-aligned, both allocators ---
+index = 0
+while index < blocks.size
+  if blocks[index].address & 7 != 0
+    raise "alignment: block #{index} is not 8-aligned"
+  end
+  index = index + 1
+end
+puts "alignment: every pointer 8-aligned"
+
+# --- realloc: same-class growth, cross-class growth, and null, both allocators ---
+grown = Pointer(UInt8).malloc(24_u64)
+fill(grown, 24, 3)
+grown = grown.realloc(30_u64)
+verify(grown, 24, 3, "realloc within class")
+fill(grown, 30, 3)
+grown = grown.realloc(2000_u64)
+verify(grown, 30, 3, "realloc across classes")
+nothing = Pointer(UInt8).new(0_u64)
+nothing = nothing.realloc(64_u64)
+fill(nothing, 64, 9)
+verify(nothing, 64, 9, "realloc of null")
+puts "realloc: same-class, cross-class and null all hold their bytes"
+
+{% if flag?(:gc_iyi) %}
+  # --- Size classes: a request lands in its class, and the class is the payload ---
+  requests = [1, 15, 16, 17, 4095, 4096]
+  expected = [16, 16, 16, 32, 4096, 4096]
+  index = 0
+  while index < requests.size
+    block = IyiHeap.alloc(requests[index].to_u64)
+    arena = IyiHeap.containing(block)
+    raise "size classes: request #{requests[index]} is in no arena" if arena == 0
+    payload = IyiHeap.arena_chunk(arena) - IyiHeap::HEADER
+    if payload != expected[index].to_u64
+      raise "size classes: request #{requests[index]} landed in class #{payload.to_i64}, expected #{expected[index]}"
+    end
+    if block.address & 7 != 0
+      raise "size classes: request #{requests[index]} is not 8-aligned"
+    end
+    index = index + 1
+  end
+  puts "size classes: 1/15/16/17/4095/4096 -> 16/16/16/32/4096/4096, all 8-aligned"
+
+  # --- Addressability: a live block resolves, a foreign pointer answers 0 ---
+  probe = IyiHeap.alloc(100_u64)
+  arena = IyiHeap.containing(probe)
+  raise "addressability: live block is in no arena" if arena == 0
+  middle = Pointer(Void).new(probe.address + 50)
+  if IyiHeap.containing(middle) != arena
+    raise "addressability: block middle resolved to a different arena"
+  end
+  payload = IyiHeap.arena_chunk(arena) - IyiHeap::HEADER
+  if payload != 128_u64
+    raise "addressability: block of 100 resolved to class #{payload.to_i64}, expected 128"
+  end
+  local = 0_u64
+  foreign = IyiHeap.containing(pointerof(local).as(Void*))
+  if foreign != 0
+    raise "addressability: a stack word was claimed by arena #{foreign.to_i64.to_s(16)}"
+  end
+  puts "addressability: live block and its middle resolve to class 128, a stack word answers 0"
+
+  # --- Header: the size the realloc contract reads sits twenty-four bytes
+  # down, the type id and the mark word above it, and all three behave.
+  # The size is read back with the allocator's own arithmetic; the two
+  # collector words are written and read as raw words at their offsets, so a
+  # header in the wrong place is caught rather than inherited.
+  #
+  # The type id is a `u32` in the header and is checked here as the low half of
+  # the `u64` word that contains it, which is also how the collector reads it
+  # (`IyiHeap.read64`). That is not squeamishness about width: `UInt32` in this
+  # prelude has no `<`, no `>`, no `to_i64`, no `to_u64`, and its `==` answers
+  # false even for `x = 99_u32; x == 99_u32`. This check used to compare a
+  # `UInt32` against a literal and failed while the memory was perfectly
+  # correct. The prelude gap is real and wants its own fix; reading the word is
+  # what makes this check about the header instead of about that gap.
+  header_probe = IyiHeap.alloc(64_u64)
+  size_at = Pointer(UInt64).new(header_probe.address - 24_u64).value
+  raise "header: size at P-24 is #{size_at.to_i64}, expected 64" if size_at != 64_u64
+  Pointer(UInt32).new(header_probe.address - 16_u64).value = 99_u32
+  Pointer(UInt64).new(header_probe.address - 8_u64).value = 0x0101010101010101_u64
+  read_type = Pointer(UInt64).new(header_probe.address - 16_u64).value
+  read_mark = Pointer(UInt64).new(header_probe.address - 8_u64).value
+  if read_type != 99_u64 || read_mark != 0x0101010101010101_u64
+    raise "header: type id or mark word at P-16/P-8 did not round trip"
+  end
+  header_probe = header_probe.realloc(2000_u64)
+  moved_size = Pointer(UInt64).new(header_probe.address - 24_u64).value
+  raise "header: realloc kept the size at the old offset; got #{moved_size.to_i64}" if moved_size != 2000_u64
+  puts "header: size at P-24, type id and mark word above it, all live through a realloc"
+
+  # --- Clearing: a dirty chunk comes back zeroed through the clearing entry ---
+  dirty = IyiHeap.alloc(100_u64).as(Pointer(UInt8))
+  index = 0
+  while index < 100
+    dirty[index] = 170_u8
+    index = index + 1
+  end
+  IyiHeap.free(dirty.as(Void*))
+  fresh = IyiHeap.alloc(100_u64).as(Pointer(UInt8))
+  index = 0
+  while index < 100
+    if fresh[index] != 0_u8
+      raise "clearing: reused chunk dirty at byte #{index}: got #{fresh[index].to_i32}"
+    end
+    index = index + 1
+  end
+  # The same check end to end through codegen's clearing entry point:
+  # Pointer of a pointerful type routes to `__crystal_malloc64`.
+  words = Pointer(Pointer(UInt8)).malloc(16_u64)
+  index = 0
+  while index < 128
+    words.as(Pointer(UInt8))[index] = 170_u8
+    index = index + 1
+  end
+  IyiHeap.free(words.as(Void*))
+  words = Pointer(Pointer(UInt8)).malloc(16_u64)
+  index = 0
+  while index < 128
+    if words.as(Pointer(UInt8))[index] != 0_u8
+      raise "clearing: __crystal_malloc64 reused chunk dirty at byte #{index}"
+    end
+    index = index + 1
+  end
+  # And the header's own words: a reused chunk must come back with a fresh
+  # zero type id and mark word, whichever entry point handed it out, because
+  # a stale mark word is a live object the collector never scans.
+  # Read as the containing word for the same reason as the header check above:
+  # `UInt32` equality in this prelude answers false even against itself.
+  if Pointer(UInt64).new(words.address - 16_u64).value != 0_u64
+    raise "clearing: reused chunk carried a stale type id"
+  end
+  if Pointer(UInt64).new(words.address - 8_u64).value != 0_u64
+    raise "clearing: reused chunk carried a stale mark word"
+  end
+  puts "clearing: a freed chunk of 0xAA bytes comes back zeroed, directly, through __crystal_malloc64, and in its header"
+
+  # --- No corruption under reuse: freed chunks serve new owners, survivors unchanged ---
+  rblocks = [] of Pointer(UInt8)
+  rseeds = [] of Int32
+  index = 0
+  while index < 200
+    size = sizes[index % sizes.size]
+    block = Pointer(UInt8).malloc(size.to_u64)
+    seed = index * 13 + 5
+    fill(block, size, seed)
+    rblocks << block
+    rseeds << seed
+    index = index + 1
+  end
+  # Free every other block, newest first, which is not the allocation order.
+  index = rblocks.size - 2
+  while index >= 0
+    IyiHeap.free(rblocks[index].as(Void*))
+    index = index - 2
+  end
+  # Allocate again against the freed chunks, in a different size order, so a
+  # reused chunk that aliases a survivor overwrites it and is caught below.
+  nblocks = [] of Pointer(UInt8)
+  nseeds = [] of Int32
+  index = 0
+  while index < 100
+    size = sizes[(index * 3 + 1) % sizes.size]
+    block = Pointer(UInt8).malloc(size.to_u64)
+    seed = 7000 + index * 11
+    fill(block, size, seed)
+    nblocks << block
+    nseeds << seed
+    index = index + 1
+  end
+  index = 1
+  while index < rblocks.size
+    verify(rblocks[index], sizes[index % sizes.size], rseeds[index], "reuse survivor #{index}")
+    index = index + 2
+  end
+  index = 0
+  while index < nblocks.size
+    verify(nblocks[index], sizes[(index * 3 + 1) % sizes.size], nseeds[index], "reuse block #{index}")
+    index = index + 1
+  end
+  puts "reuse: 200 allocated, 100 freed out of order, 100 allocated again, every byte intact"
+
+  # --- Large objects: over the top class, round trip, listed, unlisted on free ---
+  big = 2097153
+  large = Pointer(UInt8).malloc(big.to_u64)
+  fill(large, big, 17)
+  verify(large, big, 17, "large object")
+  if IyiHeap.containing_large(large.as(Void*)) == 0
+    raise "large: a live large object is on no list"
+  end
+  if IyiHeap.containing(large.as(Void*)) != 0
+    raise "large: an arena claimed a large object"
+  end
+
+  # realloc across the large boundary in both directions: a class chunk
+  # growing past the top class, a large object growing to another mapping,
+  # and one shrinking back into a class. Each one allocates, copies the
+  # smaller of the two sizes and frees the old, so a lost byte or a leaked
+  # node shows up here rather than in a program.
+  crossing = Pointer(UInt8).malloc(500_u64)
+  fill(crossing, 500, 11)
+  crossing = crossing.realloc(2000000_u64)
+  verify(crossing, 500, 11, "realloc class to large")
+  fill(crossing, 3000, 21)
+  crossing = crossing.realloc(3000000_u64)
+  verify(crossing, 3000, 21, "realloc large to larger")
+  fill(crossing, 300, 31)
+  crossing = crossing.realloc(100_u64)
+  verify(crossing, 100, 31, "realloc large to class")
+  puts "realloc: class to large, large to larger and large back to class all hold their bytes"
+
+  # --- Traversal: the arena list and the large list both walk ---
+  arenas = 0
+  arena = IyiHeap.first_arena
+  while arena != 0
+    puts "  arena #{arenas}: chunk #{IyiHeap.arena_chunk(arena).to_i64} bytes, #{IyiHeap.arena_map(arena).to_i64} mapped"
+    arenas = arenas + 1
+    arena = IyiHeap.arena_next(arena)
+  end
+  larges = 0
+  node = IyiHeap.first_large
+  while node != 0
+    larges = larges + 1
+    node = IyiHeap.large_next(node)
+  end
+  raise "traversal: no arenas on the list" if arenas == 0
+  if larges != 1
+    raise "traversal: #{larges} large objects listed, expected 1"
+  end
+  puts "traversal: #{arenas} arenas and #{larges} large object walked"
+
+  IyiHeap.free(large.as(Void*))
+  if IyiHeap.first_large != 0
+    raise "large: still listed after free"
+  end
+  puts "large: 2 MiB over the top class round trips and unlists on free; bench/arena_large_probe.iyi proves the mapping is gone"
+{% else %}
+  puts "gc_iyi checks skipped: this build has the default bump allocator; -Dgc_iyi runs them"
+{% end %}
+
+# --- Speed: a long run of allocations, nanoseconds per allocation ---
+runs = 2000000
+sink = 0_u64
+start = monotonic_ns
+index = 0
+while index < runs
+  block = Pointer(UInt8).malloc(24_u64)
+  block[0] = 1_u8
+  sink = sink &+ block.address
+  index = index + 1
+end
+elapsed = monotonic_ns - start
+puts "speed: #{elapsed.unsafe_div(runs.to_u64).to_i64} ns per allocation over #{runs} (sink #{(sink & 1023).to_i64})"
+
+{% if flag?(:gc_iyi) %}
+  # The pair loop: what an allocation costs when its chunk is freed each
+  # time, which is the shape a collecting heap's mutator actually takes.
+  start = monotonic_ns
+  index = 0
+  while index < runs
+    block = Pointer(UInt8).malloc(24_u64)
+    block[0] = 1_u8
+    sink = sink &+ block.address
+    IyiHeap.free(block.as(Void*))
+    index = index + 1
+  end
+  elapsed = monotonic_ns - start
+  puts "speed: #{elapsed.unsafe_div(runs.to_u64).to_i64} ns per alloc+free pair over #{runs}"
+{% end %}
+
+puts "arena allocator: every check passed"

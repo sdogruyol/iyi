@@ -1,0 +1,11 @@
+# Breaks R-2: everything a module exports carries full parameter and return
+# types, because the signature is the whole of what a consumer reads. Drop the
+# return type and there is nothing to write into the artifact, so the omission
+# is refused where it is written rather than inferred from the body.
+module diagnostics/r2_missing_return_type
+
+pub def total(numbers : Array(Int32))
+  numbers.sum
+end
+
+puts total([1, 2, 3])

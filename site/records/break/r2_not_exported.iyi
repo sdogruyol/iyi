@@ -1,0 +1,11 @@
+# Breaks R-2: only what a module marks `pub` is reachable from outside it, and
+# `greeting` in `dep/greeter` carries no `pub`. Qualifying the call does not get
+# around that. It has to be genuinely unreachable rather than merely absent
+# from a `using`, because a `.iyimod` carries a module's exports and nothing
+# else, so if another module could call an unmarked name that artifact would
+# not be enough to compile against.
+module diagnostics/r2_not_exported
+
+import dep/greeter
+
+puts Dep::Greeter.greeting

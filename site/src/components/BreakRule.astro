@@ -1,0 +1,119 @@
+---
+/**
+ * Break this rule, and read what the compiler says about it.
+ *
+ * Every step of the learning path ends with one of these, and it is the part of
+ * a lesson that cannot be written. It carries two things and neither is
+ * authored: a program in the repository that was written to be rejected, and
+ * the verdict a real compiler gave it, recorded byte for byte in
+ * `site/records/diagnostics.json` by the recorder that ran it.
+ *
+ * Two decisions worth stating.
+ *
+ * The diagnostic is not summarised. `stderr` reaches the page exactly as the
+ * compiler wrote it, including the frame line it opens with and the em-dashes
+ * it prints, because a recording that has been tidied is no longer a recording.
+ * The one thing dropped is the trailing newline a stream ends with.
+ *
+ * The rule citation is pulled out of the recording and set in a footer, which
+ * is the treatment the art direction gives a diagnostic. iyi's errors name the
+ * rule they enforce, so the citation is a feature of the compiler and the page
+ * should say so rather than leaving it buried in the output. The premise beside
+ * it is SPEC.md's own sentence, read out of SPEC.md at build time.
+ */
+import Sample from "./Sample.astro";
+import { breakCase, ruleById, inlineMarkdown } from "../lib/lessons";
+import { renderRecording } from "../lib/recording";
+
+interface Props {
+  /** The case id in site/records/diagnostics.json. */
+  id: string;
+  /**
+   * Other files the reader has to see for the rejection to make sense: the two
+   * modules that close an import cycle, say. Each resolves through the same
+   * index every other listing on the site is read from, so a path that is not
+   * in the tree fails the build.
+   */
+  also?: string[];
+}
+
+const { id, also = [] } = Astro.props;
+
+const broken = breakCase(id);
+const rule = ruleById(broken.rule, `diagnostics.json case ${id}`);
+
+// The command is part of the recording, so it is set as the diagnostic's first
+// line in the same face the compiler's own "In ..." lines get: this is where,
+// not what.
+const recording = renderRecording(
+  `$ ${broken.command}\n${broken.stderr}`,
+  "diagnostic",
+);
+---
+
+<section class="break to-wide">
+  <hr class="rule" />
+  <p class="label">Break it</p>
+  <h2 class="break-title">{broken.title}</h2>
+  <Sample path={broken.path} />
+  {also.map((path) => <Sample path={path} />)}
+
+  <div class="diagnostic">
+    <pre set:html={recording} />
+    <span class="cites">
+      <span class="cited-rule">{rule.id}</span>
+      <span class="cited-premise" set:html={inlineMarkdown(rule.premise)} />
+      <span class="cited-where">
+        {rule.cite}. Recorded run, exit code {broken.exitCode}, {broken.recorded.compiler},
+        commit {broken.recorded.commit.slice(0, 12)}. Regenerate with <code
+          >{broken.recorded.command}</code
+        >.
+      </span>
+    </span>
+  </div>
+</section>
+
+<style>
+  .break {
+    margin-block-start: 3.4rem;
+  }
+
+  .break > .rule {
+    margin-block-end: 1.3rem;
+  }
+
+  .break-title {
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+    margin-block: 0.35rem 1.1rem;
+    max-width: var(--measure);
+  }
+
+  .break :global(.source),
+  .break .diagnostic {
+    margin-block: 1.5rem;
+  }
+
+  /* The cited footer. The rule the compiler named, the sentence SPEC.md states
+   * for it, and where the recording came from, in that order: the claim, then
+   * its authority, then its provenance. */
+  .cited-rule {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .cited-premise {
+    display: block;
+    margin-block-start: 0.25rem;
+  }
+
+  .cited-where {
+    display: block;
+    margin-block-start: 0.35rem;
+    color: var(--mute);
+  }
+
+  .cited-where code {
+    font-size: inherit;
+  }
+</style>

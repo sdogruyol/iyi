@@ -1,0 +1,83 @@
+{
+  "recorded": {
+    "compiler": "iyi 0.3.0-dev (built on Crystal 1.22.0-dev [af509de9e] (2026-08-23))",
+    "commit": "3975a179fc5d0c56572148c1f6ce46d5627da046",
+    "machine": "Darwin 25.5.0 arm64, Apple M5 Max",
+    "command": "npm run record:diagnostics",
+    "when": "2026-08-25T05:38:43.873Z"
+  },
+  "cases": [
+    {
+      "id": "r1-import-cycle",
+      "rule": "R-1",
+      "title": "two modules that import each other",
+      "path": "site/records/break/r1_import_cycle.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r1_import_cycle.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/dep/loop_b.iyi:5:1\n\n 5 | import dep/loop_a\n     ^\nError: import cycle\n\n    dep/loop_a -> dep/loop_b -> dep/loop_a\n\n`import` forms a DAG (R-1). A cycle has no initialisation order — a module initialises after every module it imports (SPEC.md III.5 rule 1), and here each would have to go after the other — and it is what makes at most one module able to define any given impl (SPEC.md IV.4). Move what the modules in the cycle share into a module they both import.\n"
+    },
+    {
+      "id": "r2-not-exported",
+      "rule": "R-2",
+      "title": "a name the module never exported",
+      "path": "site/records/break/r2_not_exported.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r2_not_exported.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/r2_not_exported.iyi:11:19\n\n 11 | puts Dep::Greeter.greeting\n                        ^-------\nError: Dep::Greeter does not export 'greeting'. Only what a module marks `pub` is reachable from outside it — see SPEC.md R-2\n"
+    },
+    {
+      "id": "r2-missing-return-type",
+      "rule": "R-2",
+      "title": "an exported def that does not say what it returns",
+      "path": "site/records/break/r2_missing_return_type.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r2_missing_return_type.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/r2_missing_return_type.iyi:7:9\n\n 7 | pub def total(numbers : Array(Int32))\n             ^----\nError: `total` is exported and does not say what it returns\n\nR-2 asks an exported signature for full types. A consumer types a call to this from the return type alone, since the body stays in this module: without one it infers `Nil`, and the symbol it then asks the linker for is not the symbol this module emitted.\n\nAnnotate the return type, or leave the def unexported.\n"
+    },
+    {
+      "id": "r2-wrong-return-type",
+      "rule": "R-2",
+      "title": "a body that does not honour its written return type",
+      "path": "site/records/break/r2_wrong_return_type.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r2_wrong_return_type.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/r2_wrong_return_type.iyi:6:41\n\n 6 | pub def total(numbers : Array(Int32)) : Int32\n                                             ^----\nError: method Diagnostics::R2WrongReturnType.total must return Int32 but it is returning String\n"
+    },
+    {
+      "id": "r2b-using-missing",
+      "rule": "R-2b",
+      "title": "an unqualified name with no using to bring it in",
+      "path": "site/records/break/r2b_using_missing.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r2b_using_missing.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/r2b_using_missing.iyi:9:6\n\n 9 | puts polite(\"iyi\")\n          ^-----\nError: undefined method 'polite' for Diagnostics::R2bUsingMissing:Module\n\n`polite` is exported by `dep/greeter`, and this file has not written `using`. Add `using dep/greeter` to bring its names in unqualified, or call it as `Dep::Greeter.polite` (SPEC.md R-2b)\n"
+    },
+    {
+      "id": "r3-orphan-impl",
+      "rule": "R-3",
+      "title": "an impl in a module that owns neither the trait nor the type",
+      "path": "site/records/break/r3_orphan_impl.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r3_orphan_impl.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/r3_orphan_impl.iyi:14:6\n\n 14 | impl Greet for User\n           ^\nError: can't implement Dep::Greeter::Greet for Dep::User::User in Diagnostics::R3OrphanImpl: an impl must live in the module that defines the trait (Dep::Greeter) or the module that defines the type (Dep::User). This is R-3, the orphan rule, and it is what lets coherence be checked without a global pass — see SPEC.md IV.4\n"
+    },
+    {
+      "id": "r3-unmet-trait-bound",
+      "rule": "R-3",
+      "title": "a type that does not implement a required trait",
+      "path": "site/records/break/r3_unmet_trait_bound.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/r3_unmet_trait_bound.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/r3_unmet_trait_bound.iyi:29:6\n\n 29 | puts announce(42)\n           ^-------\nError: Int32 does not implement Diagnostics::R3UnmetTraitBound::Greet, required by `T` in `announce`\n"
+    },
+    {
+      "id": "errors-non-exhaustive",
+      "rule": "III.1",
+      "title": "an error member left unhandled",
+      "path": "site/records/break/errors_non_exhaustive.iyi",
+      "command": "IYI_PATH=src iyi build --no-codegen --no-color site/records/break/errors_non_exhaustive.iyi",
+      "exitCode": 1,
+      "stderr": "Showing last frame. Use --error-trace for full trace.\n\nIn site/records/break/errors_non_exhaustive.iyi:28:1\n\n 28 | case read(\"missing\")\n      ^\nError: case is not exhaustive.\n\nMissing types:\n - Diagnostics::ErrorsNonExhaustive::IOError\n"
+    }
+  ]
+}

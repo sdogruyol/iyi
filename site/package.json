@@ -1,0 +1,25 @@
+{
+  "name": "iyi-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node scripts/facts.mjs && node scripts/reference.mjs && node scripts/samples.mjs && node scripts/records.mjs && node scripts/no-transcription.mjs && node scripts/blocker.mjs",
+    "record:wasm": "node scripts/record-wasm.mjs",
+    "record:diagnostics": "node scripts/record-diagnostics.mjs",
+    "record:highlight": "node scripts/record-highlight.mjs",
+    "record": "npm run record:wasm && npm run record:diagnostics && npm run record:highlight",
+    "predev": "npm run generate",
+    "dev": "astro dev",
+    "prebuild": "npm run generate",
+    "build": "astro build",
+    "postbuild": "node scripts/prose.mjs",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^7.0.7",
+    "@fontsource-variable/newsreader": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "astro": "^7.2.4"
+  }
+}

@@ -1,0 +1,357 @@
+---
+/**
+ * The path.
+ *
+ * Not a card grid and not a directory listing: a numbered walk with one
+ * starting point, where reading step three assumes you read step two. The step
+ * number is the `order` in the lesson's own frontmatter, checked by
+ * src/lib/lessons.ts to be unique and gapless, so the number on this page is
+ * the number in the file.
+ *
+ * The rule each step teaches is named beside it, carrying SPEC.md's own
+ * sentence, read out of SPEC.md's rule table and its section headings by
+ * scripts/samples.mjs. The rejection each step ends on is named too, carrying
+ * the title of a case in site/records/diagnostics.json, so the index cannot
+ * promise a recorded diagnostic that nobody ran.
+ */
+import Measure from "../../components/Measure.astro";
+import Page from "../../layouts/Page.astro";
+import {
+  sequence,
+  rulesOf,
+  breakCase,
+  inlineMarkdown,
+  lessonHref,
+  SPELLED,
+} from "../../lib/lessons";
+
+const lessons = await sequence();
+const base = import.meta.env.BASE_URL;
+
+const steps = lessons.map((lesson, i) => ({
+  lesson,
+  href: lessonHref(base, lesson),
+  rules: rulesOf(lesson),
+  broken: breakCase(lesson.data.breaks),
+  next: lessons[i + 1],
+}));
+
+const [first] = steps;
+const spelled = SPELLED[steps.length] ?? String(steps.length);
+const count = `${spelled[0].toUpperCase()}${spelled.slice(1)}`;
+---
+
+<Page
+  title="Learn iyi"
+  summary={`${count} steps in order, one rule each. Compile against declarations rather than bodies, write down what you export, own your own names, replace open classes with traits, and return errors as ordinary values.`}
+>
+  <div class="spread">
+    <div class="intro">
+      <p class="label">Learn</p>
+      <h1>{count} steps, one rule each</h1>
+      <p class="lede">
+        iyi is Crystal with one rule added, and that rule changes enough that
+        starting from the syntax would teach you the wrong thing. So the path
+        starts from the rule, takes the rules in the order they depend on each
+        other, and spends one step on each.
+      </p>
+      <p>
+        Every step is set the same way. It opens with what the rule says in the
+        specification's own words, shows the program in this repository it is
+        grounded in, teaches the rule from that program, then breaks the rule on
+        purpose and prints what a real compiler said about it. It closes with
+        what the rule bought. Nothing on these pages is a recollection of
+        something that once worked: the listings are read out of the files when
+        the page is built, the terminal sessions are quoted from README.md with
+        the lines they came from, and every compiler error is a recording of a
+        run, with the compiler and the commit that produced it stamped beside
+        it.
+      </p>
+      <p class="start">
+        <a href={first.href}>Start at step one, {first.lesson.data.title}</a>
+      </p>
+    </div>
+
+    <dl class="evidence to-rail chain">
+      <dt>the path</dt>
+      {
+        steps.map(({ lesson, rules }) => (
+          <dd>
+            <span class="chain-step">{lesson.data.order}</span>
+            <span class="chain-rule">{rules.map((rule) => rule.id).join(" ")}</span>
+          </dd>
+        ))
+      }
+      <dd class="chain-note">
+        Each identifier is the specification's own, and the sentence it states
+        for it is beside the step.
+      </dd>
+    </dl>
+  </div>
+
+  <ol class="sequence">
+    {
+      steps.map(({ lesson, href, rules, broken, next }) => (
+        <li class="spread step">
+          <hr class="rule to-wide" />
+
+          <div class="step-body">
+            <p class="label step-index">
+              Step {lesson.data.order} of {steps.length}
+              {lesson.data.order === 1 && <span class="here">start here</span>}
+            </p>
+            <ol class="ticks" aria-hidden="true">
+              {steps.map(({ lesson: other }) => (
+                <li
+                  class:list={[
+                    "tick",
+                    {
+                      done: other.data.order < lesson.data.order,
+                      here: other.data.order === lesson.data.order,
+                    },
+                  ]}
+                />
+              ))}
+            </ol>
+            <h2>
+              <a href={href}>{lesson.data.title}</a>
+            </h2>
+            <p class="step-summary" set:html={inlineMarkdown(lesson.data.summary)} />
+            <p class="step-onward">
+              {
+                next ? (
+                  <>
+                    Then step {next.data.order}, <a href={lessonHref(base, next)}>{next.data.title}</a>.
+                  </>
+                ) : (
+                  <>The last step. After it, the samples are the rest of the language.</>
+                )
+              }
+            </p>
+          </div>
+
+          <dl class="evidence to-rail">
+            <dt>teaches</dt>
+            {rules.map((rule) => (
+              <dd>
+                <span class="rule-id">{rule.id}</span>
+                <span class="premise" set:html={inlineMarkdown(rule.premise)} />
+              </dd>
+            ))}
+            <dt>grounded in</dt>
+            <dd>{lesson.data.sample}</dd>
+            <dt>breaks</dt>
+            <dd class="breaks">{broken.title}</dd>
+          </dl>
+        </li>
+      ))
+    }
+  </ol>
+
+  <div class="spread">
+    <section class="after to-wide">
+      <hr class="rule" />
+      <p class="label">After the last step</p>
+      <p class="after-body">
+        The samples are the rest of the language. <code>samples/iyi</code> holds{" "}
+        <Measure of="samples" /> programs, each written to document a part of the
+        design rather than to show off. <code>collections.iyi</code> ports an{" "}
+        <code>Enumerable</code> onto traits with associated types, which is where
+        step four starts paying real rent. <code>immutable.iyi</code> is a
+        shareable collection and the copy that makes it safe.{" "}
+        <code>init_order.iyi</code> is about what a module may do while it loads.
+        And <code>webapp.iyi</code> is the Kemal port whose source you deleted in
+        step one.
+      </p>
+    </section>
+  </div>
+</Page>
+
+<style>
+  .intro {
+    padding-block: 3.2rem 0.6rem;
+  }
+
+  .intro h1 {
+    margin-block: 0.5rem 1.1rem;
+  }
+
+  .lede {
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+    color: var(--graphite);
+  }
+
+  /* The one obvious way in. A path with no marked entrance is a directory. */
+  .start {
+    margin-block: 1.6rem 0;
+    font-size: var(--step-1);
+  }
+
+  .start a {
+    text-decoration: none;
+    border-bottom: 2px solid var(--signal);
+    padding-block-end: 2px;
+  }
+
+  /* The whole walk in the rail: the step numbers and the rule each one takes,
+   * in order, so the shape of the path is legible before any of it is read. */
+  .chain {
+    padding-block-start: 3.9rem;
+  }
+
+  .chain dd {
+    display: flex;
+    gap: 0.7rem;
+    margin-block-end: 0.3rem;
+  }
+
+  .chain-step {
+    color: var(--mute);
+  }
+
+  .chain-rule {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .chain dt + dt,
+  .chain dd + dt {
+    margin-block-start: 1.1rem;
+  }
+
+  .chain-note {
+    color: var(--graphite);
+  }
+
+  .sequence {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  /* `.spread` makes each step a grid, so the marker is gone and the number is
+   * rendered instead. That is deliberate: the number is content here, taken
+   * from the lesson's frontmatter, not a browser's list decoration. */
+  .step {
+    padding-block-end: 0.4rem;
+  }
+
+  .step > .rule {
+    margin-block: 2.4rem 1.5rem;
+  }
+
+  .step-index {
+    margin: 0 0 0.45rem;
+  }
+
+  /* The entrance, marked in the one colour this site spends on a caveat, used
+   * here for the one thing a reader has to see first. */
+  .here {
+    color: var(--signal);
+    margin-inline-start: 0.7rem;
+  }
+
+  /* Position in the path, drawn as instrument ticks. Structural: it is the
+   * `order` in the file, and it is not a claim about what has been read. */
+  .ticks {
+    display: flex;
+    gap: 0.32rem;
+    list-style: none;
+    margin: 0 0 0.9rem;
+    padding: 0;
+  }
+
+  .tick {
+    width: 1.6rem;
+    height: var(--hair);
+    background: var(--track);
+  }
+
+  .tick.done {
+    background: var(--hairline);
+  }
+
+  .tick.here {
+    height: 3px;
+    background: var(--ink);
+  }
+
+  .step h2 {
+    font-size: var(--step-2);
+    margin-block-end: 0.55rem;
+  }
+
+  .step h2 a {
+    text-decoration: none;
+    border-bottom: var(--hair) solid var(--hairline);
+    padding-block-end: 1px;
+  }
+
+  .step h2 a:hover {
+    border-bottom-color: var(--signal);
+  }
+
+  .step-summary {
+    max-width: 58ch;
+    color: var(--graphite);
+    margin-block-end: 0;
+  }
+
+  /* Each step hands off to the next here as well as at the foot of the lesson,
+   * because the index is where a reader decides whether this is a path. */
+  .step-onward {
+    margin-block: 0.9rem 0;
+    max-width: 58ch;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--mute);
+  }
+
+  .step-onward a {
+    color: var(--graphite);
+  }
+
+  .step .evidence {
+    margin-block: 0.35rem 0;
+  }
+
+  .rule-id {
+    display: block;
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .premise {
+    display: block;
+  }
+
+  .breaks {
+    color: var(--signal-deep);
+  }
+
+  @media (max-width: 62rem) {
+    .chain {
+      padding-block-start: 1.6rem;
+    }
+
+    .step .evidence {
+      margin-block-start: 1.1rem;
+    }
+  }
+
+  /* The end of the path. A walk should say where it stops. */
+  .after {
+    margin-block: 3rem 1rem;
+  }
+
+  .after .label {
+    margin-block: 1.3rem 0.8rem;
+  }
+
+  .after-body {
+    margin: 0;
+    max-width: var(--measure);
+    color: var(--graphite);
+  }
+</style>

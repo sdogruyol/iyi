@@ -1,0 +1,313 @@
+---
+/**
+ * The edit loop, drawn at 1:1 real time.
+ *
+ * This is the site's spine, and it is the project's own idea rather than a
+ * borrowed one: doc/assets/edit-loop.anim.svg is already an animated bar chart
+ * drawn by the run that measured it. This component is that chart with the two
+ * things a README cannot have.
+ *
+ * First, a control. The README's SVG loops forever because a static image has
+ * no other way to be seen; a page can wait until it is scrolled to, run once,
+ * and offer to run again. An infinite loop turns a measurement into decoration.
+ *
+ * Second, the spread. README.md publishes three sessions and says to read the
+ * columns against each other because they pay the same machine together. So
+ * every bar carries a whisker to its slowest reading, and the headline is the
+ * ratio, which held across all three. The bar is what varied. The ratio is the
+ * claim.
+ *
+ * Nothing here is typed in. Every value comes from bench/site_facts.py.
+ */
+import facts from "../generated/facts.json";
+
+const loop = facts.recorded.edit_loop;
+const sessions = loop.sessions as Array<Record<string, number>>;
+const series = loop.series as Array<{ key: string; label: string }>;
+
+// Scale to the slowest reading of any series in any session, so a whisker can
+// never run off the end of its own track.
+const ceiling = Math.max(
+  ...sessions.flatMap((s) => series.map((x) => s[x.key])),
+);
+
+const rows = series.map(({ key, label }) => {
+  const readings = sessions.map((s) => s[key]);
+  const fast = Math.min(...readings);
+  const slow = Math.max(...readings);
+  return {
+    key,
+    label,
+    fast,
+    slow,
+    spread: slow > fast,
+    fastPct: (fast / ceiling) * 100,
+    slowPct: (slow / ceiling) * 100,
+  };
+});
+
+const ratios = loop.ratios as number[];
+const lo = Math.min(...ratios);
+const hi = Math.max(...ratios);
+---
+
+<div class="chart" data-slowest={String(Math.max(...rows.map((r) => r.slow)))}>
+  <div class="chart-head">
+    <span class="label">the loop, at the speed you wait at</span>
+    <button class="replay" type="button" data-replay aria-live="off">
+      run again
+    </button>
+  </div>
+
+  <ol class="rows">
+    {
+      rows.map((row) => (
+        <li class="row" data-key={row.key}>
+          <code class="cmd">
+            <span class="prompt">$ </span>
+            {row.label}
+          </code>
+          <div class="gauge">
+            <div class="track"></div>
+            {row.spread && (
+              <div
+                class="whisker"
+                style={`left:${row.fastPct}%;width:${row.slowPct - row.fastPct}%`}
+                title={`slowest session ${row.slow.toFixed(2)} s`}
+              ></div>
+            )}
+            <div
+              class="bar"
+              style={`--to:${row.fastPct}%;--dur:${row.fast}s`}
+            ></div>
+            <span class="reading" style={`--at:${row.fastPct}%;--dur:${row.fast}s`}>
+              {row.fast.toFixed(2)} s
+            </span>
+          </div>
+        </li>
+      ))
+    }
+  </ol>
+
+  <p class="spread-note">
+    Bars are the fastest of {sessions.length} published sessions. The hairline
+    behind each one runs to that session's slowest reading, {
+      rows.find((r) => r.key === "crystal")!.slow.toFixed(2)
+    } s at the far end. The ratio held from {lo.toFixed(2)}x to {hi.toFixed(2)}x
+    while the seconds moved, which is why the ratio is the claim.
+  </p>
+</div>
+
+<script>
+  // Run once when seen, not on a loop. Honour reduced motion by showing the
+  // finished state rather than by animating faster: the animation IS the
+  // measurement, so a shortened one would be a false reading.
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+  document.querySelectorAll<HTMLElement>(".chart").forEach((chart) => {
+    const play = () => {
+      chart.classList.remove("running", "settled");
+      // Force a reflow so re-adding the class restarts the animation.
+      void chart.offsetWidth;
+      if (reduce.matches) {
+        chart.classList.add("settled");
+        return;
+      }
+      chart.classList.add("running");
+      const slowest = Number(chart.dataset.slowest ?? "0");
+      window.setTimeout(
+        () => chart.classList.add("settled"),
+        slowest * 1000 + 60,
+      );
+    };
+
+    chart
+      .querySelector<HTMLButtonElement>("[data-replay]")
+      ?.addEventListener("click", play);
+
+    const seen = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            play();
+            seen.disconnect();
+          }
+        }
+      },
+      { threshold: 0.45 },
+    );
+    seen.observe(chart);
+  });
+</script>
+
+<style>
+  .chart {
+    border: var(--hair) solid var(--hairline);
+    background: var(--raise);
+    padding: 0.9rem 1.1rem 1rem;
+  }
+
+  .chart-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-block-end: 0.8rem;
+    border-block-end: var(--hair) solid var(--hairline);
+  }
+
+  .replay {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--graphite);
+    background: none;
+    border: var(--hair) solid var(--hairline);
+    border-radius: 2px;
+    padding: 0.22rem 0.55rem;
+    cursor: pointer;
+  }
+
+  .replay:hover {
+    color: var(--ink);
+    border-color: var(--graphite);
+  }
+
+  .rows {
+    list-style: none;
+    margin: 0;
+    padding: 0.9rem 0 0;
+    display: grid;
+    gap: 0.55rem;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.25rem;
+  }
+
+  @media (min-width: 44rem) {
+    .row {
+      grid-template-columns: minmax(0, 26ch) minmax(0, 1fr);
+      align-items: center;
+      gap: 1rem;
+    }
+  }
+
+  .cmd {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: none;
+    border: 0;
+    padding: 0;
+  }
+
+  .prompt {
+    color: var(--mute);
+    user-select: none;
+  }
+
+  .gauge {
+    position: relative;
+    height: 15px;
+    display: flex;
+    align-items: center;
+  }
+
+  .track {
+    position: absolute;
+    inset-inline: 0;
+    height: 15px;
+    background: var(--track);
+    border-radius: 2px;
+  }
+
+  /* The spread. A hairline, hatched, because it is a range and not a value. */
+  .whisker {
+    position: absolute;
+    height: 15px;
+    border-block: var(--hair) solid var(--hairline);
+    background-image: repeating-linear-gradient(
+      45deg,
+      var(--hairline) 0 1px,
+      transparent 1px 4px
+    );
+  }
+
+  /* The bar is ink. A win is never coloured: the signal red on this site means
+   * a loss or a caveat, and iyi wins this row. */
+  .bar {
+    position: absolute;
+    left: 0;
+    height: 15px;
+    width: 0;
+    background: var(--ink);
+    border-radius: 2px;
+  }
+
+  .reading {
+    position: absolute;
+    left: var(--at);
+    margin-inline-start: 0.55rem;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    font-weight: 600;
+    color: var(--ink);
+    opacity: 0;
+    white-space: nowrap;
+  }
+
+  /* Real time: the bar takes exactly as long as the build took. */
+  .chart.running .bar {
+    animation: grow var(--dur) linear forwards;
+  }
+
+  .chart.running .reading {
+    animation: reveal var(--dur) steps(1, end) forwards;
+  }
+
+  /* After the run, and for reduced motion, the finished reading stands. */
+  .chart.settled .bar {
+    animation: none;
+    width: var(--to);
+  }
+
+  .chart.settled .reading {
+    animation: none;
+    opacity: 1;
+  }
+
+  @keyframes grow {
+    from {
+      width: 0;
+    }
+    to {
+      width: var(--to);
+    }
+  }
+
+  @keyframes reveal {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  .spread-note {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    line-height: 1.55;
+    color: var(--graphite);
+    margin: 1rem 0 0;
+    padding-block-start: 0.75rem;
+    border-block-start: var(--hair) solid var(--hairline);
+  }
+</style>

@@ -1,0 +1,9 @@
+# Breaks R-2b: `import` brings a module into scope under its qualified name and
+# nothing more. Unqualified names arrive only through a `using`, which the
+# consumer writes, so importing a module never quietly changes what a name in
+# this file means. `polite` is exported and still not in scope here.
+module diagnostics/r2b_using_missing
+
+import dep/greeter
+
+puts polite("iyi")

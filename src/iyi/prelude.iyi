@@ -465,7 +465,1248 @@ require "./file"
     LibGC.realloc(pointer, size)
   end
 {% else %}
-  {% if flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
+  {% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+    # iyi: `-Dgc_iyi` selects the size-class arena allocator of GC_DESIGN.md's
+    # Stage 2, the heap the collector's later stages grow from. It is opt-in:
+    # the default on every target stays the allocator below, and moving the
+    # default is a separate decision backed by measurement, not a thing to
+    # slip in beside the allocator itself. The flag names the collector it
+    # belongs to, but nothing here marks, scans or collects: this stage is
+    # allocation, explicit free and realloc. An object comes back only when a
+    # caller passes it to `IyiHeap.free`, which exists now precisely so it can
+    # be called explicitly and tested; Stage 6's sweep is the caller it is
+    # waiting for.
+    #
+    # The flag reaches POSIX and stops there, which is deliberate rather than
+    # unfinished. Linux binds it over raw syscalls and darwin over libSystem,
+    # the two interfaces this file already calls the platform's own. win32 and
+    # wasm32 keep the allocators they have under the flag: win32 has an open
+    # diagnosis for printing memory it was never given, and a new allocator
+    # landing there in the same change would confound that evidence; wasm32
+    # has no mmap, and its watermark arena is a separate design.
+    #
+    # Requests are rounded to size classes: 16, 32, 64 and doubling to 1 MiB,
+    # seventeen classes. A small fixed set is what keeps allocation and free
+    # O(1) list operations, and pure doubling is what keeps the per-class
+    # table to one page; the waste against the request is under half in the
+    # worst case, the standing trade for never splitting or coalescing. The
+    # class is the payload: a chunk is the class plus the twenty-four bytes
+    # under the user pointer, and every user pointer stays 8-aligned. A
+    # request over 1 MiB is large and gets a mapping of its own.
+    #
+    # Those twenty-four bytes are the object header, and GC_DESIGN.md's Stage
+    # 5 is where they became real. With `P` the pointer the program holds:
+    #
+    #     P-24   size       u64   the requested size, `realloc`'s contract
+    #     P-16   type_id    u32   index into the program's layout table
+    #     P-12   pad        u32
+    #     P-8    mark_word  u64   colour, flags, reserved; zero is white
+    #     P      user data
+    #
+    # The eight-byte size is Stage 2's, moved down rather than changed: it is
+    # still the only place that knows how much to copy when `realloc` crosses
+    # a class, and it is still read from under the pointer. The sixteen bytes
+    # above it are `Iyi::Collector::ObjectHeader` laid out exactly as
+    # `src/compiler/iyi/object_header.cr` defines it, because the compiler
+    # emits the type id into that word and this file reads it back.
+    #
+    # `malloc` cannot write the type id: it is handed a size and nothing
+    # else. Codegen writes it at the allocation site, right after the call
+    # returns, for every object allocated as an instance of a type. Every
+    # other allocation — a `Pointer(T).malloc` buffer, a closure's
+    # environment — keeps the zero the allocator leaves there, and zero is
+    # the sentinel for "no layout": the mark loop word-scans such an object
+    # conservatively instead of trusting a map it does not have. Zero is safe
+    # to spend that way because the compiler's numbering gives it to `Nil`
+    # alone, which is never allocated and never has a layout.
+    #
+    # One arena is one contiguous 16 MiB mmap region holding chunks of a
+    # single class. Sixteen rather than thirty-two because address space is
+    # the cheap half of a mapping (pages commit when touched, on Linux and
+    # darwin alike) and a small program pays one arena per class it uses. The
+    # first 64 bytes of an arena are its header: the next arena in the heap's
+    # list, the mapped length, the chunk size, and the fill cursor with the
+    # count of chunks never handed out. Everything that varies per class
+    # lives in the directory, one mapped page holding seventeen free-list
+    # heads and seventeen fill-arena pointers: the language has no array
+    # class variable, so seventeen scalars would mean a seventeen-way branch
+    # on every allocation, and one zeroed page is the whole table.
+    #
+    # Allocation pops the class's free list; with the list empty it carves
+    # the next fresh chunk from the class's fill arena, and with the arena
+    # spent it maps another and links it in. Free reads the class back out of
+    # the size the header carries and pushes the chunk onto that class's
+    # list. Neither walks the arena list: the list exists to be
+    # traversed, not to serve the hot path.
+    #
+    # The clearing contract is the stage's correctness point, because reuse
+    # is what is new here. `__crystal_malloc64` is documented to allocate
+    # *and clear*, and until now the clear was free: every byte any path
+    # handed out came from a fresh mapping, zero-filled by the kernel, and
+    # nothing was handed out twice. A free list hands memory back out, so a
+    # reused chunk is dirty, and a dirty chunk returned as cleared is the
+    # exact shape of the defect that has a win32 binary printing memory it
+    # was never given. A chunk popped from a free list is therefore cleared
+    # before it is returned; a chunk carved fresh from an arena is not,
+    # because the kernel already zeroed it and no second pass is owed. What
+    # is cleared is the whole class payload, not the requested size: the
+    # class rounds up, and the bytes past the request go to the caller with
+    # the chunk, reachable through the size header the next time a realloc
+    # grows into them. Zeroed slack keeps a reused chunk indistinguishable
+    # from a fresh mapping, the invariant every path in this file provided
+    # for free until now. `__crystal_malloc_atomic64` does not clear,
+    # matching `GC_malloc_atomic`: atomic means the collector never scans
+    # those bytes, so their initial value is no one's contract, and a reused
+    # chunk may come back dirty on that path on purpose.
+    #
+    # The header's own two words are the exception, and they are cleared on
+    # every reuse whichever path asked. They are not the caller's bytes, they
+    # are the collector's: a stale type id names the layout of whoever held
+    # the chunk last, which is a map read over an object that does not have
+    # that shape, and a stale mark word hands out an object that is already
+    # black and will never be scanned again. Both are false negatives, which
+    # is the one class of error this collector cannot tolerate, so the clear
+    # is unconditional there.
+    #
+    # `realloc` keeps the size-header contract: within one class, growing or
+    # shrinking, it returns the same chunk with the header rewritten; across
+    # classes it allocates, copies the smaller of the two requested sizes,
+    # and frees the old chunk. A null pointer still means allocate, through
+    # the clearing path, which is what `GC_realloc`'s null means.
+    #
+    # Large objects, over the top class, get one mmap region each and a node
+    # on a separate list: the list's next pointer and the mapped length in
+    # the sixteen bytes under the object header, so the forty bytes below a
+    # large object's user pointer are next, mapped, then the same
+    # size/type_id/mark_word header a class chunk carries. `realloc` and
+    # `free` therefore read one layout for both.
+    # Free unlinks the node and releases the mapping with `munmap`, checked
+    # the way `__iyi_mmap` is checked, because a release that failed quietly
+    # would leak the mapping with the node that named it already gone.
+    #
+    # Addressability is a question Stage 3's root scanning asks of every
+    # word, and it is a requirement now: `IyiHeap.containing(pointer)` walks
+    # the arena list and answers the containing arena's header address, or 0
+    # for a pointer in no arena, and the header's chunk field then names the
+    # size class. `IyiHeap.containing_large(pointer)` asks the same of the
+    # large-object list. A large object answers 0 from `containing`, because
+    # it is in no arena and the answer must never be a wrong arena; 0 from
+    # both is how a pointer that is not the heap's is reported. The walk is
+    # linear in arenas of 16 MiB each, so it is short; a page directory is
+    # Stage 3's optimization if profiles say so, not a Stage 2 requirement.
+    # Traversability is the same shape: `first_arena` and `arena_next`
+    # enumerate the arenas for Stage 6's sweep, `first_large` and
+    # `large_next` the large objects, and a list nothing can enumerate would
+    # fail the next stage.
+    #
+    # The state is three class variables with literal zero initializers plus
+    # the directory page, under the bump branch's rule: `$` globals are
+    # refused, a `fun` body cannot reach `@@` state, and literal initializers
+    # fold into the LLVM global's static zero, so zero means "not yet mapped"
+    # rather than a value startup installs. The entry points below stay
+    # `fun`s forwarding one frame into the class, the price of the only
+    # state-carrying construct the language offers.
+    {% if flag?(:darwin) %}
+      # `mmap` and `munmap` are libSystem's here, the same standing `write`
+      # has at the top of this file: Apple documents libSystem as the
+      # platform's interface and raw syscalls as not a stable ABI.
+      # PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x1002 on
+      # darwin, and a failed `mmap` answers MAP_FAILED rather than -errno.
+      lib LibC
+        fun mmap(addr : Void*, len : UInt64, prot : Int32, flags : Int32, fd : Int32, offset : Int64) : Void*
+        fun munmap(address : Void*, length : UInt64) : Int32
+      end
+
+      fun __iyi_mmap(length : UInt64) : Pointer(Void)
+        result = LibC.mmap(Pointer(Void).new(0_u64), length, 3, 0x1002, -1, 0_i64)
+        if result.address == 0xFFFFFFFFFFFFFFFF_u64
+          __iyi_write(1, "iyi: out of memory\n".to_unsafe.as(Void*), 19_u64)
+          __iyi_exit(1)
+        end
+        result
+      end
+
+      fun __iyi_munmap(address : UInt64, length : UInt64) : Nil
+        if LibC.munmap(Pointer(Void).new(address), length) != 0
+          __iyi_write(1, "iyi: munmap failed\n".to_unsafe.as(Void*), 19_u64)
+          __iyi_exit(1)
+        end
+      end
+    {% else %}
+      # `mmap` the way the bump branch binds it, a raw syscall with the
+      # numbers `src/syscall/x86_64-linux.cr` and `aarch64-linux.cr` carry.
+      # `munmap` joins it here because large objects are released in this
+      # stage: syscall 11 on x86_64 and 215 on aarch64, checked rather than
+      # assumed for `__iyi_mmap`'s reason, a failure answered with -errno in
+      # the result register rather than a flag.
+      fun __iyi_mmap(length : UInt64) : Pointer(Void)
+        result = uninitialized Int64
+        {% if flag?(:x86_64) %}
+          # PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22.
+          asm("syscall" : "={rax}"(result)
+                        : "{rax}"(9_i64), "{rdi}"(0_i64), "{rsi}"(length), "{rdx}"(3_i64),
+                          "{r10}"(34_i64), "{r8}"(-1_i64), "{r9}"(0_i64)
+                        : "rcx", "r11", "memory"
+                        : "volatile")
+        {% else %}
+          asm("svc #0" : "={x0}"(result)
+                       : "{x8}"(222_i64), "{x0}"(0_i64), "{x1}"(length), "{x2}"(3_i64),
+                         "{x3}"(34_i64), "{x4}"(-1_i64), "{x5}"(0_i64)
+                       : "memory"
+                       : "volatile")
+        {% end %}
+        # A failed raw syscall answers with -errno in the result register
+        # rather than a flag: -4095..-1 is errno's whole range.
+        if result < 0 && result >= -4095
+          __iyi_write(1, "iyi: out of memory\n".to_unsafe.as(Void*), 19_u64)
+          __iyi_exit(1)
+        end
+        Pointer(Void).new(result.to_u64)
+      end
+
+      fun __iyi_munmap(address : UInt64, length : UInt64) : Nil
+        result = uninitialized Int64
+        {% if flag?(:x86_64) %}
+          asm("syscall" : "={rax}"(result)
+                        : "{rax}"(11_i64), "{rdi}"(address), "{rsi}"(length)
+                        : "rcx", "r11", "memory"
+                        : "volatile")
+        {% else %}
+          asm("svc #0" : "={x0}"(result)
+                       : "{x8}"(215_i64), "{x0}"(address), "{x1}"(length)
+                       : "memory"
+                       : "volatile")
+        {% end %}
+        if result < 0 && result >= -4095
+          __iyi_write(1, "iyi: munmap failed\n".to_unsafe.as(Void*), 19_u64)
+          __iyi_exit(1)
+        end
+      end
+    {% end %}
+
+    class IyiHeap
+      MAP = 16777216_u64
+      TOP = 1048576_u64
+      HEAD = 64_u64
+      DIR_LEN = 4096_u64
+      FILL = 17
+
+      # The object header, named once. `HEADER` is what sits between a chunk's
+      # head and the pointer the program holds: the eight-byte size plus the
+      # sixteen-byte `ObjectHeader`. `OFF_TYPE` and `OFF_MARK` are the type id
+      # and the mark word, as offsets from the chunk head, which is the same
+      # thing as P-16 and P-8 read from the other end. `LARGE_USER` is the
+      # distance from a large object's node to its user pointer: the node's
+      # next and mapped words, then the same header.
+      HEADER = 24_u64
+      OFF_SIZE = 0_u64
+      OFF_TYPE = 8_u64
+      OFF_MARK = 16_u64
+      LARGE_USER = 40_u64
+
+      OFF_NEXT = 0_u64
+      OFF_MAP = 8_u64
+      OFF_CHUNK = 16_u64
+      OFF_CURSOR = 24_u64
+      OFF_LEFT = 32_u64
+
+      @@directory : UInt64 = 0_u64
+      @@arenas : UInt64 = 0_u64
+      @@large : UInt64 = 0_u64
+
+      def self.read64(address : UInt64) : UInt64
+        Pointer(UInt64).new(address).value
+      end
+
+      def self.write64(address : UInt64, value : UInt64) : Nil
+        Pointer(UInt64).new(address).value = value
+      end
+
+      def self.directory : Pointer(UInt64)
+        if @@directory == 0
+          @@directory = __iyi_mmap(DIR_LEN).address
+        end
+        Pointer(UInt64).new(@@directory)
+      end
+
+      def self.class_index(size : UInt64) : Int32
+        index = 0
+        capacity = 16_u64
+        while capacity < size
+          capacity = capacity + capacity
+          index = index + 1
+        end
+        index
+      end
+
+      def self.payload(index : Int32) : UInt64
+        16_u64.unsafe_shl(index)
+      end
+
+      def self.class_for(size : UInt64) : UInt64
+        payload(class_index(size))
+      end
+
+      def self.alloc(size : UInt64) : Void*
+        Pointer(Void).new(take(size, true) + HEADER)
+      end
+
+      def self.alloc_atomic(size : UInt64) : Void*
+        Pointer(Void).new(take(size, false) + HEADER)
+      end
+
+      def self.take(size : UInt64, clear : Bool) : UInt64
+        return take_large(size) if size > TOP
+        index = class_index(size)
+        table = directory
+        head = table[index]
+        if head != 0
+          table[index] = read64(head)
+          # The type id and the mark word go first, on both paths: they are
+          # the collector's words rather than the caller's, and a stale one
+          # is a live object the mark loop misses.
+          write64(head + OFF_TYPE, 0_u64)
+          write64(head + OFF_MARK, 0_u64)
+          clear_block(head + HEADER, payload(index)) if clear
+          write64(head + OFF_SIZE, size)
+          return head
+        end
+        carve(table, size, index)
+      end
+
+      def self.carve(table : Pointer(UInt64), size : UInt64, index : Int32) : UInt64
+        arena = table[FILL + index]
+        if arena == 0 || read64(arena + OFF_LEFT) == 0
+          arena = map_arena(index)
+          table[FILL + index] = arena
+        end
+        cursor = read64(arena + OFF_CURSOR)
+        write64(arena + OFF_CURSOR, cursor + read64(arena + OFF_CHUNK))
+        write64(arena + OFF_LEFT, read64(arena + OFF_LEFT) - 1)
+        write64(cursor + OFF_SIZE, size)
+        cursor
+      end
+
+      def self.map_arena(index : Int32) : UInt64
+        base = __iyi_mmap(MAP).address
+        chunk = payload(index) + HEADER
+        write64(base + OFF_NEXT, @@arenas)
+        write64(base + OFF_MAP, MAP)
+        write64(base + OFF_CHUNK, chunk)
+        write64(base + OFF_CURSOR, base + HEAD)
+        write64(base + OFF_LEFT, (MAP - HEAD).unsafe_div(chunk))
+        @@arenas = base
+        base
+      end
+
+      def self.take_large(size : UInt64) : UInt64
+        mapped = size + LARGE_USER
+        base = __iyi_mmap(mapped).address
+        write64(base + OFF_NEXT, @@large)
+        write64(base + OFF_MAP, mapped)
+        write64(base + 16 + OFF_SIZE, size)
+        @@large = base
+        base + 16
+      end
+
+      def self.free(pointer : Void*) : Nil
+        return if pointer.address == 0
+        head = pointer.address - HEADER
+        size = read64(head)
+        if size <= TOP
+          index = class_index(size)
+          table = directory
+          write64(head, table[index])
+          table[index] = head
+        else
+          free_large(head)
+        end
+      end
+
+      def self.free_large(head : UInt64) : Nil
+        base = head - 16
+        previous = 0_u64
+        node = @@large
+        while node != 0
+          if node == base
+            if previous == 0
+              @@large = read64(node)
+            else
+              write64(previous, read64(node))
+            end
+            break
+          end
+          previous = node
+          node = read64(node)
+        end
+        __iyi_munmap(base, read64(base + 8))
+      end
+
+      # Same-chunk growth within a class, allocate-and-copy across one,
+      # because the old size rides under the object header, which is the only
+      # place that knows it. The new chunk's type id stays zero, which is
+      # right: a reallocated buffer is raw memory whose old map, if it had
+      # one, described a different number of bytes, and zero means the mark
+      # loop word-scans it conservatively instead.
+      def self.realloc(pointer : Void*, size : UInt64) : Void*
+        return alloc(size) if pointer.address == 0
+        head = pointer.address - HEADER
+        old_size = read64(head)
+        if old_size <= TOP && size <= TOP && class_index(old_size) == class_index(size)
+          write64(head + OFF_SIZE, size)
+          return pointer
+        end
+        new_pointer = alloc(size)
+        source = pointer.as(Pointer(UInt8))
+        destination = new_pointer.as(Pointer(UInt8))
+        limit = old_size < size ? old_size : size
+        index = 0_u64
+        while index < limit
+          (destination + index.to_i64).value = (source + index.to_i64).value
+          index = index + 1
+        end
+        free(pointer)
+        new_pointer
+      end
+
+      # The whole payload, word at a time: pointer arithmetic counts
+      # elements here, so eight bytes is one step, not eight.
+      def self.clear_block(start : UInt64, count : UInt64) : Nil
+        words = Pointer(UInt64).new(start)
+        filled = 0_u64
+        while filled + 8 <= count
+          words.value = 0_u64
+          words = words + 1_i64
+          filled = filled + 8
+        end
+        bytes = Pointer(UInt8).new(start + filled)
+        while filled < count
+          bytes.value = 0_u8
+          bytes = bytes + 1_i64
+          filled = filled + 1
+        end
+      end
+
+      def self.containing(pointer : Void*) : UInt64
+        address = pointer.address
+        arena = @@arenas
+        while arena != 0
+          if address >= arena + HEAD && address < arena + read64(arena + OFF_MAP)
+            return arena
+          end
+          arena = read64(arena + OFF_NEXT)
+        end
+        0_u64
+      end
+
+      def self.containing_large(pointer : Void*) : UInt64
+        address = pointer.address
+        node = @@large
+        while node != 0
+          if address >= node + LARGE_USER && address < node + read64(node + OFF_MAP)
+            return node
+          end
+          node = read64(node)
+        end
+        0_u64
+      end
+
+      def self.first_arena : UInt64
+        @@arenas
+      end
+
+      def self.arena_next(arena : UInt64) : UInt64
+        read64(arena + OFF_NEXT)
+      end
+
+      def self.arena_map(arena : UInt64) : UInt64
+        read64(arena + OFF_MAP)
+      end
+
+      def self.arena_chunk(arena : UInt64) : UInt64
+        read64(arena + OFF_CHUNK)
+      end
+
+      # The fill cursor names where carving stopped, which is what tells a
+      # chunk that was handed out from the untouched tail of an arena. Stage 3
+      # asks it of every candidate pointer and Stage 6's sweep will ask it of
+      # every arena, so it is an accessor beside the others rather than a
+      # thing either stage reaches into the header for.
+      def self.arena_cursor(arena : UInt64) : UInt64
+        read64(arena + OFF_CURSOR)
+      end
+
+      def self.first_large : UInt64
+        @@large
+      end
+
+      def self.large_next(node : UInt64) : UInt64
+        read64(node)
+      end
+
+      def self.large_mapped(node : UInt64) : UInt64
+        read64(node + 8)
+      end
+    end
+
+    # Codegen emits calls to these by name for every allocation, so they are not
+    # optional and their names are not ours to choose.
+    fun __crystal_malloc64(size : UInt64) : Void*
+      IyiHeap.alloc(size)
+    end
+
+    fun __crystal_malloc_atomic64(size : UInt64) : Void*
+      IyiHeap.alloc_atomic(size)
+    end
+
+    fun __crystal_realloc64(pointer : Void*, size : UInt64) : Void*
+      IyiHeap.realloc(pointer, size)
+    end
+
+    # `memset` is defined locally for the bump branch's reason: codegen itself
+    # reaches for the name (`pre_initialize_aggregate` and
+    # `generic_array_malloc` lower to the LLVM `llvm.memset` intrinsic, which
+    # becomes a C `memset` call once the size is not a constant), and a
+    # definition with the same name, types and return is the only thing that
+    # can intercept that. The bulk goes eight bytes at a time, and the word
+    # store advances one word per store, because pointer arithmetic here
+    # counts elements: eight bytes is one step, not eight. The byte loop
+    # carries the tail, and the pattern word is the byte tiled eight wide.
+    fun memset(destination : Void*, value : Int32, count : UInt64) : Void*
+      byte = value.to_u8!
+
+      word = byte.to_u64 * 0x0101010101010101_u64
+      words = destination.as(Pointer(UInt64))
+      filled = 0_u64
+      while filled + 8_u64 <= count
+        words.value = word
+        words = words + 1_i64
+        filled = filled + 8_u64
+      end
+      bytes = words.as(Pointer(UInt8))
+      while filled < count
+        bytes.value = byte
+        bytes = bytes + 1_i64
+        filled = filled + 1_u64
+      end
+      destination
+    end
+
+    # GC_DESIGN.md's Stage 3: the root set, made enumerable. Nothing marks and
+    # nothing collects here. What lands is the answer to "where could a
+    # pointer to a live object be", asked of the one thread this language has,
+    # and the answer to "is this word one", asked of the heap Stage 2 built.
+    # Stage 5 passes a marking function to `IyiRoots.each_root` and that is
+    # the whole interface it needs; `bench/root_exercise.iyi` is the only
+    # caller until then, and it is what says the mechanism works.
+    #
+    # Conservative, and deliberately biased toward retaining. A word that is
+    # not a pointer but lands inside an allocated chunk keeps that chunk alive
+    # for one cycle, which costs memory. A word that IS a pointer and is not
+    # reported frees a live object, which costs correctness. Every decision
+    # below is made in that direction: when in doubt, retain.
+    #
+    # Three places a root can be, and the second is the one that gets missed:
+    #
+    # 1. The stack, word by word between the current stack pointer and the
+    #    base. Both targets grow the stack downward, so the stack pointer is
+    #    the low end and the base is the high one, and the scan runs upward
+    #    from the first 8-aligned address. Only aligned words are candidates:
+    #    a pointer the compiler stored is 8-aligned on both targets, so an
+    #    unaligned word is a coincidence of neighbouring bytes and not a
+    #    reference anything can follow.
+    #
+    # 2. The registers. A root can sit in a callee-saved register and appear
+    #    nowhere on the stack, so a collector that scans only the stack frees
+    #    a live object. This is the part of GC_DESIGN.md's Stage 4 that is
+    #    real without threads: there is no thread to suspend and no register
+    #    state to read out of one, but the register file of the thread that
+    #    is running still holds references. They are spilled to memory before
+    #    the scan and that memory is a root range of its own.
+    #
+    # 3. The globals, whose ranges come from the platform rather than from a
+    #    guess. A range that cannot be obtained is fatal rather than empty,
+    #    because a missing root range is a collector that frees live objects
+    #    and an empty range looks exactly like a clean scan.
+    #
+    # Fibers are Stage 3's fourth task, and since 0.4.0 they exist: the
+    # concurrency runtime in `concurrency.iyi` parks fibers whose 256 KiB
+    # stacks this walk never reaches. **A parked fiber's stack is an
+    # unscanned root range**, so an object reachable only from one would be
+    # freed live if a collection ran while it was parked. That has no way to
+    # happen today — nothing triggers a collection except the exercises, and
+    # they are single-fiber — which is why this is a recorded gap rather
+    # than a bug: before anything calls `IyiMark.collect` from a program
+    # that spawns, `each_root` must grow a walk of the scheduler's registry,
+    # each parked fiber's [saved stack pointer, stack top] as a range.
+    #
+    # What is NOT here, for the same reason: nothing suspends a thread. Stage
+    # 4's `SIGSTOP` on Linux and Mach `thread_suspend` on darwin stop threads
+    # this runtime cannot create, and code that stops nothing cannot be
+    # tested for stopping the right things.
+    {% if flag?(:darwin) %}
+      # The stack base and the global segments, from libSystem, which has the
+      # same standing here that `write` and `mmap` do: Apple documents it as
+      # the platform's interface and raw syscalls as not a stable ABI.
+      # `pthread_get_stackaddr_np` is the sanctioned answer for the highest
+      # address of a thread's stack, and dyld's image list is the sanctioned
+      # answer for where a Mach-O image's segments landed after sliding.
+      lib LibC
+        fun pthread_self : Void*
+        fun pthread_get_stackaddr_np(thread : Void*) : Void*
+        fun _dyld_get_image_header(index : Int32) : Void*
+        fun _dyld_get_image_vmaddr_slide(index : Int32) : Int64
+      end
+    {% else %}
+      # The static data span on Linux, from the two symbols the link already
+      # defines: `__data_start` at the front of `.data` and `_end` past the
+      # back of `.bss`, which is GC_DESIGN.md's "`__data_start` to
+      # `__bss_end`" written the way the linker spells it. Declaring them and
+      # taking their addresses costs no library: `_end` comes from the linker
+      # itself and `__data_start` from the C runtime object every link
+      # template already adds, so they arrive as two undefined symbols and no
+      # new `-l`. A binary whose link provides neither fails at the link
+      # rather than scanning nothing at run time.
+      lib LibIyiImage
+        $__data_start : UInt8
+        $_end : UInt8
+      end
+    {% end %}
+
+    class IyiRoots
+      # Six callee-saved registers on x86_64 and twelve on aarch64, named
+      # where they are spilled.
+      {% if flag?(:x86_64) %}
+        SPILL = 48_u64
+      {% else %}
+        SPILL = 96_u64
+      {% end %}
+      PAGE = 4096_u64
+      MAPS = 65536_u64
+
+      # The same rule the allocator's state lives under: `$` globals are
+      # refused, a `fun` body cannot reach `@@` state, and a literal
+      # initializer folds into the LLVM global's static zero, so zero means
+      # "not discovered yet" rather than a value startup code installs. There
+      # is no array class variable either, which is why the register spill
+      # buffer is a mapped page named by one of these rather than a field.
+      @@spill : UInt64 = 0_u64
+      @@stack_base : UInt64 = 0_u64
+      @@data_low : UInt64 = 0_u64
+      @@data_high : UInt64 = 0_u64
+      @@const_low : UInt64 = 0_u64
+      @@const_high : UInt64 = 0_u64
+      @@found_globals : UInt64 = 0_u64
+
+      # A root range that cannot be obtained ends the program. The whole
+      # point of the range is that missing it frees live objects, so a
+      # diagnosis now is cheaper than a corrupted heap later.
+      def self.fatal(message : String) : NoReturn
+        __iyi_write(1, message.to_unsafe.as(Void*), message.bytesize.to_u64)
+        __iyi_exit(1)
+      end
+
+      # One page of its own for the register spill, mapped on first use the
+      # way the allocator's directory is. It is deliberately not heap memory:
+      # a spill buffer taken from `IyiHeap` would be a chunk the scan then
+      # reports as a live object, and a chunk holding a raw pointer to
+      # everything every register held.
+      def self.spill : UInt64
+        @@spill = __iyi_mmap(PAGE).address if @@spill == 0
+        @@spill
+      end
+
+      # The callee-saved registers, stored where the scan can see them.
+      # x86_64 System V preserves rbx, rbp and r12 through r15 across a call;
+      # aarch64 AAPCS64 preserves x19 through x28, x29 the frame pointer and
+      # x30 the link register. The caller-saved registers are not captured
+      # and do not need to be: their convention is that a caller keeps
+      # nothing live in them across a call, so any value still wanted was
+      # written to the frame that the stack scan already covers. The
+      # floating-point callee-saved registers (d8 to d15, xmm on Windows) are
+      # not captured either, because nothing in this language puts an object
+      # pointer in one.
+      #
+      # The destination is pinned to a caller-saved register, rdi or x0, so
+      # that the register holding it can never be one of the registers being
+      # captured. Slots left over from an earlier spill stay as they were,
+      # which retains a little more than it must and never less.
+      def self.spill_registers : Nil
+        buffer = spill
+        {% if flag?(:x86_64) %}
+          asm("movq %rbx, 0($0)
+               movq %rbp, 8($0)
+               movq %r12, 16($0)
+               movq %r13, 24($0)
+               movq %r14, 32($0)
+               movq %r15, 40($0)" :: "{rdi}"(buffer) : "memory" : "volatile")
+        {% else %}
+          asm("stp x19, x20, [$0, #0]
+               stp x21, x22, [$0, #16]
+               stp x23, x24, [$0, #32]
+               stp x25, x26, [$0, #48]
+               stp x27, x28, [$0, #64]
+               stp x29, x30, [$0, #80]" :: "{x0}"(buffer) : "memory" : "volatile")
+        {% end %}
+      end
+
+      # The low end of the stack, read out of the register that names it.
+      # Taken here rather than from the address of a local because a local's
+      # address is above whatever the current frame has already pushed, and
+      # the difference is exactly the words a compiler spills a pointer into.
+      def self.stack_pointer : UInt64
+        value = uninitialized UInt64
+        {% if flag?(:x86_64) %}
+          asm("movq %rsp, $0" : "=r"(value) :: : "volatile")
+        {% else %}
+          asm("mov $0, sp" : "=r"(value) :: : "volatile")
+        {% end %}
+        value
+      end
+
+      # The high end, discovered once. The main thread's stack grows down
+      # from a fixed top on both targets, so the number does not change over
+      # a run and reading it lazily is the same answer as recording it at
+      # startup, without the startup cost for a program that never collects.
+      def self.stack_base : UInt64
+        @@stack_base = discover_stack_base if @@stack_base == 0
+        @@stack_base
+      end
+
+      {% if flag?(:darwin) %}
+        # What this number is: the address one past the highest byte of the
+        # main thread's stack, which is what `pthread_get_stackaddr_np`
+        # returns and is the true base rather than an approximation of it.
+        def self.discover_stack_base : UInt64
+          base = LibC.pthread_get_stackaddr_np(LibC.pthread_self).address
+          fatal("iyi: stack base unavailable\n") if base == 0
+          base
+        end
+      {% else %}
+        # What this number is: the end address of the kernel's `[stack]`
+        # mapping for this process, read out of `/proc/self/maps`, which is
+        # the true base and not an approximation. The address of a local in
+        # `main` was the alternative and it is not the same number: it sits
+        # below argv, envp and the auxiliary vector, which the kernel places
+        # at the top of that mapping, so a base taken there is too low and a
+        # base that is too low silently loses roots.
+        #
+        # Reading a file is three syscalls this file already issues. The
+        # buffer is a mapping of its own rather than a heap chunk, because
+        # the heap is the thing being described and a scratch chunk in it
+        # would be one more object every later scan has to reason about.
+        def self.discover_stack_base : UInt64
+          buffer = __iyi_mmap(MAPS).address
+          handle = __iyi_open_read("/proc/self/maps".to_unsafe)
+          fatal("iyi: /proc/self/maps unreadable\n") if handle < 0
+          filled = 0_u64
+          while filled < MAPS
+            count = __iyi_read(handle.to_i32, Pointer(Void).new(buffer + filled), MAPS - filled)
+            break if count <= 0
+            filled = filled + count.to_u64
+          end
+          __iyi_close(handle)
+          base = stack_end_in_maps(buffer, filled)
+          __iyi_munmap(buffer, MAPS)
+          # The `[stack]` line is near the end of the file, so a read that
+          # filled the buffer and stopped short reports no line rather than a
+          # wrong one, and this is where that becomes a diagnosis.
+          fatal("iyi: no [stack] line in /proc/self/maps\n") if base == 0
+          base
+        end
+      {% end %}
+
+      # `/proc/self/maps` is a line per mapping, "low-high perms ..." in hex,
+      # with the region's name last. The line whose name is `[stack]` is the
+      # main thread's, and the number after the dash is its end. Kept off the
+      # platform branch and reachable on both, because parsing text is the
+      # half of this that a test can exercise anywhere and the syscalls are
+      # the half that cannot leave Linux.
+      def self.stack_end_in_maps(buffer : UInt64, length : UInt64) : UInt64
+        bytes = Pointer(UInt8).new(buffer)
+        start = 0_u64
+        index = 0_u64
+        while index <= length
+          if index == length || (bytes + index.to_i64).value == 10_u8
+            return line_stack_end(bytes, start, index) if line_names_stack?(bytes, start, index)
+            start = index + 1
+          end
+          index = index + 1
+        end
+        0_u64
+      end
+
+      def self.line_names_stack?(bytes : Pointer(UInt8), start : UInt64, stop : UInt64) : Bool
+        return false if stop < start + 7
+        name = "[stack]".to_unsafe
+        cursor = stop - 7
+        index = 0
+        while index < 7
+          return false if (bytes + (cursor + index.to_u64).to_i64).value != name[index]
+          index = index + 1
+        end
+        true
+      end
+
+      def self.line_stack_end(bytes : Pointer(UInt8), start : UInt64, stop : UInt64) : UInt64
+        cursor = start
+        # 45 is '-', which separates the two addresses.
+        while cursor < stop && (bytes + cursor.to_i64).value != 45_u8
+          cursor = cursor + 1
+        end
+        return 0_u64 if cursor >= stop
+        cursor = cursor + 1
+        value = 0_u64
+        digits = 0
+        while cursor < stop
+          digit = hex_digit((bytes + cursor.to_i64).value)
+          break if digit > 15
+          value = value * 16_u64 + digit
+          digits = digits + 1
+          cursor = cursor + 1
+        end
+        return 0_u64 if digits == 0
+        value
+      end
+
+      # 16 for anything that is not a hex digit, which is the terminator the
+      # caller reads rather than a second return value it has nowhere to put.
+      def self.hex_digit(byte : UInt8) : UInt64
+        return (byte - 48_u8).to_u64 if byte >= 48_u8 && byte <= 57_u8
+        return (byte - 97_u8).to_u64 + 10_u64 if byte >= 97_u8 && byte <= 102_u8
+        return (byte - 65_u8).to_u64 + 10_u64 if byte >= 65_u8 && byte <= 70_u8
+        16_u64
+      end
+
+      {% if flag?(:darwin) %}
+        # The main executable's `__DATA` and `__DATA_CONST`, walked out of its
+        # Mach header. Image 0 is the main executable, and it is the only
+        # image asked: nothing outside this program allocates from this heap,
+        # so no other image's data segment can hold a pointer into it. The
+        # segment addresses in the file are unslid, so the slide is added.
+        # `__DATA_CONST` is optional because a binary may genuinely have none;
+        # `__DATA` is not, because every binary has one and its absence means
+        # the walk is wrong rather than the binary unusual.
+        def self.discover_globals : Nil
+          header = LibC._dyld_get_image_header(0).address
+          fatal("iyi: no Mach header for the main image\n") if header == 0
+          fatal("iyi: main image is not 64-bit Mach-O\n") if IyiHeap.read64(header) & 0xFFFFFFFF_u64 != 0xFEEDFACF_u64
+          slide = LibC._dyld_get_image_vmaddr_slide(0).to_u64
+          count = IyiHeap.read64(header + 16) & 0xFFFFFFFF_u64
+          cursor = header + 32_u64
+          seen = 0_u64
+          while seen < count
+            word = IyiHeap.read64(cursor)
+            size = word.unsafe_shr(32)
+            fatal("iyi: zero-length Mach load command\n") if size == 0
+            # LC_SEGMENT_64. The name is sixteen bytes at offset 8, compared
+            # as two words rather than a loop: "__DATA" padded with zeros,
+            # and "__DATA_CONST" the same.
+            if word & 0xFFFFFFFF_u64 == 0x19_u64
+              first = IyiHeap.read64(cursor + 8)
+              second = IyiHeap.read64(cursor + 16)
+              if first == 0x415441445F5F_u64 && second == 0_u64
+                @@data_low = IyiHeap.read64(cursor + 24) &+ slide
+                @@data_high = @@data_low &+ IyiHeap.read64(cursor + 32)
+              elsif first == 0x435F415441445F5F_u64 && second == 0x54534E4F_u64
+                @@const_low = IyiHeap.read64(cursor + 24) &+ slide
+                @@const_high = @@const_low &+ IyiHeap.read64(cursor + 32)
+              end
+            end
+            cursor = cursor + size
+            seen = seen + 1_u64
+          end
+          fatal("iyi: no __DATA segment in the main image\n") if @@data_high <= @@data_low
+          @@found_globals = 1_u64
+        end
+      {% else %}
+        # `.data` and `.bss`, which are contiguous in every ELF layout the
+        # link templates produce, so the two symbols bound one range rather
+        # than two. There is no second range on this target, which is why
+        # `@@const_low` and `@@const_high` stay zero here and the scan skips
+        # an empty range rather than needing a flag to tell it to.
+        def self.discover_globals : Nil
+          low = pointerof(LibIyiImage.__data_start).address
+          high = pointerof(LibIyiImage._end).address
+          fatal("iyi: __data_start.._end is not a range\n") if high <= low
+          @@data_low = low
+          @@data_high = high
+          @@found_globals = 1_u64
+        end
+      {% end %}
+
+      def self.globals : Nil
+        discover_globals if @@found_globals == 0
+      end
+
+      def self.data_low : UInt64
+        globals
+        @@data_low
+      end
+
+      def self.data_high : UInt64
+        globals
+        @@data_high
+      end
+
+      def self.const_low : UInt64
+        globals
+        @@const_low
+      end
+
+      def self.const_high : UInt64
+        globals
+        @@const_high
+      end
+
+      # Is this word a pointer to a live object, and if so where does that
+      # object start? One answer for both questions, because a root usually
+      # points into the middle of an object and the marker needs the base.
+      # Zero means "not a heap pointer", which is also the answer for a null
+      # word, for a word in no arena, for a word in the part of an arena that
+      # was never carved, and for a word in a chunk that has been freed.
+      #
+      # Stage 2 answers the first half already: `containing` names the arena
+      # a pointer is in, and the arena's header names its chunk size, so the
+      # chunk a word falls in is arithmetic rather than a search. The rest is
+      # the part Stage 2 had no reason to answer. A chunk at or past the fill
+      # cursor was never handed out, which is also how the tail of an arena
+      # too short for one more chunk is rejected. A chunk on its class's free
+      # list was handed out and given back, and reporting it live would keep
+      # a dead object alive forever, since nothing would ever free it twice.
+      #
+      # The free-list walk is linear in the chunks freed for that one class,
+      # and it is only reached by a word that already landed inside an arena,
+      # which a word that is not a pointer almost never does. A per-arena
+      # allocation bitmap is the O(1) form and it is Stage 6's to add if
+      # sweeping wants one, not a thing to build before a profile asks.
+      def self.base_of(word : UInt64) : UInt64
+        return 0_u64 if word == 0
+        candidate = Pointer(Void).new(word)
+        arena = IyiHeap.containing(candidate)
+        if arena != 0
+          first = arena + IyiHeap::HEAD
+          chunk = IyiHeap.arena_chunk(arena)
+          head = first + (word - first).unsafe_div(chunk) * chunk
+          return 0_u64 if head >= IyiHeap.arena_cursor(arena)
+          return 0_u64 if free_listed?(head, chunk)
+          return head + IyiHeap::HEADER
+        end
+        node = IyiHeap.containing_large(candidate)
+        return node + IyiHeap::LARGE_USER if node != 0
+        0_u64
+      end
+
+      def self.free_listed?(head : UInt64, chunk : UInt64) : Bool
+        node = IyiHeap.directory[IyiHeap.class_index(chunk - IyiHeap::HEADER)]
+        while node != 0
+          return true if node == head
+          node = IyiHeap.read64(node)
+        end
+        false
+      end
+
+      # Every 8-aligned word in [low, high), with the ones that validate
+      # handed to the callback as the base of the object they reach. The same
+      # base can be reported more than once, because more than one root can
+      # reach one object; marking is idempotent, so deduplicating is the
+      # caller's business and not worth a set here.
+      def self.scan_range(low : UInt64, high : UInt64, visit : Proc(UInt64, Nil)) : Nil
+        return if high <= low
+        cursor = low
+        remainder = cursor.unsafe_mod(8_u64)
+        cursor = cursor + (8_u64 - remainder) if remainder != 0
+        while cursor + 8_u64 <= high
+          base = base_of(IyiHeap.read64(cursor))
+          visit.call(base) if base != 0
+          cursor = cursor + 8_u64
+        end
+      end
+
+      def self.each_stack_root(visit : Proc(UInt64, Nil)) : Nil
+        scan_range(stack_pointer, stack_base, visit)
+      end
+
+      # The spill buffer as a root range. Writing the registers somewhere the
+      # scan does not reach would be the same as not capturing them.
+      def self.each_register_root(visit : Proc(UInt64, Nil)) : Nil
+        buffer = spill
+        scan_range(buffer, buffer + SPILL, visit)
+      end
+
+      def self.each_global_root(visit : Proc(UInt64, Nil)) : Nil
+        scan_range(data_low, data_high, visit)
+        scan_range(const_low, const_high, visit)
+      end
+
+      # The current stack, registers and globals — NOT the whole root set:
+      # parked fiber stacks are missing, the recorded gap the block above
+      # states, and the reason nothing may trigger a collection from a
+      # program that spawns until the scheduler's registry is walked. The
+      # spill happens first and before anything calls back into user code,
+      # because the callback is user code and user code uses registers.
+      def self.each_root(visit : Proc(UInt64, Nil)) : Nil
+        spill_registers
+        each_register_root(visit)
+        each_stack_root(visit)
+        each_global_root(visit)
+      end
+    end
+
+    # iyi: GC_DESIGN.md Stage 5, the mark phase. Roots go gray, the queue
+    # drains, and what is still white when it stops is unreachable. Nothing
+    # sweeps yet: this stage decides what is garbage, Stage 6 reclaims it.
+    #
+    # Colour lives in bits 0 and 1 of the mark word at `base - 8`, matching
+    # `Iyi::Collector::ObjectHeader` in the compiler: 0 white, 1 gray, 2 black,
+    # and a fresh chunk is zero, so a newly allocated object is white without
+    # anyone writing anything. The bits above are left alone on every write,
+    # because they are the flag and reserved bits the header promises to a
+    # forwarding pointer later.
+    #
+    # **Conservative, on purpose, for now.** Every object is word-scanned
+    # between its user pointer and its size, rather than by the pointer
+    # offsets its `TypeLayout` names. The table those offsets live in IS
+    # emitted into the binary (`__iyi_gc_layouts`, `codegen/gc_layouts.cr`),
+    # and this loop does not read it, because nothing writes an object's
+    # `type_id` yet: `malloc` is handed a size and cannot know the type, so
+    # the store belongs at the allocation site in codegen and that is the next
+    # step. Reading a table keyed by an id that is always zero would be a
+    # lookup no test could reach, so it is not written until the id is real.
+    # Conservative marking is not a placeholder either way: it is what Boehm
+    # does in production, and it is safe in the direction that matters, since
+    # a false positive retains a dead object and only a false negative frees a
+    # live one.
+    #
+    # Plain loads and stores rather than compare-and-swap: one mutator
+    # thread, and the scheduler's fibers yield only at suspension points,
+    # never inside the marker. `ObjectHeader`'s CAS helpers exist and are
+    # tested for when Stage 7 has threads to contend, and with a single
+    # mutator a CAS and a load-store pair decide the same thing.
+    class IyiMark
+      WHITE = 0_u64
+      GRAY  = 1_u64
+      BLACK = 2_u64
+      COLOUR = 3_u64
+
+      # The queue is its own mapping, never the heap being marked. A mark
+      # phase that allocated from that heap could carve a chunk, or hand back
+      # one it is about to decide the liveness of, which is a collector
+      # reasoning about memory it is mutating. It starts at one page of words
+      # and doubles into a fresh mapping when it fills; the old mapping is
+      # released, because a mark phase that leaked its own queue every cycle
+      # would outgrow the heap it was collecting.
+      @@queue : UInt64 = 0_u64
+      @@queue_words : UInt64 = 0_u64
+      @@queue_len : UInt64 = 0_u64
+
+      # What the last sweep reclaimed and kept, and how many collections have
+      # run. Literal initializers, so codegen folds them to a static zero the
+      # way every other piece of state in this file does.
+      @@swept : UInt64 = 0_u64
+      @@kept : UInt64 = 0_u64
+      @@bytes_freed : UInt64 = 0_u64
+      @@collections : UInt64 = 0_u64
+
+      def self.colour(base : UInt64) : UInt64
+        IyiHeap.read64(base - 8_u64) & COLOUR
+      end
+
+      # Set the colour and leave every other bit of the word as it was, because
+      # those are the flag and reserved bits the header promises to a forwarding
+      # pointer later.
+      #
+      # `word - (word & COLOUR)` is how the low two bits get cleared, and the
+      # shape is dictated by what this prelude actually defines on `UInt64`.
+      # Neither `~` nor `>>` is there, and the literal 2^64-4 as a mask invited
+      # a question about whether a literal that large round-trips exactly, which
+      # is not a question worth carrying in the one line that decides an
+      # object's colour. Subtracting the low bits from the word needs only `&`
+      # and `-`, both of which this file already relies on everywhere.
+      def self.recolour(base : UInt64, colour : UInt64) : Nil
+        word = IyiHeap.read64(base - 8_u64)
+        IyiHeap.write64(base - 8_u64, (word - (word & COLOUR)) | colour)
+      end
+
+      def self.queue_reserve : Nil
+        return if @@queue_len < @@queue_words
+        words = @@queue_words == 0 ? 512_u64 : @@queue_words * 2_u64
+        fresh = __iyi_mmap(words * 8_u64).address
+        IyiRoots.fatal("iyi: the mark queue could not grow\n") if fresh == 0
+        moved = 0_u64
+        while moved < @@queue_len
+          IyiHeap.write64(fresh + moved * 8_u64, IyiHeap.read64(@@queue + moved * 8_u64))
+          moved = moved + 1_u64
+        end
+        __iyi_munmap(@@queue, @@queue_words * 8_u64) if @@queue != 0
+        @@queue = fresh
+        @@queue_words = words
+      end
+
+      # Gray it and enqueue it, once. A base that is already gray or black has
+      # been claimed, and enqueuing it again would scan it twice and, on a
+      # cycle, never stop.
+      def self.shade(base : UInt64) : Nil
+        return if base == 0
+        return if colour(base) != WHITE
+        recolour(base, GRAY)
+        queue_reserve
+        IyiHeap.write64(@@queue + @@queue_len * 8_u64, base)
+        @@queue_len = @@queue_len + 1_u64
+      end
+
+      # Scan one object's payload and blacken it. The bound is the size the
+      # header carries, which is the requested size rather than the chunk's:
+      # the bytes past the request belong to the caller only through a later
+      # realloc, and scanning them would read whatever the last owner left.
+      def self.scan(base : UInt64) : Nil
+        size = IyiHeap.read64(base - IyiHeap::HEADER)
+        cursor = base
+        limit = base + size
+        while cursor + 8_u64 <= limit
+          shade(IyiRoots.base_of(IyiHeap.read64(cursor)))
+          cursor = cursor + 8_u64
+        end
+        recolour(base, BLACK)
+      end
+
+      # One mark phase. Returns how many objects came out black, which is the
+      # live count the exercise checks and the number Stage 6 will sweep
+      # against.
+      def self.mark : UInt64
+        @@queue_len = 0_u64
+        IyiRoots.each_root(->(base : UInt64) { shade(base) })
+        black = 0_u64
+        while @@queue_len > 0_u64
+          @@queue_len = @@queue_len - 1_u64
+          base = IyiHeap.read64(@@queue + @@queue_len * 8_u64)
+          scan(base)
+          black = black + 1_u64
+        end
+        black
+      end
+
+      # Put every live object back to white, so a second phase starts from
+      # where the first one did. Stage 6 does this as it sweeps, one walk
+      # instead of two; until then the exercise needs a way to run the phase
+      # more than once.
+      def self.unmark : Nil
+        arena = IyiHeap.first_arena
+        while arena != 0
+          chunk = IyiHeap.arena_chunk(arena)
+          cursor = arena + IyiHeap::HEAD
+          stop = IyiHeap.arena_cursor(arena)
+          while cursor < stop
+            recolour(cursor + IyiHeap::HEADER, WHITE)
+            cursor = cursor + chunk
+          end
+          arena = IyiHeap.arena_next(arena)
+        end
+        node = IyiHeap.first_large
+        while node != 0
+          recolour(node + IyiHeap::LARGE_USER, WHITE)
+          node = IyiHeap.large_next(node)
+        end
+      end
+
+      # iyi: GC_DESIGN.md Stage 6, the sweep. Stage 5 decided what is garbage;
+      # this is where the memory comes back. One walk over every chunk that has
+      # been carved: a white object is unreachable, so its chunk goes on its
+      # class's free list, and a black one survives and is repainted white for
+      # the next cycle. Repainting as it goes is why sweep does not need a
+      # second pass, and why `unmark` above is only the exercise's tool.
+      #
+      # A chunk already on a free list is skipped rather than freed again. It is
+      # white, because nothing marked it and nothing owns it, and freeing it
+      # twice would put one chunk on the list twice, which is the same memory
+      # handed to two callers. `free_listed?` is that check, and it is why this
+      # loop cannot simply trust the colour.
+      #
+      # A large object's `next` is read before the node is released, because
+      # releasing it unmaps the memory the link lives in.
+      #
+      # What is not here, and why. **Finalizers**: nothing in this language
+      # defines one. There is no `def finalize` anywhere in `src/iyi` or
+      # `samples/iyi`, so a finalizer queue would be a mechanism no program
+      # could put an entry in, which is the shape SPEC.md III.4.8 refused for a
+      # concurrency marker and the shape this collector has refused twice
+      # already. **Weak references**: the same answer. They are registration
+      # based and the standard library's `WeakRef` lives on the `--crystal`
+      # side, so there is no table here to walk and null out. Both wait on the
+      # language having the feature rather than on the collector.
+      def self.sweep : Nil
+        @@swept = 0_u64
+        @@kept = 0_u64
+        @@bytes_freed = 0_u64
+
+        arena = IyiHeap.first_arena
+        while arena != 0
+          chunk = IyiHeap.arena_chunk(arena)
+          cursor = arena + IyiHeap::HEAD
+          stop = IyiHeap.arena_cursor(arena)
+          while cursor < stop
+            base = cursor + IyiHeap::HEADER
+            unless IyiRoots.free_listed?(cursor, chunk)
+              if colour(base) == WHITE
+                @@bytes_freed = @@bytes_freed + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
+                @@swept = @@swept + 1_u64
+                IyiHeap.free(Pointer(Void).new(base))
+              else
+                recolour(base, WHITE)
+                @@kept = @@kept + 1_u64
+              end
+            end
+            cursor = cursor + chunk
+          end
+          arena = IyiHeap.arena_next(arena)
+        end
+
+        node = IyiHeap.first_large
+        while node != 0
+          following = IyiHeap.large_next(node)
+          base = node + IyiHeap::LARGE_USER
+          if colour(base) == WHITE
+            @@bytes_freed = @@bytes_freed + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
+            @@swept = @@swept + 1_u64
+            IyiHeap.free(Pointer(Void).new(base))
+          else
+            recolour(base, WHITE)
+            @@kept = @@kept + 1_u64
+          end
+          node = following
+        end
+
+        @@collections = @@collections + 1_u64
+      end
+
+      # One collection: decide, then reclaim.
+      def self.collect : Nil
+        mark
+        sweep
+      end
+
+      # What the last sweep did. GC_DESIGN.md Stage 6 asks for statistics and
+      # this is the honest subset: counted as the walk went rather than sampled
+      # afterwards. Pause time and a cumulative allocation total want a clock
+      # and a hook in the hot path, and neither is worth adding before there is
+      # something that reads them.
+      def self.swept : UInt64
+        @@swept
+      end
+
+      def self.kept : UInt64
+        @@kept
+      end
+
+      def self.bytes_freed : UInt64
+        @@bytes_freed
+      end
+
+      def self.collections : UInt64
+        @@collections
+      end
+    end
+  {% elsif flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
     # iyi: The default heap on Linux is a bump pointer over `mmap` regions:
     # allocate, never free, which is the contract the libc path below already
     # has (`free` is not bound there for the same reason, and a program that
@@ -593,7 +1834,7 @@ require "./file"
       filled = 0_u64
       while filled + 8_u64 <= count
         words.value = word
-        words = words + 8_i64
+        words = words + 1_i64
         filled = filled + 8_u64
       end
       bytes = words.as(Pointer(UInt8))
@@ -666,7 +1907,11 @@ require "./file"
     # contract libc's `realloc` has on the other paths; a null pointer cannot
     # be handed to it, so it routes to a plain `HeapAlloc`. `free` is not
     # bound because nothing frees, and a program that outlives its memory is
-    # what allocating without collecting asks for.
+    # what allocating without collecting asks for. `-Dgc_iyi` does not reach
+    # this branch, deliberately rather than unfinished: the size-class arena
+    # allocator is POSIX-only in its stage, because this target has an open
+    # diagnosis for printing memory it was never given and a new allocator
+    # landing in the same change would confound that evidence.
     # Same reason as the block above: an LLVM-emitted object names no library
     # for itself, so the three heap functions have to name theirs.
     @[Link("kernel32")]
@@ -709,7 +1954,7 @@ require "./file"
       filled = 0_u64
       while filled + 8_u64 <= count
         words.value = word
-        words = words + 8_i64
+        words = words + 1_i64
         filled = filled + 8_u64
       end
       bytes = words.as(Pointer(UInt8))
@@ -780,7 +2025,10 @@ require "./file"
     # word: `$` globals are refused, a `fun` body cannot reach `@@` state,
     # and literal initializers fold into the LLVM global's static zero, so
     # zero means "grow on the first allocation" rather than a value startup
-    # code installs.
+    # code installs. `-Dgc_iyi` does not reach this branch either, by design
+    # rather than omission: wasm32 has no mmap, and its arena is a watermark
+    # over linear memory, a separate design that GC_DESIGN.md's Stage 2
+    # defers, so the flag keeps this allocator.
     class IyiHeap
       @@cursor : UInt64 = 0_u64
       @@left : UInt64 = 0_u64
@@ -860,7 +2108,7 @@ require "./file"
       filled = 0_u64
       while filled + 4_u64 <= total
         words.value = word
-        words = words + 4_i64
+        words = words + 1_i64
         filled = filled + 4_u64
       end
       bytes = words.as(Pointer(UInt8))

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="iyi">
+  <!-- The two tittles. In Turkish orthography the dot on the i is semantic: i
+       and dotless i are different letters. A project whose argument is that a
+       small written mark carries the load gets a mark that is only the dots. -->
+  <rect width="32" height="32" fill="#f2f3f0"/>
+  <circle cx="10" cy="9" r="3.1" fill="#a8232b"/>
+  <circle cx="22" cy="9" r="3.1" fill="#171a17"/>
+  <rect x="8.4" y="15" width="3.2" height="10" fill="#171a17"/>
+  <rect x="20.4" y="15" width="3.2" height="10" fill="#171a17"/>
+</svg>

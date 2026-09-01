@@ -1,0 +1,193 @@
+# Stage 6 sweep, exercised rather than asserted. GC_DESIGN.md names the
+# verification: unreachable objects are freed and heap space is reclaimed.
+#
+#   ./bin/iyi run -Dgc_iyi bench/sweep_exercise.iyi
+#
+# This is the stage where the collector stops being a decision and starts being
+# memory that comes back, so the check that matters is the one nobody can fake:
+# allocate garbage, collect, allocate again, and see the same addresses handed
+# out. A sweep that only counted things would pass while reclaiming nothing.
+#
+# Everything here needs `-Dgc_iyi`. Built without it the program says so in one
+# line and exits 0, which is what stops a build that compiled the whole section
+# out from reading as a pass.
+#
+# Not under `samples/`: the sample count is a gated number, and samples are
+# explanations rather than torture tests.
+
+{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+  def count(value : UInt64) : String
+    value.to_i64.to_s
+  end
+
+  def hex(value : UInt64) : String
+    value.to_i64.to_s(16)
+  end
+
+  # Addresses recorded outside the heap, so recording one does not root it.
+  class Seen
+    LIMIT = 8192_u64
+
+    @@buffer : UInt64 = 0_u64
+    @@count : UInt64 = 0_u64
+
+    def self.buffer : UInt64
+      @@buffer = __iyi_mmap(LIMIT * 8_u64).address if @@buffer == 0
+      @@buffer
+    end
+
+    def self.add(value : UInt64) : Nil
+      raise "the ledger is full" if @@count >= LIMIT
+      Pointer(UInt64).new(buffer + @@count * 8_u64).value = value
+      @@count = @@count + 1_u64
+    end
+
+    def self.at(index : UInt64) : UInt64
+      Pointer(UInt64).new(buffer + index * 8_u64).value
+    end
+
+    def self.count : UInt64
+      @@count
+    end
+
+    def self.forget : Nil
+      @@count = 0_u64
+    end
+
+    def self.holds?(value : UInt64) : Bool
+      index = 0_u64
+      while index < @@count
+        return true if at(index) == value
+        index = index + 1_u64
+      end
+      false
+    end
+  end
+
+  class Held
+    @@keep : UInt64 = 0_u64
+
+    def self.keep : UInt64
+      @@keep
+    end
+
+    def self.keep=(value : UInt64) : Nil
+      @@keep = value
+    end
+  end
+
+  def fresh(size : UInt64) : UInt64
+    Pointer(UInt8).malloc(size).address
+  end
+
+  puts "== the exercise, -Dgc_iyi"
+
+  # 1. Garbage is reclaimed, and the proof is reuse rather than a counter.
+  # Allocate a batch nothing references, record the addresses, collect, then
+  # allocate the same shape again. If the sweep put those chunks back on the
+  # free list, the second batch is drawn from them.
+  Seen.forget
+  batch = 0_u64
+  while batch < 300_u64
+    Seen.add(fresh(96_u64))
+    batch = batch + 1_u64
+  end
+  IyiMark.collect
+  swept = IyiMark.swept
+  freed = IyiMark.bytes_freed
+
+  reused = 0_u64
+  batch = 0_u64
+  while batch < 300_u64
+    reused = reused + 1_u64 if Seen.holds?(fresh(96_u64))
+    batch = batch + 1_u64
+  end
+  raise "sweep: nothing was reclaimed, so no address came back" if reused == 0
+  puts "    reclaimed: #{count(swept)} chunks swept and #{count(freed)} bytes freed, and #{count(reused)} of 300 new allocations came from addresses the sweep reclaimed"
+
+  # 2. A live object survives a collection, and its bytes are intact. This is
+  # the direction that matters: a sweep that frees a live object is a corrupted
+  # program, not a failed test.
+  survivor = fresh(64_u64)
+  Held.keep = survivor
+  index = 0_u64
+  while index < 64_u64
+    Pointer(UInt8).new(survivor + index).value = 0x5A_u8
+    index = index + 1_u64
+  end
+  IyiMark.collect
+  index = 0_u64
+  while index < 64_u64
+    got = Pointer(UInt8).new(survivor + index).value
+    raise "sweep: a live object's byte #{count(index)} is #{count(got.to_u64)} rather than 90" if got != 0x5A_u8
+    index = index + 1_u64
+  end
+  raise "sweep: the survivor is not white after the sweep repainted it" if IyiMark.colour(survivor) != IyiMark::WHITE
+  puts "    survivor: a rooted object keeps all 64 bytes through a collection and comes out white for the next one"
+
+  # 3. The survivor's chunk is not handed out again while it is still live.
+  # Reclaiming a live object is the one failure a collector cannot have, so it
+  # gets its own check rather than being implied by the bytes above.
+  handed = 0_u64
+  index = 0_u64
+  while index < 400_u64
+    handed = handed + 1_u64 if fresh(64_u64) == survivor
+    index = index + 1_u64
+  end
+  raise "sweep: the live survivor's chunk was handed out #{count(handed)} times" if handed != 0
+  puts "    liveness: 400 further allocations never returned the live object's chunk"
+
+  # 4. The large-object list is walked, and the deterministic direction is the
+  # one asserted. A 2 MiB object held in a global survives a collection with
+  # its bytes intact and comes out white. Whether an unreferenced large object
+  # is reclaimed cannot be asserted here, because a local holds its address and
+  # a conservative scan is right to retain it. That half is reported, the same
+  # treatment the small garbage gets above.
+  big = fresh(2097152_u64)
+  raise "sweep: the large allocation failed" if big == 0
+  Held.keep = big
+  Pointer(UInt8).new(big).value = 0x77_u8
+  Pointer(UInt8).new(big + 2097151_u64).value = 0x88_u8
+  IyiMark.collect
+  # Read the root back before touching the bytes: the read is the check that
+  # the global still holds the object, and it is also what keeps the store
+  # alive under optimisation — a global written and never read is a store the
+  # back end may legally drop, and a dropped store is a root that never
+  # existed. A collector cannot promise more than "reachable through memory";
+  # this line is what makes the object reachable through memory.
+  raise "sweep: the large root was lost" if Held.keep != big
+  if Pointer(UInt8).new(big).value != 0x77_u8 || Pointer(UInt8).new(big + 2097151_u64).value != 0x88_u8
+    raise "sweep: a rooted 2 MiB object lost its first or last byte"
+  end
+  raise "sweep: the large survivor is not white again" if IyiMark.colour(big) != IyiMark::WHITE
+  puts "    large: a rooted 2 MiB object keeps its first and last byte through a collection and comes out white"
+
+  Held.keep = 0_u64
+  IyiMark.collect
+  IyiMark.collect
+  puts "    large, unrooted: #{count(IyiMark.bytes_freed)} bytes freed on the pass after the global was cleared"
+
+  # 5. Repeated collections are stable. A heap that grew every cycle would be a
+  # sweep that reclaims less than it keeps, which no single collection shows.
+  cycle = 0_u64
+  while cycle < 20_u64
+    churn = 0_u64
+    while churn < 200_u64
+      fresh(128_u64)
+      churn = churn + 1_u64
+    end
+    IyiMark.collect
+    cycle = cycle + 1_u64
+  end
+  arenas = 0_u64
+  arena = IyiHeap.first_arena
+  while arena != 0
+    arenas = arenas + 1_u64
+    arena = IyiHeap.arena_next(arena)
+  end
+  puts "    steady: 20 cycles of 200 allocations each left #{count(arenas)} arenas mapped and #{count(IyiMark.collections)} collections recorded"
+
+  puts "    all sweep checks passed"
+{% else %}
+  puts "    sweeping needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here"
+{% end %}

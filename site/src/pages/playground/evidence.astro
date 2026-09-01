@@ -1,0 +1,542 @@
+---
+/**
+ * The playground's evidence, which used to be the playground.
+ *
+ * WHY THIS PAGE EXISTS. The playground shipped as an evidence page: curated
+ * listings, a table of recorded diagnostics, a card proving that a module
+ * printed exactly what the native binary printed. That material is good and it
+ * is the site's character, so none of it is deleted. It is just not a
+ * playground, and it was standing where the editor needed to be. It moved here.
+ *
+ * WHY IT IS A FILE RATHER THAN A GENERATED ROUTE. `/playground/[...sample]/`
+ * generates one route per recorded sample, so a page called `evidence` produced
+ * there would exist only as long as no sample was ever named `evidence`, and it
+ * would stop existing if the recording ever failed. A static route wins over a
+ * rest parameter in Astro, so this file owns the URL outright and its existence
+ * does not depend on the recording at all. That matters because this is the page
+ * that explains the recording.
+ *
+ * THE BUILD TIME GATES ON THIS PAGE, and each one is a check the good records
+ * pass and a broken one fails.
+ *
+ *   1. The engine's own diagnostics stream is drained here, in node, so the
+ *      static page carries the real compiler output for a visitor with no
+ *      scripts and so a future engine that breaks the contract fails this build
+ *      rather than shipping a pane that renders nothing.
+ *   2. An engine that claims `diagnostics` and produces none fails the build,
+ *      because an empty pane rendered without complaint would imply that
+ *      nothing in this language can be got wrong.
+ *   3. An engine that answers a diagnostics request with any other kind of
+ *      event fails the build, because the pane renders diagnostics and an
+ *      engine streaming output into it is answering a question nobody asked.
+ */
+import Page from "../../layouts/Page.astro";
+import Stamped from "../../components/Stamped.astro";
+import { activeEngine } from "../../playground/registry";
+import type { Capability, RunEvent } from "../../playground/types";
+import { CAPABILITY_LABEL } from "../../playground/types";
+import {
+  curatedSamples,
+  playgroundHref,
+  wasmProvenance,
+} from "../../playground/samples";
+import {
+  diagnosticCases,
+  diagnosticsProvenance,
+} from "../../playground/diagnostics";
+import { diagnosticHtml } from "../../playground/render";
+import {
+  highlightProvenance,
+  highlightedLines,
+  recordedText,
+} from "../../lib/highlight";
+import { emphasiseRuleWords, inkLines } from "../../lib/tokens";
+
+const engine = activeEngine();
+const caps = engine.capabilities();
+const supports = (cap: Capability) => caps.supported.includes(cap);
+
+/* GATE 1 and GATE 3. The same call the browser makes, made here, so what this
+ * page renders is the engine's own event stream and not a second reading of the
+ * record. */
+const diagnosticEvents: Extract<RunEvent, { kind: "diagnostic" }>[] = [];
+if (supports("diagnostics")) {
+  const first = curatedSamples[0];
+  for await (const event of engine.run([{ path: first.path, text: "" }], {
+    entry: first.path,
+    want: "diagnostics",
+  })) {
+    if (event.kind === "diagnostic") diagnosticEvents.push(event);
+    else if (event.kind !== "unsupported") {
+      throw new Error(
+        `evidence: the active engine claims diagnostics but answered a ` +
+          `diagnostics request with a "${event.kind}" event. This page renders ` +
+          `diagnostics, and an engine that streams output into it is reporting ` +
+          `something other than what was asked for.`,
+      );
+    }
+  }
+  /* GATE 2. */
+  if (diagnosticEvents.length === 0) {
+    throw new Error(
+      "evidence: the active engine claims the diagnostics capability and " +
+        "produced no diagnostic for any recorded case. An empty pane rendered " +
+        "without complaint would imply that nothing in this language can be " +
+        "got wrong.",
+    );
+  }
+}
+
+/* GATES 4, 5 AND 6, over the live colouring path, and they are here rather than
+ * beside `tokens.ts` because this is where the build already exercises the
+ * records and where a gate runs on every CI build with no tooling that is not
+ * already installed.
+ *
+ * When iyi's compiler runs as wasm in this page it will lex what somebody is
+ * typing and hand back a token stream as markup rather than as a promise.
+ * Painted without checking, a stream describing a different program produces a
+ * listing that is entirely plausible and entirely wrong, with every keyword in
+ * a place no compiler put it. That happens for real, because an editor lexes
+ * per edit and an answer can arrive after the characters it describes are gone.
+ *
+ * GATE 4: the emphasis a live stream gets is the emphasis the recorder stamped.
+ * Every recorded listing is turned back into what a live lexer actually sends,
+ * by putting each `k tok-rule` span back to the bare `k` span the compiler's
+ * highlighter emits, and `inkLines` must reproduce the recording exactly.
+ *
+ * WHAT GATE 4 DOES NOT SEE, said plainly because a gate whose reach is
+ * overstated is worse than no gate. Breaking the reflow does not fail it: both
+ * sides of the comparison call `reflowLines`, so a defect there moves them
+ * together and they stay equal. That was measured by breaking the reflow for
+ * real, and the build stayed green. What gate 4 does catch, also measured by
+ * breaking each one for real, is the emphasis pass ceasing to mark, and the
+ * rule-word list drifting from what the recorder stamped. Those are the two
+ * defects that would make one page emphasise different words depending on which
+ * side of the wire its tokens came from, which is what this gate is for. The
+ * reflow is held instead by the equivalence check that moved it out of
+ * `highlight.ts`, which compared it against the pre-refactor algorithm rather
+ * than against itself.
+ *
+ * GATE 5: `inkLines` refuses a stream that lies. One character of the expected
+ * text is changed and it must throw. This is the reason the editor is allowed
+ * to paint at all, and breaking the verification makes the build fail.
+ *
+ * GATE 6: the emphasis pass is idempotent. `tokens.ts` claims that is what lets
+ * the recorded path and the live path share one pipeline, so the claim is
+ * checked rather than asserted: passing an already marked recording through it
+ * must change nothing. Broadening the pattern to match a marked span fails
+ * this and nothing else, which is why it is a gate of its own. */
+const RECORDED_EMPHASIS = / class="k tok-rule"/g;
+let liveLinesChecked = 0;
+let liveWordsRebuilt = 0;
+for (const sample of curatedSamples) {
+  const recording = highlightedLines(sample.path).join("\n");
+  const asSent = recording.replace(RECORDED_EMPHASIS, ' class="k"');
+  liveWordsRebuilt += recording.split(' class="k tok-rule"').length - 1;
+  const live = inkLines(asSent, sample.path, recordedText(sample.path)).join("\n");
+  if (live !== recording) {
+    throw new Error(
+      `evidence: colouring ${sample.path} from a live token stream does not ` +
+        `reproduce its recorded colouring, so the same program would be ` +
+        `emphasised differently depending on whether the tokens came off the ` +
+        `record or off the wire. The two paths share one renderer precisely so ` +
+        `that cannot happen, and this is the check that says it has.`,
+    );
+  }
+  liveLinesChecked += recording.split("\n").length;
+}
+
+const liar = curatedSamples[0];
+let refusedALiar = false;
+try {
+  inkLines(
+    highlightedLines(liar.path).join("\n").replace(RECORDED_EMPHASIS, ' class="k"'),
+    liar.path,
+    `${recordedText(liar.path)}x`,
+  );
+} catch {
+  refusedALiar = true;
+}
+if (!refusedALiar) {
+  throw new Error(
+    "evidence: inkLines painted a token stream that does not encode the text " +
+      "it was given. That check is the only thing standing between the editor " +
+      "and a listing whose every keyword is in a place no compiler put it, so " +
+      "a build where it does not fire is a build that must not ship.",
+  );
+}
+
+for (const sample of curatedSamples) {
+  const recording = highlightedLines(sample.path).join("\n");
+  if (emphasiseRuleWords(recording) !== recording) {
+    throw new Error(
+      `evidence: passing the already marked recording of ${sample.path} ` +
+        `through the rule-word pass changed it, so the pass is not ` +
+        `idempotent. tokens.ts claims idempotence is what lets the recorded ` +
+        `path and the live path share one pipeline, and a recorded stream ` +
+        `marked twice carries emphasis the recorder did not stamp.`,
+    );
+  }
+}
+
+/* The counts this page states about itself. Structural numbers: they are
+ * measured from the records, they are the same on every machine, and they carry
+ * no machine stamp because they need none. */
+const identical = curatedSamples.filter((sample) => sample.identical);
+const differing = curatedSamples.filter((sample) => !sample.identical);
+---
+
+<Page
+  title="Playground evidence | iyi"
+  summary="What is real on the iyi playground, precisely: the recorded wasm32-wasi modules and their digests, the real compiler's diagnostics on real broken programs captured verbatim, and the proof that a module printed what the native binary printed."
+>
+  <section class="spread">
+    <div class="to-wide intro">
+      <h1>playground evidence</h1>
+      <p class="lead">
+        Worth being exact, because "runs in your browser" is a claim a lot of
+        pages make loosely. This page is the recording behind the{" "}
+        <a href={`${import.meta.env.BASE_URL.replace(/\/*$/, "/")}playground/`}
+          >playground</a
+        >: which bytes came from where, what checked them, and what the compiler
+        actually said when it refused a program.
+      </p>
+    </div>
+  </section>
+
+  <section class="spread">
+    <div class="to-wide body">
+      <h2>What is real here, precisely</h2>
+      <ul>
+        <li>
+          <strong>The modules are real compiler output.</strong> Each came from{" "}
+          <code>iyi build --cross-compile --target wasm32-wasi</code> on the
+          machine stamped below, then a link step, because for this target the
+          fork prints a <code>cc --target=wasm32-wasi</code> command rather than
+          calling <code>wasm-ld</code>. Both are recorded in{" "}
+          <code>site/records/wasm/manifest.json</code>, and{" "}
+          <code>site/scripts/records.mjs</code> fails the build if a module's
+          digest does not match the bytes on disk or if a sample's source has
+          changed since the module was built from it.
+        </li>
+        <li>
+          <strong>The execution is real, and it is in your tab.</strong> The host
+          in <code>site/src/playground/engines/wasi-preview1.ts</code> implements
+          the WASI preview1 calls the modules import, and it grants what a page
+          can honestly grant: standard output and standard error captured per
+          write, standard input open and at end of file, an empty environment,
+          real clocks, real randomness, and no filesystem at all. A call it does
+          not implement returns an errno rather than trapping, so a program can
+          see the failure instead of dying.
+        </li>
+        <li>
+          <strong>One execution path, whatever produced the module.</strong> A
+          recorded sample today, and a program compiled in the tab when iyi's
+          compiler runs there, are the same bytes flowing through the same host,
+          so a defect in either is a defect in both and cannot hide on one side.
+          That is why <code>engines/execute.ts</code> exists once rather than
+          twice.
+        </li>
+        <li>
+          <strong>Nothing is instantiated without a digest, unless this tab
+          made it.</strong> Every module the page runs today is a recorded one,
+          checked against the manifest before it is instantiated, because its
+          provenance is a claim about a machine you were not at. A module the
+          compiler in the page produces needs no digest, because its provenance
+          is that this tab made it, and the page will say which of the two it
+          ran.
+        </li>
+        <li>
+          <strong>
+            The colouring is the compiler's lexer or it is nothing, and this
+            build checked that.
+          </strong>
+          There is no grammar in the playground and there will not be one. A
+          loaded sample paints from the token stream the compiler's own
+          highlighter recorded. When iyi's compiler runs in the page, text you
+          type paints from that same highlighter, and only after the page
+          recovers the text out of the stream and finds it byte identical to the
+          characters on screen. Otherwise it paints plain ink, because a listing
+          with no emphasis is worth more than a listing whose every keyword sits
+          where no compiler put it. This build turned all{" "}
+          {curatedSamples.length} recordings back into what a live lexer sends,
+          re-emphasised them through the live path, and required{" "}
+          {liveLinesChecked} lines and {liveWordsRebuilt} rule words to come
+          back identical. It also required the check to refuse a stream that
+          lies, and the emphasis pass to leave an already marked recording
+          alone. Any one of those failing stops this page from building.
+        </li>
+        <li>
+          <strong>The type checking is not in this page, and the reason
+          changed.</strong> It used to be that the compiler could not report a
+          diagnostic from wasm at all. Work on{" "}
+          <code>wasm/compiler-in-browser</code> cleared that, so a checker in
+          the page is reachable now and when one lands it feeds this same event
+          path. What is not reachable is running the program afterwards: a
+          browser has no linker and producing a program out of a module needs
+          one. So the diagnostics below are recorded, and the page says so
+          rather than leaving a reader to assume.
+        </li>
+        <li>
+          <strong>{differing.length} of the samples do not print the same
+          thing on both targets, on purpose.</strong> The recording marks them,
+          the menu marks them, and the card carries the sentence. They are in the
+          set because a target that cannot open a file is a thing worth knowing
+          about the target, and hiding them would make the other{" "}
+          {identical.length} less believable.
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="spread">
+    <div class="to-wide body">
+      <hr class="rule" />
+      <h2>Every recorded module</h2>
+      <p>
+        One card per sample, each one a claim with the machine that produced it
+        in the same frame. A byte count and an exit status are recorded numbers,
+        so they appear only inside these frames and never as bare figures.
+      </p>
+      {
+        curatedSamples.map((sample) => (
+          <Stamped
+            claim={
+              sample.identical
+                ? "The module printed exactly what the native binary printed"
+                : "On this target the module and the native binary do not print the same thing"
+            }
+            subject={`${sample.wasm} from ${sample.path}`}
+            machine={wasmProvenance.machine}
+            command={wasmProvenance.command}
+            outcome={sample.identical ? "flat" : "loss"}
+          >
+            <dl class="recording">
+              <div>
+                <dt>module</dt>
+                <dd>{sample.wasm}, {sample.bytes} bytes</dd>
+              </div>
+              <div>
+                <dt>sha256</dt>
+                <dd>{sample.sha256}</dd>
+              </div>
+              <div>
+                <dt>recorded exit</dt>
+                <dd>{sample.exitCode}</dd>
+              </div>
+              <div>
+                <dt>open it</dt>
+                <dd>
+                  <a href={playgroundHref(sample.id)}>{sample.id}</a>
+                </dd>
+              </div>
+              {sample.note !== null && (
+                <div class="lesson">
+                  <dt>the lesson</dt>
+                  <dd>{sample.note}</dd>
+                </div>
+              )}
+            </dl>
+          </Stamped>
+        ))
+      }
+      <aside class="evidence">
+        <dl>
+          <dt>compiler</dt>
+          <dd>{wasmProvenance.compiler}</dd>
+          <dt>recorded at</dt>
+          <dd>{wasmProvenance.commit}</dd>
+          <dt>machine</dt>
+          <dd>{wasmProvenance.machine}</dd>
+          <dt>regenerated by</dt>
+          <dd>{wasmProvenance.command}</dd>
+        </dl>
+      </aside>
+    </div>
+  </section>
+
+  {
+    supports("diagnostics") && (
+      <section class="spread">
+        <div class="to-wide body">
+          <hr class="rule" />
+          <h2>What the compiler says when it refuses</h2>
+          <p class="pane-note">
+            Recorded, not live, because nothing in this page compiles: a browser
+            has no linker and producing a program out of a module needs one. The
+            programs
+            below are real files under{" "}
+            <code>site/records/break/</code>, they are really wrong, and this is
+            the real compiler's output on them, captured verbatim, caret line
+            included. Where the compiler cited the rule it was enforcing, the
+            citation is pulled into the footer, because iyi's errors naming their
+            rule is a feature of the language and the design should say so.
+          </p>
+          <div class="cases">
+            {diagnosticEvents.map((event, index) => (
+              <article class="case" data-case={diagnosticCases[index]?.id}>
+                <h3>{diagnosticCases[index]?.title ?? event.file}</h3>
+                <p class="case-meta mono">
+                  {diagnosticCases[index]?.path ?? event.file}, exit{" "}
+                  {diagnosticCases[index]?.exitCode ?? 1}
+                </p>
+                <div
+                  class="diagnostic"
+                  set:html={diagnosticHtml(
+                    event,
+                    diagnosticCases[index]?.command,
+                  )}
+                />
+              </article>
+            ))}
+          </div>
+          <aside class="evidence">
+            <dl>
+              <dt>recorded by</dt>
+              <dd>{diagnosticsProvenance.command}</dd>
+              <dt>compiler</dt>
+              <dd>{diagnosticsProvenance.compiler}</dd>
+              <dt>machine</dt>
+              <dd>{diagnosticsProvenance.machine}</dd>
+              <dt>commit</dt>
+              <dd>{diagnosticsProvenance.commit}</dd>
+            </dl>
+          </aside>
+        </div>
+      </section>
+    )
+  }
+
+  <section class="spread">
+    <div class="to-wide body">
+      <hr class="rule" />
+      <h2>The interface underneath</h2>
+      <p>
+        Everything the playground knows about compiling iyi arrives through one
+        interface, <code>PlaygroundEngine</code>, resolved in one place. The
+        engine's own account of itself is the only input to how that page is
+        shaped, so an engine that could check source but not link would get a
+        larger playground without a markup change, and one that could do neither
+        would get a smaller one. To swap it, follow the three steps in{" "}
+        <code>src/playground/registry.ts</code>: add an implementation, register
+        it there, and report only what it actually does.
+      </p>
+      <aside class="evidence">
+        <dl>
+          <dt>engine</dt>
+          <dd>{engine.id}, {engine.label}</dd>
+          <dt>claims</dt>
+          <dd>
+            {caps.supported.length === 0
+              ? "no capabilities"
+              : caps.supported.map((cap) => CAPABILITY_LABEL[cap]).join(", ")}
+          </dd>
+          <dt>colouring</dt>
+          <dd>
+            the compiler's own lexer, recorded by {highlightProvenance.command}
+          </dd>
+          {caps.notes.map((note) => (
+            <Fragment>
+              <dt>caveat</dt>
+              <dd>{note}</dd>
+            </Fragment>
+          ))}
+        </dl>
+      </aside>
+    </div>
+  </section>
+</Page>
+
+<style>
+  .intro {
+    margin-block: 2.5rem 0;
+  }
+
+  .intro h1 {
+    font-size: var(--step-4);
+    margin-block-end: 0.6rem;
+  }
+
+  .lead {
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+    max-width: var(--measure);
+  }
+
+  .body {
+    margin-block: 1rem 0;
+  }
+
+  .body h2 {
+    margin-block: 1.8rem 0.9rem;
+  }
+
+  .body p {
+    max-width: var(--measure);
+  }
+
+  .body ul {
+    padding-inline-start: 1.1rem;
+    margin-block: 0 1.05em;
+    max-width: var(--measure);
+  }
+
+  .body li {
+    margin-block: 0.6em;
+  }
+
+  /* The recording's own figures, inside the stamped frame and nowhere else. */
+  .recording {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 22ch), 1fr));
+    gap: 0.4rem 1.4rem;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+  }
+
+  .recording dt {
+    color: var(--mute);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .recording dd {
+    color: var(--graphite);
+    margin: 0.1rem 0 0;
+    overflow-wrap: anywhere;
+  }
+
+  .recording dd a {
+    color: inherit;
+  }
+
+  /* A note the recorder wrote is a caveat about this target, so it reads in the
+   * signal colour, which is the one thing that colour means here. */
+  .recording .lesson dd {
+    color: var(--signal-deep);
+  }
+
+  .pane-note {
+    color: var(--graphite);
+    max-width: var(--measure);
+  }
+
+  .cases {
+    display: flex;
+    flex-direction: column;
+    gap: 1.6rem;
+  }
+
+  .case h3 {
+    font-size: var(--step-0);
+    font-weight: 640;
+    margin-block-end: 0.2rem;
+  }
+
+  .case-meta {
+    font-size: var(--step--2);
+    color: var(--mute);
+    margin: 0 0 0.5rem;
+  }
+</style>

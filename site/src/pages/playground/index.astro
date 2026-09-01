@@ -1,0 +1,326 @@
+---
+/**
+ * The playground, parked.
+ *
+ * WHY THIS PAGE IS NOT THE PLAYGROUND. The playground worth having for this
+ * language is one where iyi's own compiler runs in the visitor's tab: you type,
+ * it compiles, it runs, and no source leaves the machine. A version that sent
+ * source to a compile service was designed, agreed and half built here, and it
+ * was then thrown away on purpose, because it proved nothing about the thing
+ * being claimed. Compiling on somebody's server and calling it a playground for
+ * a language that cannot compile itself to wasm would be the one dishonest page
+ * on a site whose whole argument is that its claims are checkable.
+ *
+ * So this page says what is coming, says exactly what stands in the way, and
+ * sends a visitor to the programs that really do run today. Short on purpose.
+ * The full account belongs in the record, not in front of somebody who asked a
+ * one line question.
+ *
+ * WHY THE PREVIEW IS A DIAGRAM AND NOT A MOCK UP. `registry.ts` says a control
+ * that does nothing is a lie told by an affordance, and that binds here too. A
+ * greyed out editor with a greyed out Run button is exactly that lie, softened.
+ * So the shape of the thing being built is drawn the way the art direction
+ * draws every other structure on this site: typographic boxes, hairline edges,
+ * mono labels, nothing that looks pressable, and no `button` or `textarea`
+ * element anywhere in it. It is a plan, and it reads as a plan.
+ */
+import Page from "../../layouts/Page.astro";
+import { curatedSamples } from "../../playground/samples";
+import { SPELLED, lessonHref, sequence } from "../../lib/lessons";
+
+const base = import.meta.env.BASE_URL.replace(/\/*$/, "/");
+const lessons = await sequence();
+const first = lessons[0];
+const steps = SPELLED[lessons.length] ?? String(lessons.length);
+
+/* Structural counts, read from the records. They are the same on every machine,
+ * so they are set flat and inline with no card and no machine stamp. */
+const runnable = curatedSamples.filter((sample) => sample.identical).length;
+---
+
+<Page
+  title="Playground | iyi"
+  summary="The iyi playground is not built yet. It will be an editor you type iyi into, with the compiler itself running in your browser. Until then, the learn tour runs real cross-compiled programs in the page."
+>
+  <section class="spread hero">
+    <div class="to-wide">
+      <p class="label">playground</p>
+      <h1>An editor, with the compiler in your tab.</h1>
+      <p class="one-line">
+        Type iyi, press run, watch it compile and execute in your own browser.
+        Nothing sent anywhere.
+      </p>
+      <p class="not-yet mono">Not built yet. Here is what is in the way.</p>
+    </div>
+  </section>
+
+  <section class="spread">
+    <div class="to-wide blocker">
+      <hr class="rule" />
+      <p>
+        The compiler can already tell you what is wrong with your code from
+        inside a browser. What it cannot do there is run it: that needs a linker
+        a page cannot shell out to, and an interpreter this language does not
+        have.
+      </p>
+      <p>
+        Sending your code to a server instead would have worked, and was
+        refused: compiling somewhere else proves only that somewhere else has a
+        compiler.
+      </p>
+      <p class="one-link">
+        <a href={`${base}spec/iii-8-tooling/`}>The full account is in the spec</a
+        >.
+      </p>
+    </div>
+  </section>
+
+  {/* The shape being built. A structure diagram, which is what this site draws
+      when it draws a plan: mono boxes, hairline edges, no affordances. */}
+  <section class="spread">
+    <div class="to-wide">
+      <hr class="rule" />
+      <p class="label">planned</p>
+      <figure class="plan">
+        <div class="plan-frame" role="img" aria-label="Three panes: samples on the left, the editor in the middle and dominant, the output transcript on the right. A single run control, bound to Cmd or Ctrl and Enter.">
+          <div class="plan-col plan-list">
+            <span class="plan-name mono">samples</span>
+            <span class="plan-rule" aria-hidden="true"></span>
+            <span class="plan-rule" aria-hidden="true"></span>
+            <span class="plan-rule" aria-hidden="true"></span>
+          </div>
+          <div class="plan-col plan-editor">
+            <span class="plan-name mono">editor</span>
+            <span class="plan-code" aria-hidden="true"></span>
+            <span class="plan-code short" aria-hidden="true"></span>
+            <span class="plan-code" aria-hidden="true"></span>
+            <span class="plan-code shorter" aria-hidden="true"></span>
+            <span class="plan-code short" aria-hidden="true"></span>
+          </div>
+          <div class="plan-col plan-out">
+            <span class="plan-name mono">output</span>
+            <span class="plan-code short" aria-hidden="true"></span>
+            <span class="plan-code" aria-hidden="true"></span>
+            <span class="plan-name mono foot">diagnostics</span>
+          </div>
+        </div>
+        <figcaption class="mono">
+          Three panes, editor dominant. Run on Cmd or Ctrl and Enter. Drawn, not
+          shipped: nothing above is a control.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="spread">
+    <div class="to-wide works">
+      <hr class="rule" />
+      <p class="label">what runs today</p>
+      <p>
+        {runnable} programs from <code>samples/iyi/</code> are cross-compiled
+        to <code>wasm32-wasi</code>{" "}by the iyi compiler and execute in this
+        page, printing the same bytes as a native run.
+      </p>
+      <ul class="ways">
+        <li>
+          <a class="way" href={lessonHref(base, first)}>
+            <span class="way-name">Take the tour</span>
+            <span class="way-note"
+              >{steps.charAt(0).toUpperCase() + steps.slice(1)} steps. Each one
+              runs its program in the page.</span
+            >
+          </a>
+        </li>
+        <li>
+          <a class="way" href={`${base}playground/hello/`}>
+            <span class="way-name">Run one now</span>
+            <span class="way-note"
+              >The recorded modules, one route each, digest checked before they
+              execute.</span
+            >
+          </a>
+        </li>
+        <li>
+          <a class="way" href={`${base}playground/evidence/`}>
+            <span class="way-name">Check the recordings</span>
+            <span class="way-note"
+              >Which bytes ran, what checked them, and what the compiler said
+              when it refused.</span
+            >
+          </a>
+        </li>
+      </ul>
+    </div>
+  </section>
+</Page>
+
+<style>
+  .hero {
+    padding-block: 3.4rem 0;
+  }
+
+  .hero h1 {
+    font-size: var(--step-4);
+    font-variation-settings: "opsz" 60;
+    line-height: var(--lead-tight);
+    letter-spacing: -0.02em;
+    margin-block: 0.4rem 0.7rem;
+    max-width: 30ch;
+  }
+
+  .one-line {
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+    color: var(--graphite);
+    max-width: 44ch;
+    margin: 0;
+  }
+
+  /* The one place the signal colour appears on this page, and it is a caveat,
+   * which is the only thing that colour means on this site. */
+  .not-yet {
+    color: var(--signal-deep);
+    font-size: var(--step--1);
+    margin-block: 1.3rem 0;
+  }
+
+  .blocker p {
+    max-width: 52ch;
+    margin-block: 0.9rem;
+  }
+
+  .blocker p:first-of-type {
+    font-size: var(--step-0);
+  }
+
+  .one-link {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    margin-block-end: 2.2rem;
+  }
+
+  /* THE PLAN. A structure diagram in the site's own imagery system: hairline
+   * boxes, mono labels, and bars standing in for text. Nothing here is a
+   * control, nothing is disabled, and nothing invites a click, because a
+   * greyed out button is still an affordance and this page has none. */
+  .plan {
+    margin: 1rem 0 2.6rem;
+  }
+
+  .plan-frame {
+    display: grid;
+    grid-template-columns: minmax(0, 0.55fr) minmax(0, 1.6fr) minmax(0, 1fr);
+    gap: var(--hair);
+    background: var(--hairline);
+    border: var(--hair) solid var(--hairline);
+    padding: var(--hair);
+  }
+
+  @media (max-width: 48rem) {
+    .plan-frame {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  .plan-col {
+    background: var(--raise);
+    padding: 0.65rem 0.8rem 0.9rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .plan-editor {
+    min-height: 13.5rem;
+  }
+
+  .plan-name {
+    font-size: var(--step--2);
+    color: var(--mute);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .plan-name.foot {
+    margin-block-start: auto;
+    padding-block-start: 0.6rem;
+    border-block-start: var(--hair) solid var(--hairline);
+  }
+
+  /* A line of source, drawn. Track fill rather than ink, so it reads as a
+   * placeholder for text and never as text. */
+  .plan-code,
+  .plan-rule {
+    display: block;
+    height: 0.5rem;
+    background: var(--track);
+  }
+
+  .plan-code {
+    width: 82%;
+  }
+
+  .plan-code.short {
+    width: 58%;
+  }
+
+  .plan-code.shorter {
+    width: 34%;
+  }
+
+  .plan-rule {
+    width: 46%;
+    height: 0.4rem;
+  }
+
+  .plan figcaption {
+    font-size: var(--step--2);
+    color: var(--mute);
+    margin-block-start: 0.6rem;
+    max-width: var(--measure);
+    line-height: 1.5;
+  }
+
+  .works p {
+    max-width: 52ch;
+  }
+
+  .ways {
+    list-style: none;
+    margin: 1.2rem 0 1.2rem;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 17ch), 1fr));
+    gap: 0;
+    border-block-start: var(--hair) solid var(--hairline);
+  }
+
+  .way {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.9rem 1.1rem 1.1rem 0;
+    text-decoration: none;
+    color: inherit;
+    border-block-end: var(--hair) solid var(--hairline);
+    height: 100%;
+  }
+
+  .way-name {
+    font-weight: 620;
+    text-decoration: underline;
+    text-decoration-color: var(--signal);
+    text-underline-offset: 0.18em;
+  }
+
+  .way-note {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--graphite);
+    line-height: 1.5;
+  }
+
+  .way:hover .way-name {
+    color: var(--signal-deep);
+  }
+</style>

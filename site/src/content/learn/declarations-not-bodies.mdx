@@ -1,0 +1,122 @@
+---
+title: Delete the library, build again
+order: 1
+summary: A module is the unit of compilation, and a consumer compiles against what its imports declare rather than against what they do. Build once keeping each module's artifact, delete the library's source, and build again.
+rule: R-1
+sample: samples/iyi/modules.iyi
+breaks: r1-import-cycle
+breaksAlso:
+  - site/records/break/dep/loop_a.iyi
+  - site/records/break/dep/loop_b.iyi
+bought: >-
+  A change inside a module cannot reach past that module's exported signatures,
+  so what has to be rebuilt is bounded by the import graph instead of by the size
+  of your program. Whole program compilers cannot offer that boundary, and
+  Crystal is a whole program compiler. `bench/samples_roundtrip.sh` deletes
+  `app`, `std`, `boot` and `kemal` and rebuilds every sample from artifacts on
+  every push, so the boundary is a gate rather than a claim.
+sources:
+  - file: README.md
+    note: the two console sequences, quoted with their lines on each block, and the paragraph under the first one
+  - file: samples/iyi/app/greeter.iyi
+    note: the library the two builds import, shown whole
+  - file: samples/iyi/modules.iyi
+    note: the same procedure written into the sample's own comments, shown here
+  - file: bench/samples_roundtrip.sh
+    note: the check, what it deletes, and what it compares
+---
+
+import Sample from "../../components/Sample.astro";
+import Quote from "../../components/Quote.astro";
+
+This is the step the language exists for. Everything else in iyi, the `pub`
+signatures, the traits, the orphan rule, is here to make it hold.
+
+Two files are enough to show it, so start with the one being imported. Every iyi
+file opens by saying which module it is, and that line is not a namespace
+declaration you can put anywhere. It is the compilation unit's name, it is
+absolute, and it tells you where the file sits: a module called `app/greeter`
+lives at `app/greeter.iyi`, resolved from the project root and never relative to
+whoever imports it. No manifest, no include path, no search order.
+
+<Sample path="samples/iyi/app/greeter.iyi" />
+
+`polite` and `title` carry `pub` and `greeting` does not, which is the next
+step's subject. What matters here is the other half of that file: the signatures,
+and not the bodies underneath them.
+
+Now build a consumer of it once, keeping each module's artifact. Then delete the
+library and build again.
+
+<Quote id="the_rule" as="console" />
+
+Look at the `rm -r app` line, then at what the program printed. The library's
+source is gone. The build works anyway, and the binary it produced runs.
+
+Nothing was cached. The second build never opens `polite`'s body, because there
+is no body on the disk to open. It reads `mods/app/greeter.iyimod`, which carries
+the declarations it type checks against and the machine code it links. README.md
+puts it in one sentence in the paragraph under that block: a module compiles
+against what its imports say, not against what they do.
+
+That is R-1, and this is what it buys. Everything after this step is the bill.
+
+## Try it on the samples
+
+The repository does not ask you to take this on faith, and the sample carries the
+procedure in its own comments.
+
+<Sample
+  path="samples/iyi/modules.iyi"
+  from="# Compiling this file without"
+  to="not in the artifact"
+  must="--use-iyimod /tmp/mods"
+/>
+
+The middle command is the one to run first. `mod dump --declarations` prints
+exactly what the artifact only build gets to see: `app/greeter` with
+`pub def polite(name : String) : String`, `pub trait Greet` with its requirement,
+and no bodies at all. `greeting` is missing from it, because it never carried
+`pub`.
+
+## The same move on a framework
+
+Two files is a demonstration. A web framework is a test.
+
+<Quote id="library_deleted" as="console" />
+
+`samples/iyi/webapp.iyi` is a port of Kemal onto iyi's rules, and its router
+lives in `samples/iyi/kemal`. That whole directory goes away between the two
+builds, and the program still builds, links, runs, and prints the same output.
+
+## It is a gate, not a slogan
+
+`bench/samples_roundtrip.sh` is where the claim stops being prose. For every
+sample that imports a module it builds with `--emit-iyimod`, runs the binary, and
+keeps what it printed. Then it deletes `app`, `std`, `boot` and `kemal`, so a
+build that wants a module's source has nothing to fall back on. Then it builds
+each sample again with `--use-iyimod`, runs that second binary, and diffs the two
+outputs. Any sample that fails to build either way, or prints something
+different, exits the script non zero. README.md says CI runs it on every push.
+
+Look at what the diff compares. Not that both builds succeeded, which would only
+prove the front end swallowed the artifacts. That both programs ran, and printed
+the same thing. The script's own header is blunt about why the deletion is the
+whole test: the only way to be sure a consumer never reads a dependency's source
+is to take the source away and see whether the build still produces a program
+that behaves.
+
+What that boundary saves in seconds belongs to a machine rather than to a
+language, so this page will not quote you a number. README.md publishes them with
+the machine attached and the command that measures them.
+
+## The clause the deletion did not use
+
+Read the premise at the top of this page again. It is three sentences, and the
+deletion proves the third. The second one, that `import` forms a DAG, is
+enforced long before any of that, and it has to be: a module initialises after
+every module it imports, so two modules that wait for each other have no order
+to be initialised in and there is no build to have.
+
+Write one anyway and the compiler declines, draws the cycle it found, and names
+the move that fixes it.

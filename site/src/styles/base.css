@@ -1,0 +1,337 @@
+/* Reset, grid, prose. See doc/website/ART-DIRECTION.md for the reasoning. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-size: var(--step-0);
+  line-height: var(--lead-body);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The spread. A main column for the argument and a rail for the evidence, as
+ * named grid lines so a component can opt into either without knowing the
+ * page. The README puts the command that prints a number beside the number;
+ * this is that sentence expressed as a grid. */
+.spread {
+  display: grid;
+  grid-template-columns:
+    [full-start] minmax(var(--edge), 1fr)
+    [main-start] min(var(--measure), 100% - 2 * var(--edge))
+    [main-end] var(--gutter)
+    [rail-start] minmax(0, var(--rail))
+    [rail-end] minmax(var(--edge), 1fr)
+    [full-end];
+  column-gap: 0;
+}
+
+.spread > * {
+  grid-column: main;
+}
+
+.spread > .to-rail {
+  grid-column: rail;
+}
+
+.spread > .to-full {
+  grid-column: full;
+}
+
+/* Main plus rail, for a figure that wants the whole measure of both. */
+.spread > .to-wide {
+  grid-column: main-start / rail-end;
+}
+
+@media (max-width: 62rem) {
+  .spread {
+    grid-template-columns:
+      [full-start] minmax(var(--edge), 1fr)
+      [main-start rail-start] min(var(--measure), 100% - 2 * var(--edge))
+      [main-end rail-end] minmax(var(--edge), 1fr)
+      [full-end];
+  }
+}
+
+/* Type ------------------------------------------------------------------- */
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 620;
+  line-height: var(--lead-tight);
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+  margin: 0;
+  font-variation-settings: "opsz" 40;
+}
+
+h1 {
+  font-size: var(--step-4);
+}
+h2 {
+  font-size: var(--step-3);
+}
+h3 {
+  font-size: var(--step-2);
+}
+h4 {
+  font-size: var(--step-1);
+}
+
+p {
+  margin: 0 0 1.05em;
+  text-wrap: pretty;
+}
+
+a {
+  color: var(--ink);
+  text-decoration-color: var(--signal);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+strong {
+  font-weight: 640;
+}
+
+/* Anything a command printed is the machine talking, so it is set in mono. */
+code,
+kbd,
+samp,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.885em;
+  font-variant-ligatures: none;
+}
+
+:not(pre) > code {
+  background: var(--raise);
+  border: var(--hair) solid var(--hairline);
+  padding: 0.08em 0.32em;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+/* Small caps label, used for section eyebrows and rail headings. Mono, wide,
+ * uppercase: this is an instrument label, not a badge. */
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--mute);
+  font-weight: 500;
+}
+
+/* Rules ------------------------------------------------------------------ */
+
+/* A section boundary is a hairline carrying a tittle: the dot on the i, which
+ * in Turkish orthography is semantic rather than decorative (i and dotless ı
+ * are different letters). It is the only ornament on the site and it marks the
+ * grid, so it is doing structural work. */
+.rule {
+  border: 0;
+  height: var(--hair);
+  background: var(--hairline);
+  margin: 0;
+  position: relative;
+  overflow: visible;
+}
+
+.rule::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: calc(50% - var(--tittle) / 2);
+  width: var(--tittle);
+  height: var(--tittle);
+  border-radius: 50%;
+  background: var(--signal);
+}
+
+/* Evidence --------------------------------------------------------------- */
+
+/* The rail. Never a tooltip, never a hover: the provenance of a number is
+ * always on the page. */
+.evidence {
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  line-height: 1.5;
+  color: var(--graphite);
+  border-left: var(--hair) solid var(--hairline);
+  padding: 0.1rem 0 0.3rem 0.7rem;
+  margin-block: 0.35rem 1.4rem;
+  overflow-wrap: break-word;
+}
+
+.evidence dt {
+  color: var(--mute);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.82em;
+}
+
+.evidence dd {
+  margin: 0 0 0.55rem;
+}
+
+.evidence dd:last-child {
+  margin-bottom: 0;
+}
+
+/* Measured values -------------------------------------------------------- */
+
+/* Every one of these is written by the build from a measurement artifact.
+ * There is no code path that renders a hand-typed number. */
+.measure-value {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-feature-settings: "tnum" 1;
+}
+
+/* A loss is the only thing that gets the signal colour. */
+.measure-value[data-outcome="loss"] {
+  color: var(--signal);
+}
+
+.measure-value[data-outcome="win"],
+.measure-value[data-outcome="flat"] {
+  color: var(--ink);
+}
+
+/* Utility ---------------------------------------------------------------- */
+
+.stack > * + * {
+  margin-block-start: var(--flow, 1.05em);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
+/* Long-form prose -------------------------------------------------------- */
+
+/* The one long-form surface on the site. A lesson and a generated spec page
+ * are different kinds of text, but the elements they are made of are the
+ * same, and they are styled exactly once, here. Components that wrap code
+ * (.source, .console, .diagnostic) are not markdown elements and keep their
+ * own rules in code.css; the pre selector below is scoped to direct children
+ * so it cannot tie with them. */
+.prose > p {
+  margin: 0 0 1.05em;
+  max-width: var(--measure);
+}
+
+.prose > h2,
+.prose > h3,
+.prose > h4 {
+  margin: 2.1em 0 0.6em;
+}
+
+.prose > h2 {
+  font-size: var(--step-2);
+}
+
+.prose > h3 {
+  font-size: var(--step-1);
+}
+
+.prose > h4 {
+  font-size: var(--step-0);
+  font-weight: 640;
+}
+
+.prose > ul,
+.prose > ol {
+  margin: 0 0 1.05em;
+  padding-inline-start: 1.3em;
+  max-width: var(--measure);
+}
+
+.prose > ul li,
+.prose > ol li {
+  margin-block-end: 0.35em;
+}
+
+.prose > blockquote {
+  margin: 1.4em 0;
+  padding: 0.1em 0 0.1em 1.1em;
+  border-inline-start: 2px solid var(--hairline);
+  color: var(--graphite);
+  font-style: italic;
+  max-width: calc(var(--measure) - 1.1em);
+}
+
+.prose > pre {
+  margin: 0 0 1.2em;
+  padding: 0.95rem 1.1rem;
+  background: var(--raise);
+  border: var(--hair) solid var(--hairline);
+  border-radius: 2px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  line-height: 1.58;
+}
+
+.prose > hr {
+  border: 0;
+  height: var(--hair);
+  background: var(--hairline);
+  margin: 2.2em 0;
+}
+
+.prose table {
+  border-collapse: collapse;
+  margin: 0 0 1.4em;
+  font-size: var(--step--1);
+  width: 100%;
+}
+
+.prose th,
+.prose td {
+  border: var(--hair) solid var(--hairline);
+  padding: 0.4em 0.7em;
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose th {
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--graphite);
+  background: var(--raise);
+}
+
+.prose td code {
+  white-space: normal;
+}

@@ -1,0 +1,84 @@
+---
+title: What a module writes down
+order: 2
+summary: If a consumer compiles against declarations, the declarations have to be complete. So an exported name carries full parameter and return types, and everything inside the module goes on inferring.
+rule: R-2
+sample: samples/iyi/calc.iyi
+breaks: r2-missing-return-type
+bought: >-
+  The artifact is enough on its own: a consumer types a call from the signature,
+  so a module can be compiled against with its source deleted, which is what step
+  one spent. The writing is asked for at the boundary, where it is documentation
+  anyway, and nowhere else, so a three module program like `samples/iyi/calc.iyi`
+  annotates what it exports and lets every local inside a body infer.
+sources:
+  - file: samples/iyi/app/greeter.iyi
+    note: the unexported def, and the comment saying why it has to be unreachable rather than merely awkward
+  - file: samples/iyi/calc/lexer.iyi
+    note: an exported signature with a union return type, and a body that annotates nothing
+  - file: samples/iyi/modules.iyi
+    note: what `mod dump --declarations` prints for a module, written into the sample's own comments
+  - file: SPEC.md
+    note: IV.2, what goes into a module's exports and what is deliberately kept out
+---
+
+import Sample from "../../components/Sample.astro";
+
+Step one deleted a library and built anyway. The bill for that arrives here, and
+it is smaller than you would expect: if a consumer only ever reads declarations,
+the declarations have to say everything a consumer needs. That is two questions,
+and R-2 answers both. Which names are written down, and what each one has to say.
+
+## Which names
+
+Go back to the library from step one. One of its three definitions is not
+exported, and the file says what that costs.
+
+<Sample
+  path="samples/iyi/app/greeter.iyi"
+  from="# R-2: not exported"
+  to="end"
+  must="def greeting : String"
+/>
+
+Read `greeting` again. It is not merely awkward to reach from another file, it is
+unreachable, and the sample says why in the comment above it. A `.iyimod`
+artifact carries a module's exports and nothing else. So a name without `pub` has
+to be genuinely unreachable, or that artifact would not be enough to compile
+against. Qualifying it does not help. `App::Greeter.greeting` fails for the same
+reason a `using` cannot find it: it is not there to be found.
+
+Notice what just happened to step one. "Unreachable rather than absent from
+`using`" and "not in the artifact" turned out to be the same sentence. Visibility
+in iyi is not advice to the reader. It is the shape of a file the compiler will
+later read instead of your source.
+
+## And what those names say
+
+The other half of the rule is about the names that are written down. Here is one
+from a bigger program, the scanner inside the three module calculator.
+
+<Sample path="samples/iyi/calc/lexer.iyi" region="def scan" />
+
+The signature is fully written: one parameter with its type, and a return type
+that is a union, because scanning can fail and step five is about what that
+means. Nothing else in the declaration is left to a reader or to a compiler.
+
+Then look inside the body. `tokens`, `index` and `start` are declared by being
+assigned, and no local anywhere in that file carries a type. That is the
+second sentence of the premise doing its work: inference is untouched, and it is
+untouched everywhere it costs a consumer nothing. Crystal's local inference,
+flow typing and blocks are all still here, unchanged, because they never crossed
+a module boundary in the first place.
+
+So the writing is asked for exactly at the edge. That is also where a person
+would want it: an exported signature is the documentation a consumer reads, and
+`iyi mod dump --declarations` prints the module as its consumers see it, which
+is the same list of signatures with the bodies gone.
+
+## Leave one off
+
+An exported def with no return type looks like an oversight the compiler could
+just fix, since the body is right there. It cannot, and the reason is worth more
+than the rule: the body stays in this module, so the consumer never sees it. The
+compiler says which symbol it would end up asking the linker for.

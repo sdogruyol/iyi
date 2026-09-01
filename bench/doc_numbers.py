@@ -9,6 +9,7 @@ was repeated in eleven places across four files.
 
     python3 bench/doc_numbers.py          # check
     python3 bench/doc_numbers.py --list   # every occurrence found
+    python3 bench/doc_numbers.py --json   # what the tree measures, for the site
 
 Only CURRENT claims are checked. A release note saying "0.1.0 had a
 1,184-line prelude" is a statement about the past and stays; the check looks
@@ -90,6 +91,7 @@ IYI_SPECS = (
     "spec/compiler/semantic/iyi_spec.cr",       # iyi's own semantics
     "spec/compiler/iyi/rx_spec.cr",             # the engine, differential
     "spec/compiler/formatter/iyi_formatter_spec.cr",  # `pub`, which Crystal has no word for
+    "spec/compiler/object_header_spec.cr",      # the collector's header, GC_DESIGN.md Stage 1
 )
 
 
@@ -201,6 +203,14 @@ def as_number(raw: str) -> int | None:
 def main() -> int:
     show_all = "--list" in sys.argv
     truth = measured()
+    # The site reads these rather than transcribing them, so the page and this
+    # gate agree by construction: one measurement function, two consumers. A
+    # number typed into a template is the artifact this project argues against.
+    if "--json" in sys.argv:
+        import json
+
+        print(json.dumps(truth, indent=2, sort_keys=True))
+        return 0
     wrong: list[str] = []
     found: list[str] = []
 

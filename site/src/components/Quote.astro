@@ -1,0 +1,65 @@
+---
+/**
+ * A verbatim recording quoted out of README.md.
+ *
+ * `scripts/samples.mjs` finds the block by an anchor string that has to match
+ * exactly one fenced block in the whole README, and carries the line numbers it
+ * came from. Nothing here retypes output. A page that invented a terminal
+ * session would be the same failure as a page that invented a number.
+ *
+ * Two faces, both already styled in styles/code.css and both classified by
+ * src/lib/recording.ts, which BreakRule shares so that a caret line means the
+ * same thing wherever a recording is set:
+ *
+ *   console     a recording of a real run. Prompts and commands are marked,
+ *               output is not, because nothing highlighted it in the terminal.
+ *   diagnostic  a compiler error. iyi's errors name the rule they enforce,
+ *               which is a feature, so this is a designed component rather
+ *               than a red box, and the caret line is preserved exactly.
+ */
+import readme from "../generated/readme.json";
+import { renderRecording } from "../lib/recording";
+
+interface Props {
+  id: string;
+  as?: "console" | "diagnostic";
+  caption?: string;
+}
+
+const { id, as = "console", caption } = Astro.props;
+
+type Block = { text: string; from: number; to: number; source: string; cite: string };
+
+const block = (readme as Record<string, Block>)[id];
+
+if (!block) {
+  throw new Error(
+    `Quote: "${id}" is not a recording scripts/samples.mjs extracts. It has ` +
+      `${Object.keys(readme).join(", ")}. Add an anchor to WANTED in that ` +
+      `script rather than typing the output into a page.`,
+  );
+}
+
+const body = renderRecording(block.text, as);
+---
+
+{
+  as === "console" ? (
+    <div class="console">
+      <div class="console-chrome">
+        <i aria-hidden="true" />
+        <i aria-hidden="true" />
+        <i aria-hidden="true" />
+        <span class="caption">{caption ?? `quoted from ${block.cite}`}</span>
+      </div>
+      <pre set:html={body} />
+    </div>
+  ) : (
+    <div class="diagnostic">
+      <pre set:html={body} />
+      <span class="cites">
+        {caption ? `${caption}. ` : ""}Quoted verbatim from {block.cite}.
+      </span>
+    </div>
+  )
+}

@@ -96,6 +96,17 @@ ALLOWED_PATHS: list[tuple[str, str]] = [
     (r"^bench/(machine_probe|dependency_floor)", "measures the compatibility binary and its libraries"),
     (r"^spec/compiler/util_spec\.cr$", "specs Crystal's own util module"),
     (r"^samples/iyi/", "programs whose comments compare iyi with Crystal"),
+    # The website's own pipeline, and the same reasoning as the benches above.
+    # `site_facts.py` parses the comparison README.md publishes, whose middle
+    # column is Crystal's, so the column has to be called what it is. The
+    # recorders drive the compatibility binary to produce the site's listings
+    # and its wasm modules. And `site/records/` is verbatim recordings of real
+    # runs: one sample prints `Hello, crystal!` because that is what the
+    # program prints, and editing a recording to satisfy a naming gate would
+    # make the recording a paraphrase.
+    (r"^bench/site_facts\.py$", "parses the published comparison, whose middle column is Crystal's"),
+    (r"^site/scripts/record-", "drives the compatibility binary and records what it prints"),
+    (r"^site/records/", "verbatim recordings of real runs, including what a sample prints"),
 ]
 
 # Lines that name Crystal legitimately inside a file that is otherwise iyi's.
@@ -148,6 +159,21 @@ ALLOWED_LINES: list[tuple[str, str]] = [
     # And the driver's, for the same reason: `crystal-lang/crystal-sqlite3` is
     # where `shards install` looks and there is no other spelling of it.
     (r"github: crystal-lang/", "a shard's own coordinates"),
+    # A probe written in Crystal, quoted by doc/website/PLAYGROUND-FEASIBILITY.md
+    # as the one line that reproduces the wasm32-wasi link defect: a Crystal
+    # prelude program collides with wasi-libc's `crt1-command.o` over `_start`,
+    # which iyi's own prelude deliberately does not define. The program is
+    # Crystal's, and so is the string it prints.
+    (r'puts "hi from crystal"', "a Crystal probe program's own source line"),
+    # The website draws a three column comparison, and the middle column is
+    # Crystal's. Its series key and the comparator square in the size figure
+    # are named after the language they stand for.
+    (r'key === "crystal"', "the comparison series naming the other language"),
+    (r"crystalSide", "the comparator square in the true-area size figure"),
+    # `samples/iyi/hello.iyi` line 115 builds `User.new("crystal")`, so the
+    # greeting it prints carries that name. The hero quotes the run, and the
+    # word is data the program printed rather than a language being renamed.
+    (r"Hello, crystal!", "a line a sample prints, quoted from a real run"),
     (
         r"Crystal's (own|library|licence|license|compiler|semantics|stdlib|"
         r"standard|prelude|codegen|cache|interpreter|fibers|ecosystem|list|"
@@ -271,6 +297,14 @@ ALLOWED_LINES: list[tuple[str, str]] = [
     # hold every file of it. Renaming either would claim a name iyi does not own.
     (r"crystal_types|crystal_requires", "what a --crystal consumer already has, carried by name"),
     (r"a \*Crystal\* source", "a sentence about the other language"),
+    # `trycrystal.org` is Crystal's own playground, and it is the reference the
+    # iyi playground's specification is written against: the site takes its
+    # structure and interaction model, three panes with the editor dominant and
+    # one primary Run, while explicitly refusing its look because this site has
+    # its own art direction. Naming it is the point, since a specification that
+    # said "a playground like the good one" would be unbuildable, and the name
+    # is a domain rather than a claim about which language this is.
+    (r"trycrystal\.org", "Crystal's own playground, named as the reference"),
 ]
 
 PATH_RES = [(re.compile(p), why) for p, why in ALLOWED_PATHS]
@@ -316,7 +350,18 @@ def path_allowed(rel: str) -> str | None:
 # wrong one of those sends a person somewhere real. The security-advisory link
 # in CODE_OF_CONDUCT.md pointed at another owner's repository, and that is the
 # shape this keeps looking for while letting the prose alone.
-PROSE_DOC = re.compile(r"\.md$")
+# `.mdx` is a lesson: prose with components in it, and the same reasoning
+# applies to it as to `.md`.
+PROSE_DOC = re.compile(r"\.mdx?$")
+
+# The website's pages and stylesheets carry paragraphs, and the site's whole
+# argument is a comparison with the other language, so a capitalised `Crystal`
+# in them is prose for the same reason it is prose in a document. This is kept
+# to `site/src` rather than applied to all source, because elsewhere in this
+# tree a capitalised `Crystal` is usually a namespace the fork did not finish
+# renaming, which is exactly what this gate is for. The lowercase test still
+# applies: a line naming the `crystal` binary or a path is still checked.
+PROSE_SITE = re.compile(r"^site/src/.*\.(astro|css|ts)$")
 LOWER_NEEDLE = re.compile(r"crystal")
 
 
@@ -324,7 +369,8 @@ def line_allowed(line: str, rel: str = "") -> str | None:
     for rx, why in LINE_RES:
         if rx.search(line):
             return why
-    if PROSE_DOC.search(rel) and not LOWER_NEEDLE.search(line):
+    prose = PROSE_DOC.search(rel) or PROSE_SITE.search(rel)
+    if prose and not LOWER_NEEDLE.search(line):
         return "the other language's name, in prose"
     return None
 

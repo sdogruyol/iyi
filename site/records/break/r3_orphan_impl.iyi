@@ -1,0 +1,20 @@
+# Breaks R-3: `impl Trait for Type` may live in the module that defines the
+# trait or the module that defines the type, and nowhere else. `Greet` belongs
+# to `dep/greeter` and `User` belongs to `dep/user`, so this module owns
+# neither and is the one place the impl cannot be written. That restriction is
+# what makes a type's method set knowable from its declarations alone.
+module diagnostics/r3_orphan_impl
+
+import dep/greeter
+import dep/user
+
+using dep/greeter
+using dep/user
+
+impl Greet for User
+  def greet : String
+    "Hello, #{name}."
+  end
+end
+
+puts User.new("iyi").greet

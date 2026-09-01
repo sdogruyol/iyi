@@ -1,0 +1,12 @@
+# Written by scripts/facts.mjs and scripts/reference.mjs on every build. It is
+# a copy of numbers and text that already live in this repository, so committing
+# it would create a second place for them to disagree.
+src/generated/
+
+# Copied out of site/records/wasm/ by scripts/records.mjs so Astro can serve
+# it. The records are the committed originals; this is the copy.
+public/wasm/
+
+node_modules/
+dist/
+.astro/

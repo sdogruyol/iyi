@@ -81,7 +81,7 @@ class Collector < Iyi::Visitor
     @types[@scope.join("::")]?
   end
 
-  private def enter(name, is_module)
+  private def enter(name, is_module, &)
     @scope << name
     key = @scope.join("::")
     info = (@types[key] ||= TypeInfo.new(key, @file))

@@ -1,0 +1,30 @@
+# Breaks the error rule in SPEC.md III.1: an error is an ordinary member of a
+# union, so handling one needs no new machinery, only the totality check a
+# `case` already performs. `read` can return an `IOError` and this `case` has
+# no branch for it, which is the same mistake as ignoring a returned error and
+# is caught by the same check.
+module diagnostics/errors_non_exhaustive
+
+pub struct IOError
+  getter path : String
+
+  def initialize(@path : String)
+  end
+end
+
+# `Error` is the compiler's trait, which is what lets a union member be an
+# error member without any name in scope deciding it.
+impl Error for IOError
+  def message : String
+    "no such file: #{path}"
+  end
+end
+
+pub def read(path : String) : String | IOError
+  return IOError.new(path) if path == "missing"
+  "12"
+end
+
+case read("missing")
+in String then puts it
+end

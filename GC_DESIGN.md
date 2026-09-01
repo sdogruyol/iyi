@@ -1,6 +1,99 @@
 # iyi Garbage Collector Design
 
-**Status:** Design for implementation. CollectorDesign unit, no code edits.
+**Status:** Stages 1, 2, 3, 5 and 6 built, so the collector works end to end
+behind `-Dgc_iyi`: allocate, mark, sweep, and the memory is handed out again.
+Stage 4 is mostly vacuous, Stages 7 to 9 wait on a scheduler, and Stage 10 is
+design.
+
+Stage 6: the sweep. One walk over every carved chunk, a white object's chunk
+goes back on its class's free list, a black one survives and is repainted white
+for the next cycle. Large objects walk their own list with `next` read before
+the node is released. The proof is reuse rather than a counter: 300 objects
+nothing references, collect, 300 more allocations, and 299 of them come back
+from addresses the sweep reclaimed. A rooted object keeps every byte, comes out
+white, and its chunk is not handed out again.
+
+Finalizers and weak references are not built, and not for lack of time.
+Nothing in this language defines a finalizer, there is no `def finalize`
+anywhere in `src/iyi` or `samples/iyi`, so a finalizer queue would be a
+mechanism no program could put an entry in. Weak references are registration
+based and the standard library's `WeakRef` is on the `--crystal` side, so there
+is no table here to walk and null out. Both wait on the language having the
+feature. Statistics are the honest subset, counted as the walk goes: chunks
+swept, chunks kept, bytes freed, collections run.
+
+Stage 5: the mark phase. Roots go gray through Stage 3's walker, a queue in its
+own mapping drains, each object's payload is scanned to the bound its size
+header carries, and what is still white when the queue empties is unreachable.
+The object header is real now: with `P` the pointer a program holds, `P-24` is
+the size, `P-16` the `type_id`, `P-8` the mark word, and `P` the user data.
+
+Marking is **conservative**, and that is a decision rather than a stub. The
+layout table is emitted into the binary (`__iyi_gc_layouts`), and the mark loop
+does not read it, because nothing writes an object's `type_id` yet: `malloc` is
+handed a size and cannot know the type, so that store belongs at the allocation
+site in codegen and is the next step. A table keyed by an id that is always
+zero would be a lookup no test could reach. Conservative marking is what Boehm
+does in production and it errs in the safe direction, since a false positive
+retains a dead object and only a false negative frees a live one.
+
+Nothing sweeps. This stage decides what is garbage; Stage 6 reclaims it.
+
+Stage 1: the artifact carries a pointer map per type it owns (`.iyimod` format
+v43, `Layouts` section 64), and the object header and its CAS-safe mark word
+exist and are tested as a unit. Stage 1's own tasks 3 and 4, work distribution
+and write barriers, are design here and deferred to Stage 6 by their own text;
+they were not built.
+
+Stage 2: a size-class arena allocator, `-Dgc_iyi`, on Linux x86_64 and aarch64
+and on darwin. Size classes to 16 KiB, 16 MiB arenas, free lists, large objects
+by their own mapping and released with `munmap`, and the two properties Stage 3
+needs: a pointer resolves to its arena and class, and the arena list walks. It
+costs no symbol and no library beyond `munmap`, so the dependency floor holds.
+
+What none of it does yet: no object is allocated with the header, nothing marks,
+nothing collects, and nothing calls `free` except the exercise. `-Dgc_boehm` is
+still the only way to get collection and every default path still allocates and
+never frees. Windows and wasm32 keep their existing allocators on purpose, the
+first because its binaries currently print uninitialized memory and a new
+allocator there would confound that diagnosis, the second because it has no
+mmap and its watermark arena is a separate design.
+
+## What the staging above got wrong, and what the rebase onto 0.6.0 corrected
+
+This plan was written assuming iyi has threads and fibers, and when the first
+three stages were built it had neither. That half inverted while the work was
+in flight: 0.4.0 shipped structured concurrency — a cooperative scheduler,
+`spawn`/`group`, `Channel`, 256 KiB mmap'd fiber stacks in
+`src/iyi/concurrency.iyi`. Threads are still absent, and III.9's reason
+stands.
+
+What that does to the stages, restated against the tree as it is:
+
+* **Stage 3's fiber enumeration is no longer blocked — it is missing.** The
+  root walk covers the current stack, the spilled registers and the globals,
+  and a *parked* fiber's stack is an unscanned root range: an object
+  reachable only from one would be freed live. Latent rather than active,
+  because nothing triggers a collection except the exercises and they are
+  single-fiber — but it is the next Stage 3 task, not a wait on III.4:
+  walk the scheduler's registry, each parked fiber's
+  [saved stack pointer, stack top] as a range.
+* **Stage 4's thread suspension** still has nothing to suspend: fibers yield
+  cooperatively at suspension points and never inside the marker, so a
+  single-threaded collection needs no stopping. Register capture, the part
+  that was real with one thread, moved into Stage 3 where it is tested.
+* **Stages 7 and 8**, parallel marking and concurrent sweeping, are the
+  reason the owner chose to own a collector, and they still wait on threads,
+  not on fibers. The mark word is already CAS-safe and the header already
+  reserves its bits, so the wait costs a redesign of nothing.
+* **Stage 9** is conditional on measuring Stage 7, so it inherits the same wait.
+
+This is worth stating plainly rather than leaving the plan to read as ten
+achievable steps: the collector can reach a working single-fiber
+mark-and-sweep today, a fiber-aware one after Stage 3's registry walk, and
+the parallelism the decision was made for arrives after threads do.
+
+So the point of no return, Stage 5, is still ahead.
 
 **Owner's Decision:** Own the garbage collector. Concurrency, parallelism, and performance control are the reasons. gcry is prior art: measurements, design hints, and a record of what has already been tried and cost what. iyi writes the heap, the STW mechanism, root discovery, and finalizers from scratch.
 

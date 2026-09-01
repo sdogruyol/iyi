@@ -1,0 +1,299 @@
+/* Code display.
+ *
+ * Code is the product, so this file carries more decisions than any other.
+ *
+ * The highlighting theory: emphasise exactly the tokens that are iyi's and not
+ * Crystal's. `module`, `import`, `using`, `pub`, `trait`, `impl`, `forall`,
+ * `derive`, `type` are the whole delta, and they are what a reader is here to
+ * see. Everything else is ink. There is no rainbow, because a rainbow would
+ * spend attention on syntax that is not the argument.
+ */
+
+.source {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  line-height: 1.58;
+  background: var(--raise);
+  border: var(--hair) solid var(--hairline);
+  border-radius: 2px;
+  margin: 0;
+  overflow-x: auto;
+  tab-size: 2;
+}
+
+.source pre {
+  margin: 0;
+  padding: 0.95rem 1.1rem;
+  overflow: visible;
+}
+
+.source code {
+  font-size: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  white-space: pre;
+}
+
+/* A file header, because a module's path IS its file's path in iyi, so the
+ * filename is load-bearing information rather than chrome. */
+.source-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.45rem 1.1rem;
+  border-bottom: var(--hair) solid var(--hairline);
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  color: var(--mute);
+}
+
+.source-head .path {
+  color: var(--graphite);
+}
+
+/* Tokens ----------------------------------------------------------------- */
+
+/* The token classes are the COMPILER'S, not this site's. They come out of
+ * `Crystal::SyntaxHighlighter::HTML` running inside the iyi fork's own
+ * compiler, recorded into `site/records/highlight.json`, so the tokens on the
+ * page are the tokens the compiler saw. There is no second grammar in this
+ * repository and there must never be one: a hand written scanner drifts from
+ * the real lexer silently, and the drift reads as a keyword the site does not
+ * think is a keyword.
+ *
+ * Its vocabulary, and the whole of it:
+ *
+ *   k  keyword, and `self`        m  identifier, a method at its def or call
+ *   t  a constant or a type       s  a string or a character literal
+ *   n  a number, a symbol, a      o  an operator or a delimiter
+ *      primitive literal         c  a comment
+ *   i  the delimiters of a string interpolation
+ *
+ * Weight only, and no hue anywhere in here. It survives printing and colour
+ * blindness, and more importantly it keeps the signal colour free for the one
+ * thing the signal colour means on this site, which is a loss or a caveat.
+ * Syntax is never a loss. */
+
+/* THE ONE EMPHASIS THAT MATTERS. `module`, `import`, `using`, `pub`, `trait`,
+ * `impl`, `forall`, `derive`, `type` and `abstract` are the entire delta
+ * between iyi and Crystal, and they are what a reader is here to see. The
+ * lexer cannot make that distinction, because to a lexer they are all just
+ * keywords, so `site/scripts/record-highlight.mjs` adds this class to those
+ * spans AFTER the lexer has decided where the tokens are. The split touches a
+ * class attribute and never a token boundary, so the emphasis cannot invent a
+ * token the compiler did not see.
+ *
+ * Eight of the ten carry it. `forall` and `derive` are contextual keywords in
+ * iyi's parser, matched on an identifier's value rather than lexed as
+ * keywords, so the lexer emits them as bare text with no span at all and there
+ * is nothing to add a class to. Deciding from the outside whether a bare
+ * `forall` is the keyword or somebody's variable is exactly the second grammar
+ * this file exists to refuse, so they are left alone. Emphasising them is a
+ * change to the compiler's highlighter, not to this site. */
+.tok-rule,
+.k.tok-rule {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+/* An ordinary Crystal keyword. Present, and quieter than the ten above. */
+.k {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+/* A constant or a type name. Ink, unweighted: a type is structure, and in iyi
+ * an exported signature is required to carry its types, so these are dense on
+ * the page and would fight the rules for attention if they were heavier. */
+.t {
+  color: var(--ink);
+}
+
+/* An identifier: a method at its definition or at its call. Ink, so a name the
+ * reader is following does not recede. */
+.m {
+  color: var(--ink);
+}
+
+/* Literals recede. A string, a character, a number, a symbol, `nil`, `true`
+ * and `false` are the least interesting thing in a listing about a type
+ * system, and graphite puts them behind the structure without hiding them. */
+.s,
+.n {
+  color: var(--graphite);
+}
+
+/* Operators and delimiters, quieter still. In iyi the punctuation carrying the
+ * argument is `:` in a signature, and it reads better as texture than as
+ * emphasis. */
+.o {
+  color: var(--mute);
+}
+
+/* The `#{` and `}` of an interpolation. Marked at all, because they are the
+ * boundary between a literal and code, and mute because the code inside them
+ * is already classed on its own. */
+.i {
+  color: var(--mute);
+}
+
+/* A comment. Mute italic, and the mono's true italic is the reason IBM Plex
+ * Mono was chosen over the ligature monos: prose inside code should read as
+ * prose. Comments in samples/iyi/ carry the rule citations, so they are
+ * quiet but never illegible. */
+.c {
+  color: var(--mute);
+  font-style: italic;
+}
+
+/* Declaration face ------------------------------------------------------- */
+
+/* R-1 says a consumer compiles against declarations and never bodies. The site
+ * reads code the way the compiler does: a module's block shows its
+ * declarations, and the bodies are elided behind a control. This is not
+ * progressive disclosure for tidiness, it is the governing rule of the
+ * language applied to the interface. */
+.decl-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--graphite);
+  background: none;
+  border: var(--hair) solid var(--hairline);
+  border-radius: 2px;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+
+/* An author `display` beats the user agent's `[hidden] { display: none }`, so
+ * without this a control marked hidden stays on the page and stays clickable.
+ * Found by reading the accessibility tree of the rendered playground, where a
+ * reset control that should not have existed yet was sitting in it. */
+.decl-toggle[hidden] {
+  display: none;
+}
+
+.decl-toggle:hover {
+  color: var(--ink);
+  border-color: var(--graphite);
+}
+
+.elision {
+  color: var(--mute);
+  user-select: none;
+}
+
+/* The elided body is marked, not hidden: a reader can see that something was
+ * removed and how much. */
+.elision::before {
+  content: "…";
+  padding-inline-end: 0.5ch;
+}
+
+/* Console ---------------------------------------------------------------- */
+
+/* A console block is a recording of a real run, so it gets the terminal frame
+ * the README's own chart uses, and nothing else on the site does. Output is
+ * never syntax highlighted, because nothing highlighted it in the terminal. */
+.console {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  line-height: 1.6;
+  background: var(--raise);
+  border: var(--hair) solid var(--hairline);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.console-chrome {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  padding: 0.55rem 0.8rem;
+  border-bottom: var(--hair) solid var(--hairline);
+}
+
+.console-chrome i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--hairline);
+}
+
+.console-chrome .caption {
+  margin-inline-start: 0.5rem;
+  font-size: var(--step--2);
+  color: var(--mute);
+}
+
+.console pre {
+  margin: 0;
+  padding: 0.9rem 1.1rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.console .prompt {
+  color: var(--mute);
+  user-select: none;
+}
+
+.console .cmd {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.console .out {
+  color: var(--graphite);
+}
+
+/* Diagnostics ------------------------------------------------------------ */
+
+/* iyi's errors name the rule they enforce, which is a feature, so a diagnostic
+ * is a designed component and not a red box. The caret line is preserved
+ * exactly as the compiler prints it. */
+.diagnostic {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  line-height: 1.55;
+  background: var(--raise);
+  border: var(--hair) solid var(--hairline);
+  border-left: 2px solid var(--signal);
+  border-radius: 0 2px 2px 0;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+}
+
+.diagnostic pre {
+  margin: 0;
+  white-space: pre;
+}
+
+.diagnostic .where {
+  color: var(--mute);
+}
+
+.diagnostic .caret {
+  color: var(--signal);
+}
+
+.diagnostic .verdict {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* The rule citation the compiler prints, pulled out as a link to the spec. */
+.diagnostic .cites {
+  display: block;
+  margin-block-start: 0.6rem;
+  padding-block-start: 0.55rem;
+  border-top: var(--hair) solid var(--hairline);
+  font-size: var(--step--2);
+  color: var(--graphite);
+}

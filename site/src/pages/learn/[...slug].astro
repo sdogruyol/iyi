@@ -1,0 +1,487 @@
+---
+/**
+ * One step of the path.
+ *
+ * Every step is set to the same shape, and the shape is rendered here rather
+ * than left to each lesson's prose, so a reader who has read one knows where to
+ * look in the next:
+ *
+ *   1. what the rule says, in the specification's own words, read out of
+ *      SPEC.md at build time and carrying the line it is stated on;
+ *   2. the program the step is grounded in, transcluded from samples/iyi, with
+ *      a link into the playground where the wasm record says it runs;
+ *   3. the lesson itself;
+ *   4. break the rule: a program in the tree written to be rejected, and the
+ *      verdict a real compiler gave it, recorded byte for byte;
+ *   5. what the rule bought.
+ *
+ * Previous and next come from `order`, so the sequence on the page is the
+ * sequence in the files rather than a hand maintained pair of links, and the
+ * forward link carries the next step's own summary because a path should tell
+ * you where it goes.
+ *
+ * Markdown element styles come from the global `.prose` class in styles. This
+ * page styles its own chrome and the spacing around the site's code components,
+ * and nothing else.
+ */
+import { render } from "astro:content";
+import Page from "../../layouts/Page.astro";
+import BreakRule from "../../components/BreakRule.astro";
+import {
+  sequence,
+  rulesOf,
+  runOf,
+  inlineMarkdown,
+  lessonHref,
+  SPELLED,
+  type Lesson,
+} from "../../lib/lessons";
+
+export async function getStaticPaths() {
+  const lessons = await sequence();
+
+  return lessons.map((lesson, i) => ({
+    params: { slug: lesson.id },
+    props: {
+      lesson,
+      previous: i > 0 ? lessons[i - 1] : undefined,
+      next: i + 1 < lessons.length ? lessons[i + 1] : undefined,
+      total: lessons.length,
+    },
+  }));
+}
+
+interface Props {
+  lesson: Lesson;
+  previous?: Lesson;
+  next?: Lesson;
+  total: number;
+}
+
+const { lesson, previous, next, total } = Astro.props;
+const { Content } = await render(lesson);
+
+const base = import.meta.env.BASE_URL;
+const rules = rulesOf(lesson);
+const run = runOf(lesson);
+const sources = lesson.data.sources ?? [];
+const indexHref = `${base.replace(/\/$/, "")}/learn/`;
+const spelled = SPELLED[total] ?? String(total);
+
+// The step's position in the path, drawn as ticks rather than written twice.
+// Structural: it is the `order` in the file, so it is the same on every
+// machine, and it is not a claim about what the reader has read.
+const ticks = Array.from({ length: total }, (_, i) => i + 1);
+---
+
+<Page
+  title={`${lesson.data.title}, learn iyi`}
+  summary={lesson.data.summary.replace(/`/g, "")}
+>
+  <article class="spread lesson">
+    <div class="head">
+      <p class="label">
+        <a href={indexHref}>Learn</a>, step {lesson.data.order} of {total}
+      </p>
+      <ol class="ticks" aria-hidden="true">
+        {
+          ticks.map((n) => (
+            <li class:list={["tick", { done: n < lesson.data.order, here: n === lesson.data.order }]} />
+          ))
+        }
+      </ol>
+      <h1>{lesson.data.title}</h1>
+      <p class="lede" set:html={inlineMarkdown(lesson.data.summary)} />
+    </div>
+
+    <section class="says to-wide">
+      <p class="label">What the rule says</p>
+      {
+        rules.map((rule) => (
+          <blockquote class="premise">
+            <p set:html={inlineMarkdown(rule.premise)} />
+            <cite>
+              <span class="premise-id">{rule.id}</span> {rule.cite}
+            </cite>
+          </blockquote>
+        ))
+      }
+    </section>
+
+    <section class="runs to-wide">
+      <p class="label">Run it</p>
+      <p class="runs-line">
+        This step is grounded in <span class="runs-path">{run.path}</span>,{" "}
+        {run.lines} lines in this repository. Every listing on this page, that
+        program and the modules it leans on, is read out of the tree when the
+        page is built.
+      </p>
+      <p class="runs-line">
+        {
+          run.href ? (
+            <Fragment>
+              <a class="runs-link" href={run.href}>Run it in the page</a>
+              <span class="runs-none">
+                {" "}where the module the compiler built from it executes in
+                your own tab, and{" "}
+                <a href={`${base.replace(/\/*$/, "/")}playground/evidence/`}>
+                  the recording behind it
+                </a>{" "}
+                says which bytes ran and what checked them.
+              </span>
+            </Fragment>
+          ) : (
+            <span class="runs-none">
+              The wasm record does not carry this program, so the playground
+              cannot offer to run it. Locally it is{" "}
+              <code>iyi run {run.path}</code>.
+            </span>
+          )
+        }
+      </p>
+      {run.note && <p class="runs-note">{run.note}</p>}
+    </section>
+
+    <hr class="rule to-wide" />
+
+    <div class="prose">
+      <Content />
+    </div>
+
+    <BreakRule id={lesson.data.breaks} also={lesson.data.breaksAlso} />
+
+    <section class="bought to-wide">
+      <hr class="rule" />
+      <p class="label">What the rule bought</p>
+      <p class="bought-body" set:html={inlineMarkdown(lesson.data.bought)} />
+    </section>
+
+    {
+      /* Provenance at the foot rather than in the rail beside the opening. The
+       * listings and the quoted recordings already print their own file and
+       * lines where they sit, so this is the shorter list of what the prose
+       * leans on without showing, and a lesson's opening is not improved by a
+       * column of citations running past it. */
+      sources.length > 0 && (
+        <footer class="standing to-wide">
+          <hr class="rule" />
+          <p class="label">Standing on</p>
+          <dl class="sources">
+            {sources.map((source) => (
+              <div class="source-entry">
+                <dt>{source.file}</dt>
+                <dd set:html={inlineMarkdown(source.note)} />
+              </div>
+            ))}
+          </dl>
+        </footer>
+      )
+    }
+
+    <nav class="onward to-wide" aria-label="Sequence">
+      <hr class="rule" />
+      <div class="onward-grid">
+        <div class="back">
+          {
+            previous ? (
+              <a href={lessonHref(base, previous)}>
+                <span class="label">Back to step {previous.data.order}</span>
+                <span class="onward-title">{previous.data.title}</span>
+              </a>
+            ) : (
+              <a href={indexHref}>
+                <span class="label">The sequence</span>
+                <span class="onward-title">All {spelled} steps</span>
+              </a>
+            )
+          }
+        </div>
+        <div class="forward">
+          {
+            next ? (
+              <a href={lessonHref(base, next)}>
+                <span class="label">Next, step {next.data.order} of {total}</span>
+                <span class="onward-title">{next.data.title}</span>
+                <span
+                  class="onward-summary"
+                  set:html={inlineMarkdown(next.data.summary)}
+                />
+              </a>
+            ) : (
+              <a href={indexHref}>
+                <span class="label">That was the last step</span>
+                <span class="onward-title">Back to the sequence</span>
+              </a>
+            )
+          }
+        </div>
+      </div>
+    </nav>
+  </article>
+</Page>
+
+<style>
+  .head {
+    padding-block: 3.2rem 0.4rem;
+  }
+
+  .head h1 {
+    margin-block: 0.5rem 1rem;
+  }
+
+  .head .label a {
+    color: inherit;
+  }
+
+  .lede {
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+    color: var(--graphite);
+    max-width: 58ch;
+    margin-block-end: 0;
+  }
+
+  /* Where this step sits in the path, drawn as instrument ticks. The filled
+   * ticks are the steps before this one, which is the `order` in the file and
+   * not a guess about what the reader has read. */
+  .ticks {
+    display: flex;
+    gap: 0.32rem;
+    list-style: none;
+    margin: 0.7rem 0 0;
+    padding: 0;
+  }
+
+  .tick {
+    width: 1.6rem;
+    height: var(--hair);
+    background: var(--track);
+  }
+
+  .tick.done {
+    background: var(--hairline);
+  }
+
+  .tick.here {
+    height: 3px;
+    background: var(--ink);
+  }
+
+  /* What the rule says. The specification's own sentence, so it is set as a
+   * quotation with its line cited, and it is the first thing under the lede
+   * because a step that cannot state its rule is not teaching one. */
+  .says {
+    margin-block-start: 3.2rem;
+  }
+
+  .says .label {
+    margin-block-end: 0.9rem;
+  }
+
+  .premise {
+    margin: 0;
+    padding-inline-start: 1.1rem;
+    border-inline-start: 2px solid var(--hairline);
+    max-width: var(--measure);
+  }
+
+  .premise + .premise {
+    margin-block-start: 1.2rem;
+  }
+
+  .premise p {
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+    margin: 0;
+  }
+
+  .premise cite {
+    display: block;
+    margin-block-start: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    font-style: normal;
+    color: var(--mute);
+  }
+
+  .premise-id {
+    color: var(--ink);
+    font-weight: 600;
+    margin-inline-end: 0.55rem;
+  }
+
+  /* The program the step is grounded in, and where it can be run. */
+  .runs {
+    margin-block-start: 3rem;
+  }
+
+  .runs .label {
+    margin-block-end: 0.9rem;
+  }
+
+  .runs-line {
+    margin: 0;
+    max-width: var(--measure);
+  }
+
+  .runs-line + .runs-line {
+    margin-block-start: 0.8rem;
+  }
+
+  .runs-path {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+  }
+
+  .runs-link {
+    text-decoration: none;
+    border-bottom: 2px solid var(--signal);
+    padding-block-end: 2px;
+  }
+
+  .runs-none {
+    color: var(--graphite);
+  }
+
+  .runs-note {
+    margin-block: 0.7rem 0;
+    max-width: var(--measure);
+    color: var(--graphite);
+    font-size: var(--step--1);
+  }
+
+  /* What the rule bought. The step's closing claim, set in the measure rather
+   * than in a frame: it is an argument, not a measurement. */
+  .bought .label {
+    margin-block: 1.3rem 0.8rem;
+  }
+
+  .bought-body {
+    margin: 0;
+    max-width: var(--measure);
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+  }
+
+  .lesson > .rule {
+    margin-block: 2.4rem 2.4rem;
+  }
+
+  /* The sources note. Mono, because it names files, and laid out across the
+   * measure so a lesson's opening is not shadowed by a column of citations. */
+  .standing {
+    margin-block-start: 3.2rem;
+  }
+
+  .standing .label {
+    margin-block: 1.2rem 0.9rem;
+  }
+
+  .sources {
+    display: grid;
+    /* The floor is the longest path a lesson cites plus room to breathe.
+     * `samples/iyi/app/greeter.iyi` is 27 characters, and a column narrower
+     * than that breaks a file path mid-token, which makes it unreadable as a
+     * path. Measured against the rendered text rather than guessed. */
+    grid-template-columns: repeat(auto-fit, minmax(min(32ch, 100%), 1fr));
+    gap: 1.1rem var(--gutter);
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    line-height: 1.5;
+  }
+
+  .source-entry {
+    border-left: var(--hair) solid var(--hairline);
+    padding-inline-start: 0.7rem;
+  }
+
+  .sources dt {
+    color: var(--ink);
+    font-weight: 600;
+    /* A safety valve only. The column floor above is set so this never fires
+     * for any path in the tree. */
+    overflow-wrap: anywhere;
+  }
+
+  .sources dd {
+    margin: 0.2rem 0 0;
+    color: var(--graphite);
+  }
+
+  /* Spacing for the site's own code components where they sit in a lesson's
+   * flow. Markdown elements are the global `.prose` class's business, not this
+   * page's, so nothing below touches one. */
+  .prose :global(.source),
+  .prose :global(.console),
+  .prose :global(.diagnostic) {
+    margin-block: 1.5rem;
+  }
+
+  .onward {
+    margin-block-start: 3.4rem;
+  }
+
+  .onward-grid {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+    gap: var(--gutter);
+    align-items: start;
+    padding-block-start: 1.3rem;
+  }
+
+  .onward a {
+    text-decoration: none;
+    display: block;
+  }
+
+  .onward .label {
+    display: block;
+    margin-block-end: 0.2rem;
+  }
+
+  .onward-title {
+    display: block;
+    font-size: var(--step-1);
+    line-height: var(--lead-snug);
+  }
+
+  .onward a:hover .onward-title {
+    text-decoration: underline;
+    text-decoration-color: var(--signal);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 0.18em;
+  }
+
+  .onward-summary {
+    display: block;
+    margin-block-start: 0.4rem;
+    color: var(--graphite);
+    font-size: var(--step--1);
+    max-width: 46ch;
+  }
+
+  .forward {
+    text-align: right;
+    justify-self: end;
+  }
+
+  .forward .onward-summary {
+    margin-inline-start: auto;
+  }
+
+  @media (max-width: 42rem) {
+    .onward-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .forward {
+      text-align: left;
+      justify-self: start;
+    }
+
+    .forward .onward-summary {
+      margin-inline-start: 0;
+    }
+  }
+</style>

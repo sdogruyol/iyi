@@ -1,0 +1,198 @@
+---
+/**
+ * A RECORDED measurement: seconds, bytes, milliseconds.
+ *
+ * These are a machine, not a language. README.md says exactly that, names the
+ * box, and publishes a tired session reading 0.22 / 1.81 / 0.27 where a good
+ * one read 0.13 / 1.17 / 0.16. A site that printed a bare figure with a
+ * seconds unit as a hero would be doing the one thing this project refuses.
+ *
+ * So this component makes the machine structural. The number cannot be
+ * rendered without it: they are one box, fed from one record, and the build
+ * fails if the record has no machine. The frame is a calibration card, and its
+ * left edge carries instrument ticks, which is the visual signature that
+ * separates a recorded number from a structural one at a glance.
+ *
+ * The headline is the RATIO, because a ratio survives the machine. The
+ * absolute is demoted to the body, where it sits next to its spread.
+ */
+interface Props {
+  /** The claim, machine-independent, stated large. */
+  claim: string;
+  /** What the claim is a claim about. */
+  subject: string;
+  /** The box. Null only for a measurement that genuinely has no machine. */
+  machine: string | null;
+  /** The command that prints it. Required: provenance is not optional. */
+  command: string;
+  /** Optional band, where a claim held across several readings. */
+  band?: string;
+  /** Marks a measurement iyi loses. Drives the signal colour. */
+  outcome?: "win" | "loss" | "flat";
+}
+
+const { claim, subject, machine, command, band, outcome = "flat" } =
+  Astro.props;
+
+if (!command) {
+  throw new Error(
+    `Stamped: "${claim}" has no command that prints it. A recorded number ` +
+      `without its provenance is not a number.`,
+  );
+}
+if (machine === undefined) {
+  throw new Error(
+    `Stamped: "${claim}" does not say what machine produced it. These seconds ` +
+      `are a machine, not a language.`,
+  );
+}
+---
+
+<figure class="stamped" data-outcome={outcome}>
+  <div class="ticks" aria-hidden="true"></div>
+
+  <div class="card">
+    <figcaption class="head">
+      <span class="label">measured</span>
+      <span class="subject">{subject}</span>
+    </figcaption>
+
+    <p class="claim">{claim}</p>
+    {band && <p class="band">{band}</p>}
+
+    <div class="body"><slot /></div>
+
+    <dl class="stamp">
+      <div>
+        <dt>machine</dt>
+        <dd>{machine ?? "none, this is counted not timed"}</dd>
+      </div>
+      <div>
+        <dt>prints it</dt>
+        <dd><code>{command}</code></dd>
+      </div>
+    </dl>
+  </div>
+</figure>
+
+<style>
+  .stamped {
+    margin: 1.8rem 0;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  /* Instrument ticks. A recorded number came off a machine, and this is the
+   * mark that says so. A structural number has no ticks, which is how the two
+   * classes stay visually distinct without a colour or a badge. */
+  .ticks {
+    width: 13px;
+    border-block: var(--hair) solid var(--hairline);
+    border-inline-start: var(--hair) solid var(--hairline);
+    /* A ruler edge. Every sixth pixel carries a tick, and every fifth tick is
+     * long, the way a scale is marked, so the eye reads "instrument" before it
+     * reads any text. A structural number has no edge at all, and that absence
+     * is the whole distinction between the two classes. */
+    background-image:
+      repeating-linear-gradient(
+        to bottom,
+        var(--mute) 0 1px,
+        transparent 1px 6px
+      ),
+      repeating-linear-gradient(
+        to bottom,
+        var(--graphite) 0 1px,
+        transparent 1px 30px
+      );
+    background-size:
+      5px 100%,
+      10px 100%;
+    background-position:
+      left top,
+      left top;
+    background-repeat: no-repeat, no-repeat;
+  }
+
+  .card {
+    border: var(--hair) solid var(--hairline);
+    border-inline-start: 0;
+    padding: 0.95rem 1.15rem 0;
+    background: var(--raise);
+  }
+
+  .head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.7rem;
+    flex-wrap: wrap;
+    margin-block-end: 0.55rem;
+  }
+
+  .subject {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--graphite);
+  }
+
+  /* The ratio. Set in the author's voice at display size, because it is the
+   * claim being made, and it does not move when the machine does. */
+  .claim {
+    font-family: var(--font-text);
+    font-variation-settings: "opsz" 48;
+    font-size: var(--step-3);
+    font-weight: 620;
+    line-height: var(--lead-tight);
+    letter-spacing: -0.015em;
+    margin: 0;
+    color: var(--ink);
+  }
+
+  .stamped[data-outcome="loss"] .claim {
+    color: var(--signal);
+  }
+
+  .band {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--graphite);
+    margin: 0.3rem 0 0;
+  }
+
+  .body {
+    margin-block-start: 1rem;
+  }
+
+  /* The stamp. Inside the frame, never a footnote, never a tooltip. */
+  .stamp {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 17ch), 1fr));
+    gap: 0.35rem 1.4rem;
+    margin: 1rem 0 0;
+    padding: 0.6rem 0 0.85rem;
+    border-block-start: var(--hair) solid var(--hairline);
+  }
+
+  .stamp dt {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--mute);
+  }
+
+  .stamp dd {
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+    color: var(--graphite);
+    margin: 0.1rem 0 0;
+    overflow-wrap: anywhere;
+  }
+
+  .stamp code {
+    background: none;
+    border: 0;
+    padding: 0;
+    font-size: inherit;
+    white-space: normal;
+  }
+</style>

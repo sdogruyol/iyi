@@ -1,0 +1,15 @@
+{
+  "words": [
+    "module",
+    "import",
+    "using",
+    "pub",
+    "trait",
+    "impl",
+    "forall",
+    "derive",
+    "type",
+    "abstract"
+  ],
+  "why": "The words that are iyi's and not Crystal's. `module` is in the list because iyi's `module app/greeter` is a compilation-unit header and Crystal's `module Foo` is a namespace, which is the single largest difference between the two languages hiding behind one shared spelling. The emphasis is applied after the lexer, and deliberately: the lexer answers what a token is, and it is right that `pub` and `if` are both keywords, while the art direction answers a different question, which tokens are iyi's own delta from Crystal, since that keyword set is the entire subject a reader came for. So a span the lexer classed `k` whose text is exactly one of these ten words also gets `tok-rule`, and the site sets that at weight 700 against 500 for an ordinary keyword. The split is applied to a class attribute, never to a token boundary, so the emphasis cannot invent a token the compiler did not see, and answering the second question inside a hand-written grammar would have meant answering the first one twice. This file is the owner of the list for the site's own code, both the recorded path and the browser-side ink that paints a live token stream, because a page that emphasised different words depending on where its tokens came from would be making two different arguments at once. It is not yet the only copy: `site/scripts/record-highlight.mjs` still holds its own array of the same ten words in the same order, so the recording is stamped from that copy and this one has to be kept in step with it by hand until the recorder is pointed here."
+}

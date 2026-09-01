@@ -1,0 +1,123 @@
+---
+// CHANGELOG.md, whole. It stays one page because the releases read as a
+// sequence and cutting them apart would impose a structure the file does not
+// have. Written by scripts/reference.mjs; nothing here is transcribed.
+
+import Page from "../layouts/Page.astro";
+import Record from "../components/Record.astro";
+import reference from "../generated/reference/index.json";
+import {
+  Content as Changelog,
+  getHeadings,
+} from "../generated/reference/changelog.md";
+
+const { changelog, commit, generator } = reference;
+
+const base = import.meta.env.BASE_URL;
+const href = (path) =>
+  `${base.replace(/\/$/, "")}/${String(path).replace(/^\//, "")}`;
+
+// The release list is taken from the rendered document rather than rebuilt from
+// the source, so its anchors are the ids that are actually on the page: the
+// same pass wrote both. The generated index is then the check on it, because a
+// nav that quietly lost a release is the failure worth catching.
+const releases = getHeadings().filter((heading) => heading.depth === 2);
+if (releases.length !== changelog.releases.length) {
+  throw new Error(
+    `${changelog.source} has ${changelog.releases.length} releases and the ` +
+      `rendered page offers ${releases.length} anchors for them`,
+  );
+}
+---
+
+<Page
+  title={`${changelog.title} · iyi`}
+  summary={`${changelog.source} at ${commit}, as the repository holds it.`}
+>
+  <article class="spread">
+    <Record
+      eyebrow="release record"
+      titleHtml={changelog.title_html}
+      source={changelog.source}
+      sourceBytes={changelog.bytes}
+      bytes={changelog.body_bytes}
+      commit={commit}
+      generator={generator}
+    >
+      <Fragment slot="mark">
+        <nav class="releases" aria-label="Releases">
+          {
+            releases.map((release) => (
+              <a href={`#${release.slug}`}>{release.text}</a>
+            ))
+          }
+        </nav>
+      </Fragment>
+
+      <Changelog />
+
+      <nav class="onward" slot="after" aria-label="The design record">
+        <hr class="rule" />
+        <p>
+          <span class="label">the design behind these releases</span>
+          <a href={href("spec/")}>{reference.spec.title}</a>
+        </p>
+      </nav>
+    </Record>
+  </article>
+</Page>
+
+<style>
+  .releases {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+    font-family: var(--font-mono);
+    font-size: var(--step--2);
+  }
+
+  .releases a {
+    color: var(--graphite);
+    text-decoration: none;
+    border: var(--hair) solid var(--hairline);
+    border-radius: 2px;
+    padding: 0.1rem 0.45rem;
+  }
+
+  .releases a:hover {
+    color: var(--ink);
+    border-color: var(--signal);
+  }
+
+  .onward {
+    margin-block-start: 2.6rem;
+  }
+
+  .onward p {
+    display: grid;
+    grid-template-columns: 24ch minmax(0, 1fr);
+    gap: 0.9rem;
+    align-items: baseline;
+    margin-block-start: 1rem;
+  }
+
+  .onward .label {
+    color: var(--mute);
+  }
+
+  .onward a {
+    text-decoration: none;
+    border-block-end: var(--hair) solid var(--hairline);
+  }
+
+  .onward a:hover {
+    border-block-end-color: var(--signal);
+  }
+
+  @media (max-width: 40rem) {
+    .onward p {
+      grid-template-columns: 1fr;
+      gap: 0.15rem;
+    }
+  }
+</style>

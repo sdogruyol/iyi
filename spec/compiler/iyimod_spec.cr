@@ -7,11 +7,13 @@ require "./spec_helper"
 # refused. A build cache whose worst case is "read something plausible and
 # carried on" is the failure IV.1 is written to avoid, so the rejections below
 # matter at least as much as the round trip.
+
 private def sample_artifact(imports = [] of String,
                             exports = [] of Iyi::IyiMod::Signature,
                             types = [] of Iyi::IyiMod::TypeDecl,
                             impls = [] of Iyi::IyiMod::ImplRecord,
-                            object_code = [] of Iyi::IyiMod::ObjectUnit)
+                            object_code = [] of Iyi::IyiMod::ObjectUnit,
+                            layouts = [] of {String, Iyi::IyiMod::TypeLayout})
   Iyi::IyiMod::Artifact.new(
     module_name: "app/greeter",
     source_path: "/src/app/greeter.iyi",
@@ -21,6 +23,7 @@ private def sample_artifact(imports = [] of String,
     imports: imports.map { |name| Iyi::IyiMod::ImportEdge.new(name) },
     exports: Iyi::IyiMod::Exports.new(exports, types, impls),
     object_code: object_code,
+    layouts: layouts,
   )
 end
 
@@ -196,6 +199,22 @@ describe Iyi::IyiMod do
       File.write path, bytes
 
       expect_raises(Iyi::IyiMod::Error, /format v99/) do
+        Iyi::IyiMod.read(path)
+      end
+    end
+  end
+  # The one a v42 artifact in a cache actually hits: the `Layouts` section
+  # bumped the format to v43, and the rule above applies to the version this
+  # tree wrote yesterday exactly as to one it never wrote.
+  it "refuses a v42 artifact" do
+    with_temporary_file do |path|
+      Iyi::IyiMod.write sample_artifact, path
+      bytes = File.read(path).to_slice.dup
+      # The version is the u32 right after the 8-byte magic.
+      Iyi::IyiMod::FORMAT.encode(42_u32, bytes[8, 4])
+      File.write path, bytes
+
+      expect_raises(Iyi::IyiMod::Error, /format v42/) do
         Iyi::IyiMod.read(path)
       end
     end
@@ -2196,6 +2215,227 @@ describe Iyi::IyiMod do
       Iyi::IyiMod.write artifact, path
 
       Iyi::IyiMod.read(path).type_ids.should eq ["Array(App::Box::Item)", "Pointer(App::Box::Item)"]
+    end
+  end
+  # GC_DESIGN.md Stage 1: the pointer maps. The container examples check the
+  # encoding and the refusals; the compiling example is the one that proves
+  # the pass, because it asserts the offsets against the layout the compiler
+  # itself computed rather than against numbers typed from memory.
+  describe "layouts" do
+    it "round-trips them" do
+      layouts = [
+        {"App::Shapes::Point", Iyi::IyiMod::TypeLayout.new(41, 8_u32, 8_u32, [] of UInt16, [] of UInt16)},
+        {"App::Shapes::Labelled", Iyi::IyiMod::TypeLayout.new(8, 40_u32, 36_u32, [8_u16, 24_u16], [] of UInt16)},
+      ]
+      with_temporary_file do |path|
+        Iyi::IyiMod.write sample_artifact(layouts: layouts), path
+        Iyi::IyiMod.read(path).layouts.should eq layouts
+      end
+    end
+
+    it "is refused when its bytes changed under it, like every other section" do
+      with_temporary_file do |path|
+        # With no object code after it, the layouts payload is the last bytes
+        # of the file, so the last byte is this section's own.
+        Iyi::IyiMod.write sample_artifact(layouts: [
+          {"App::Shapes::Labelled", Iyi::IyiMod::TypeLayout.new(8, 40_u32, 36_u32, [8_u16, 24_u16], [] of UInt16)},
+        ]), path
+        bytes = File.read(path).to_slice.dup
+        bytes[bytes.size - 1] ^= 0xFF_u8
+        File.write(path, bytes)
+
+        expect_raises(Iyi::IyiMod::Error, /the Layouts section is damaged/) do
+          Iyi::IyiMod.read(path)
+        end
+      end
+    end
+
+    it "shows them in mod dump, in a form to check against the struct as written" do
+      io = IO::Memory.new
+      Iyi::IyiMod.dump sample_artifact(layouts: [
+        {"App::Shapes::Labelled", Iyi::IyiMod::TypeLayout.new(8, 40_u32, 36_u32, [8_u16, 24_u16], [] of UInt16)},
+      ]), io
+      text = io.to_s
+
+      text.should contain "layouts"
+      text.should contain "App::Shapes::Labelled: type id 8, 40 bytes (scan cap 36), scan [8, 24], noscan []"
+    end
+
+    it "computes the offsets from the emitted struct, not from field sizes added up" do
+      with_tempdir("iyimod_layouts") do
+        Dir.mkdir_p "app"
+        File.write "app/shapes.iyi", <<-IYI
+          module app/shapes
+
+          pub struct Point
+            @x : Int32
+            @y : Int32
+
+            def initialize(@x : Int32, @y : Int32)
+            end
+          end
+
+          pub struct Inner
+            @ref : String
+            @n : Int32
+
+            def initialize(@ref : String, @n : Int32)
+            end
+          end
+
+          pub struct Outer
+            @inner : Inner
+            @flag : Bool
+
+            def initialize(@inner : Inner, @flag : Bool)
+            end
+          end
+
+          pub class Labelled
+            @name : String
+            @point : Point
+            @tags : Array(String)
+            @count : Int32
+
+            def initialize(@name : String, @point : Point, @tags : Array(String), @count : Int32)
+            end
+          end
+
+          pub class Base
+            @id : Int64
+            @owner : String
+
+            def initialize(@id : Int64, @owner : String)
+            end
+          end
+
+          pub class Derived < Base
+            @extra : String
+
+            def initialize(id : Int64, owner : String, @extra : String)
+              super(id, owner)
+            end
+          end
+
+          pub struct Box(T)
+            @value : T
+
+            def initialize(@value : T)
+            end
+          end
+
+          pub struct Unused(T)
+            @value : T
+
+            def initialize(@value : T)
+            end
+          end
+
+          pub def make(name : String) : Labelled
+            Box(String).new("packed")
+            Labelled.new(name, Point.new(1, 2), ["t"], 3)
+          end
+          IYI
+        File.write "main.iyi", <<-IYI
+          module main
+
+          import app/shapes
+
+          App::Shapes.make("hi")
+          puts "ok"
+          IYI
+
+        captured = nil
+        compiler = create_spec_compiler
+        compiler.prelude = "iyi/prelude"
+        compiler.emit_iyimod = "mods"
+        source = Iyi::Compiler::Source.new(File.expand_path("main.iyi"), File.read("main.iyi"))
+        compiler.compile_configure_program(source, File.expand_path("from-source")) do |program|
+          captured = program
+        end
+        `./from-source`.chomp.should eq "ok"
+
+        program = captured.not_nil!
+        artifact = Iyi::IyiMod.read(File.join("mods", "app", "shapes.iyimod"))
+        shapes = program.types["App"].types["Shapes"]
+
+        # The layout the compiler computed, asked the way `offsetof` asks it.
+        # An assertion against numbers typed from memory would prove nothing:
+        # the padding in these types is the target's decision.
+        offset_of = ->(type : Iyi::Type, name : String) do
+          index = type.index_of_instance_var(name).not_nil!
+          if type.struct?
+            program.offset_of(type, index)
+          else
+            program.instance_offset_of(type, index)
+          end
+        end
+        layout_of = ->(name : String) do
+          entry = artifact.layouts.find { |(candidate, _)| candidate == name }
+          entry.should_not be_nil
+          entry.not_nil![1]
+        end
+
+        # A type with no pointer fields is present with an empty map, not
+        # absent: absent means "no layout, scan conservatively" to a
+        # collector, and this type has a layout with nothing to scan.
+        point = shapes.types["Point"]
+        point_layout = layout_of.call("App::Shapes::Point")
+        point_layout.scan_offsets.should eq [] of UInt16
+        point_layout.alloc_size.should eq program.instance_size_of(point).to_u32
+
+        inner = shapes.types["Inner"]
+        inner_layout = layout_of.call("App::Shapes::Inner")
+        inner_layout.scan_offsets.should eq [offset_of.call(inner, "@ref").to_u16]
+        inner_layout.alloc_size.should eq program.instance_size_of(inner).to_u32
+        # The scan cap is the end of the last field, before tail padding.
+        expected_cap = offset_of.call(inner, "@n") + program.size_of(program.int32)
+        inner_layout.scan_cap.should eq expected_cap.to_u32
+
+        # A struct field is stored inline, so its pointer words flatten into
+        # the containing map: Outer's is where `@inner` sits plus where
+        # `@ref` sits inside an Inner.
+        outer = shapes.types["Outer"]
+        outer_layout = layout_of.call("App::Shapes::Outer")
+        outer_layout.scan_offsets.should eq [
+          (offset_of.call(outer, "@inner") + offset_of.call(inner, "@ref")).to_u16,
+        ]
+
+        # A class carries its type id word first; `@point` has no inner
+        # pointers and `@count` is a scalar, so neither is here.
+        labelled = shapes.types["Labelled"]
+        labelled_layout = layout_of.call("App::Shapes::Labelled")
+        labelled_layout.scan_offsets.should eq [
+          offset_of.call(labelled, "@name").to_u16,
+          offset_of.call(labelled, "@tags").to_u16,
+        ]
+        labelled_layout.alloc_size.should eq program.instance_size_of(labelled).to_u32
+
+        # An inherited pointer field is in the subclass's own map, at the
+        # offset the subclass's struct gives it.
+        derived = shapes.types["Derived"]
+        derived_layout = layout_of.call("App::Shapes::Derived")
+        derived_layout.scan_offsets.should eq [
+          offset_of.call(derived, "@owner").to_u16,
+          offset_of.call(derived, "@extra").to_u16,
+        ]
+
+        # A generic the module owns contributes each instantiation this build
+        # has, under the instantiation's own name; one it never instantiated
+        # contributes nothing, because R-4's per-GC-shape keying does not
+        # exist yet to give `Unused(T)` a shape of its own.
+        box = shapes.types["Box"].as(Iyi::GenericType).instantiated_types
+          .find { |instance| instance.to_s == "App::Shapes::Box(String)" }.not_nil!
+        box_layout = layout_of.call("App::Shapes::Box(String)")
+        box_layout.scan_offsets.should eq [offset_of.call(box, "@value").to_u16]
+        artifact.layouts.find { |(name, _)| name.includes?("Unused") }.should be_nil
+
+        # Empty everywhere, on purpose: what noscan means is Stage 6's to say.
+        artifact.layouts.each do |(_, layout)|
+          layout.noscan_offsets.should be_empty
+          layout.type_id.should be > 0
+        end
+      end
     end
   end
 

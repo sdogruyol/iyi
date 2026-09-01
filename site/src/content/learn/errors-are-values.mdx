@@ -1,0 +1,107 @@
+---
+title: Errors you cannot ignore
+order: 5
+summary: A function that can fail returns a union. `!` propagates an error member and narrows the rest, an exhaustive case is already total, and adding an error to a signature stops every caller compiling.
+rule: III.1
+sample: samples/iyi/errors.iyi
+breaks: errors-non-exhaustive
+bought: >-
+  Nothing was built for this. Exhaustiveness was already in the language and
+  unions already carried a type id, so adding an error member to an exported
+  signature turns every incomplete `case` on it into a compile error, and an
+  error a caller has not handled cannot reach production quietly.
+sources:
+  - file: samples/iyi/errors.iyi
+    note: the two producers, the propagating call, the exhaustive case, and what `.or` and `.or_panic` are
+  - file: SPEC.md
+    note: III.1, the section this step teaches, and III.1.2 for what `!` expands to
+---
+
+import Sample from "../../components/Sample.astro";
+
+Count what iyi adds for error handling: no `Result` wrapper, no exception
+hierarchy, no new type machinery. A union already exists and already carries a
+type id. An error member is a member whose type implements `Error`, and that is
+the entire mechanism.
+
+So a function that can fail says so in its return type, and it looks like any
+other function.
+
+<Sample path="samples/iyi/errors.iyi" region="def read" />
+
+<Sample path="samples/iyi/errors.iyi" region="def to_number" />
+
+`read` answers with a `String` or an `IOError`. `to_number` answers with an
+`Int32` or a `ParseError`. Both are ordinary unions and you could have written
+them in Crystal.
+
+`Error` itself is not declared in this module. It belongs to the compiler, so
+that `!` can ask whether a member implements it without whatever happens to be in
+your scope deciding the answer.
+
+## Propagating with one character
+
+<Sample path="samples/iyi/errors.iyi" region="def load" />
+
+`!` does two things and neither is magic. On a non-error member the expression
+evaluates to that value, narrowed, so `to_number` receives a `String` and not the
+union. On an error member it returns from `load` right there.
+
+Which is why `load` has to admit both errors in its own return type. Nothing
+special enforces that. It is the ordinary return type check, applied to the
+return the operator wrote for you.
+
+Now look at what that signature is. `load` is `pub`, so step two's rule makes it
+carry full parameter and return types, and those types are what land in the
+artifact your consumers compile against. Its error members are part of its
+published surface, not an implementation detail. Adding one is a change to the
+contract, and the next section is what that change does to everybody who calls
+it.
+
+## Handling, with nothing new to learn
+
+<Sample
+  path="samples/iyi/errors.iyi"
+  from='["config", "missing", "bad"].each'
+  block
+  must="in ParseError"
+/>
+
+`it` is the value being matched, narrowed per branch. The first branch sees an
+`Int32`, the other two see one error type each, which is how `.message` resolves
+without anything having to ask what the union is holding. It is an assignment the
+compiler writes into each branch rather than new machinery, so `it` outlives the
+`case` the way any variable assigned inside an `if` does, and a nested `case`
+shadows it.
+
+Here is the payoff, and it was free. An exhaustive `case` already checked totality
+before any of this existed. So the moment you add an error member to `load`, every
+incomplete `case` on it stops compiling.
+
+## When a case is too much
+
+Sometimes you want the value or a default. `.or` takes the default, `.or_panic`
+takes the value or dies.
+
+Neither can be an ordinary method, and the reason is worth understanding. A real
+method call on `Int32 | IOError` would demand that method from both members, and
+a method every error type has to supply is exactly what this design avoids. So
+the compiler knows these two by name, which is also why `or` and `or_panic` are
+not names an iyi program can use for anything else.
+
+`.or` is an `is_a?(::Error)` test and nothing more, so its result type falls out
+instead of being computed: the default's type unioned with the non-error members.
+`.or_panic` yields the non-error members alone, because what it calls never
+returns.
+
+## What this does not do yet
+
+Panics. They are meant to be catchable only at task boundaries, and what a task
+boundary is has not been specified. Until it is, `.or_panic` raises a Crystal
+exception, and `defer` runs on that unwind either way.
+
+## Leave a branch out
+
+That claim about totality is the strongest argument for the whole approach, so it
+should be the last thing you see fail. A `case` over a union with an error member,
+and no branch for the error:

@@ -1,0 +1,29 @@
+# Breaks R-3 from the calling side: a type's method set is closed, so a bound
+# on a type parameter is a question with a definite answer at the call. `Int32`
+# has no `impl Greet` and cannot acquire one later, so the call is refused as a
+# missing trait rather than as a failed overload match.
+module diagnostics/r3_unmet_trait_bound
+
+pub trait Greet
+  abstract def greet : String
+end
+
+pub struct User
+  getter name : String
+
+  def initialize(@name : String)
+  end
+end
+
+impl Greet for User
+  def greet : String
+    "Hello, #{name}."
+  end
+end
+
+pub def announce(item : T) : String forall T : Greet
+  "-> #{item.greet}"
+end
+
+puts announce(User.new("iyi"))
+puts announce(42)

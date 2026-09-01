@@ -1,0 +1,75 @@
+/* iyi design tokens.
+ *
+ * Rationale lives in doc/website/ART-DIRECTION.md. Two rules govern everything
+ * here and are worth repeating where they are enforced:
+ *
+ *   1. The signal colour marks where iyi LOSES, never where it wins. A win is
+ *      set in plain ink. The eye is pulled to the caveat, which is what this
+ *      project's README does in prose.
+ *   2. There is no sans-serif. Two voices: the serif is the author, the mono is
+ *      the machine. Anything a command printed is set in mono.
+ */
+
+:root {
+  /* Paper is a green-grey rag, not white. White is a screen default and reads
+   * as an absence of a decision. This is drawing paper. */
+  --paper: #f2f3f0;
+  --raise: #fbfbf9;
+  --ink: #171a17;
+  --graphite: #5c6159;
+  --mute: #787d74;
+  --hairline: #c9ccc4;
+  --track: #e2e4dd;
+
+  /* Turkey red. The pigment is madder root, traded through Anatolia, and its
+   * historical selling point was that it was colourfast: it held under test.
+   * `iyi` is Turkish. A colour named for the place the word comes from, whose
+   * virtue is surviving measurement, is the correct accent for this project. */
+  --signal: #a8232b;
+  --signal-deep: #8e1c24;
+
+  /* Contrast against --paper, computed not guessed:
+   * ink 15.76:1, graphite 5.70:1, mute 3.78:1, signal 6.41:1, deep 8.05:1. */
+
+  --font-text: "Newsreader Variable", "Newsreader", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Fluid editorial scale, ratio 1.25 with a deliberate break at the hero. */
+  --step--2: 0.79rem;
+  --step--1: 0.875rem;
+  --step-0: 1.0625rem;
+  --step-1: clamp(1.2rem, 1.1rem + 0.4vw, 1.33rem);
+  --step-2: clamp(1.45rem, 1.28rem + 0.7vw, 1.66rem);
+  --step-3: clamp(1.8rem, 1.5rem + 1.2vw, 2.2rem);
+  --step-4: clamp(2.2rem, 1.6rem + 2.6vw, 3rem);
+  --step-5: clamp(2.7rem, 1.5rem + 5.4vw, 4.4rem);
+
+  /* The measure is 66ch because this site is mostly argument, and the rail is
+   * 21ch because a command and a machine name fit in it. Both are structure. */
+  --measure: 66ch;
+  --rail: 21ch;
+  --gutter: 2.25rem;
+  --edge: 1.5rem;
+
+  --lead-tight: 1.15;
+  --lead-snug: 1.32;
+  --lead-body: 1.62;
+
+  --hair: 1px;
+  --tittle: 3px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #131512;
+    --raise: #1b1e1a;
+    --ink: #e9ebe5;
+    --graphite: #9aa096;
+    --mute: #767c72;
+    --hairline: #2f332c;
+    --track: #262a23;
+    --signal: #e4636a;
+    --signal-deep: #f08a8f;
+    /* ink 15.28:1, graphite 6.86:1, mute 4.28:1, signal 5.50:1. */
+  }
+}

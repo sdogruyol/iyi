@@ -1,5 +1,172 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The collector sweeps, so the memory comes back.** GC_DESIGN.md Stage 6, and
+  with it the collector works end to end behind `-Dgc_iyi`: allocate, mark,
+  sweep, and the chunk is handed out again. One walk over every carved chunk. A
+  white object is unreachable, so its chunk goes back on its class's free list;
+  a black one survives and is repainted white for the next cycle, which is why
+  sweep needs no second pass. Large objects walk their own list, with `next`
+  read before the node is released, because releasing it unmaps the memory the
+  link lives in. A chunk already on a free list is skipped rather than freed
+  twice, since that would hand one chunk to two callers.
+
+  The check that matters cannot be faked by a counter: 300 objects nothing
+  references, collect, 300 more allocations, and **299 of them come back from
+  addresses the sweep reclaimed**. A rooted object keeps all 64 of its bytes
+  through a collection, comes out white, and its chunk is not handed out again
+  across 400 further allocations. Twenty cycles of 200 allocations leave five
+  arenas mapped rather than a growing heap.
+
+  `bench/sweep_exercise.sh` proves both directions, as permanent steps: a sweep
+  that reclaims nothing exits 1 at "nothing was reclaimed, so no address came
+  back", and a sweep that frees regardless of colour exits 1 on the live
+  survivor. A collector's test that cannot see both is not testing a collector.
+
+  Finalizers and weak references are not built, and not for lack of time.
+  Nothing in this language defines a finalizer: there is no `def finalize`
+  anywhere in `src/iyi` or `samples/iyi`, so a finalizer queue would be a
+  mechanism no program could put an entry in, which is the shape III.4.8
+  refused for a concurrency marker. Weak references are registration based and
+  the standard library's `WeakRef` is on the `--crystal` side, so there is no
+  table here to walk and null out. Both wait on the language having the
+  feature. Statistics are the honest subset, counted as the walk goes rather
+  than sampled: chunks swept, chunks kept, bytes freed, collections run.
+
+- **The collector marks, behind `-Dgc_iyi`.** GC_DESIGN.md Stage 5. Roots go
+  gray through Stage 3's walker, a queue in its own mapping drains, each
+  object's payload is scanned to the bound its size header carries, and what is
+  still white when the queue empties is unreachable. The object header is real:
+  with `P` the pointer a program holds, `P-24` is the size that `realloc`'s
+  contract reads, `P-16` the `type_id`, `P-8` the mark word, and `P` the user
+  data. Colour is bits 0 and 1, so a fresh chunk is white without anyone
+  writing anything, and every write preserves the flag and reserved bits the
+  header promises to a forwarding pointer later.
+
+  The layout table is emitted into the binary and the mark loop does not read
+  it, which is deliberate. Nothing writes an object's `type_id` yet: `malloc`
+  is handed a size and cannot know the type, so that store belongs at the
+  allocation site in codegen and is the next step. Reading a table keyed by an
+  id that is always zero would be a lookup no test could reach. So marking is
+  conservative, which is what Boehm does in production and which errs in the
+  safe direction: a false positive retains a dead object, only a false negative
+  frees a live one.
+
+  `bench/mark_exercise.sh` proves it rather than reporting it: 400 live objects
+  all black with garbage beside them, a three-node cycle and a self-loop that
+  terminate, an interior root that marks the object it points into, and a
+  20,000-object chain fully marked, which is the queue growing and the proof
+  the walk is not the call stack. Both failure proofs are permanent steps:
+  removing the black shading exits 1 with an object left gray, and removing the
+  pointer walk exits 1 with the chain's tail left white.
+
+  Three bugs were found by running it. The colour mask, because neither `~` nor
+  `>>` is defined on `UInt64` here and the literal 2^64-4 produced colour 3,
+  which is not a colour. The idempotence check, which was wrong rather than the
+  code: after one pass everything live is black and only white objects are
+  enqueued, so a second pass finding nothing is the invariant working. And the
+  harness itself, which wrote 20,000 entries into an 8,192-slot mapping and
+  crashed; a test that corrupts memory while testing a collector is worse than
+  no test, so its ledger bounds itself and raises.
+
+  Nothing sweeps yet. This stage decides what is garbage and Stage 6 reclaims
+  it, so `-Dgc_boehm` is still the only way to get memory back.
+
+- **A heap that can hand memory back, behind `-Dgc_iyi`.** GC_DESIGN.md Stage 2:
+  size classes to 16 KiB over 16 MiB mmap arenas, per-class free lists, and
+  large objects in a mapping of their own released with `munmap`. Two properties
+  exist because Stage 3 needs them and not because they are tidy: an arbitrary
+  pointer resolves to its arena and size class, answering zero for a pointer
+  that belongs to no arena, and the arena list walks.
+
+  The correctness point is clearing, and it is not in the design. Today
+  `__crystal_malloc64`'s documented "allocate and clear" is free, because
+  `MAP_ANONYMOUS` zero-fills and no byte is ever handed out twice. A free list
+  hands memory back out, so a reused chunk is dirty and has to be cleared, or a
+  program reads memory it was never given. That is the same defect that makes an
+  iyi binary on Windows print `ache\` where `HELLO, IYI!` belongs. The atomic
+  entry point still does not clear, matching `GC_malloc_atomic`.
+
+  `bench/arena_exercise.sh` proves it rather than asserting it: 256 blocks
+  across 8 size classes keep their patterns, 100 chunks freed out of order and
+  reallocated keep every byte, a freed chunk of `0xAA` comes back zeroed, a
+  freed large object's mapping is gone (the read faults), and all 13 samples
+  print identical output under both allocators. The clearing check was proven
+  able to fail: with the clear disabled it exits 1 with `reused chunk dirty at
+  byte 0: got 170`.
+
+  Measured, not hidden: 7 ns per allocation for the bump pointer, 20 ns for the
+  arena, 15 ns per alloc-and-free pair. A size-class allocator costs more than a
+  bump pointer on the fast path, and that is the price of a heap that can hand
+  memory back.
+
+  Opt-in on purpose. The default on every target is unchanged, and switching it
+  is a separate decision backed by measurement rather than something to slip in.
+  Windows and wasm32 keep their allocators: Windows because its binaries already
+  print uninitialized memory and a second suspect would confound that, wasm32
+  because it has no mmap. The prelude's source grows 468 lines and 19 KB for
+  everyone, but the arena is inside a macro branch, so a default build does not
+  compile it and the default binary is the same size.
+
+- **The collector's first stage: pointer maps travel in the artifact.**
+  `.iyimod` carries a `Layouts` section: per type a module
+  owns, its allocation size, its unrounded instance size, and the byte offsets
+  of its pointer fields. The offsets come from the target's own data layout, not
+  from adding field sizes up, because padding is the target's business and a map
+  that misses a field is a collector that frees a live object. A struct of
+  `String`, `String` and `Int32` reads back as 24 bytes, scan cap 20, offsets
+  `[0, 8]`. `iyi mod dump` shows them. A pointer word past offset 65535 is
+  refused by name rather than truncated into a `u16`.
+
+  Alongside it, the object header and its mark word: `type_id` and an atomic
+  `u64` holding colour in bits 0 and 1, flags in 2 to 5, and 58 reserved bits a
+  forwarding pointer could later use. Colour changes are compare-and-swap and
+  report whether they won, so two marking workers cannot both scan one object.
+  Proven with two real threads racing 10,000 rounds: exactly one winner every
+  round. The round count is 10,000 rather than 1,000 because the measured win
+  split at 1,000 was 32/968, one unlucky schedule from a spec that flakes.
+
+  What this is not: no object is allocated with that header, nothing marks and
+  nothing collects. `-Dgc_boehm` is still the only way to get collection, and
+  every other path still allocates and never frees. Stage 1's own tasks 3 and 4,
+  work distribution and write barriers, are design and deferred to Stage 6 by
+  their own text. `noscan_offsets` is empty everywhere on purpose: what "not
+  traced" means is Stage 6's to define, and guessing now risks a later stage
+  reading it as "do not retain" and collecting live buffers. Layouts are per
+  instantiation, not per GC shape, because shape keying is R-4 and unbuilt.
+
+### Fixed
+
+- **`memset` strode eight elements where it meant eight bytes — in every
+  released compiler.** The prelude's own `memset` advanced its
+  `Pointer(UInt64)` by 8 — eight *elements*, 64 bytes — while its counter
+  recorded 8, so every runtime-sized clear wrote one word in eight far past
+  its count and left seven of eight bytes dirty. Invisible until now because
+  the bump allocator's overwrite landed in the untouched zero tail of its own
+  mapping; the arena gate's default arm found it by burning a full region —
+  2,000,000 allocations of 24 bytes segfault on 0.6.0 as released. The win32
+  copy carried the same stride, which is consistent with that target's open
+  diagnosis of binaries printing memory they were never given, and wasm32
+  carried it at width four. All three loops advance one element now; the
+  `-Dgc_iyi` branch's own memset already did.
+
+### Learned
+
+- **A parked fiber's stack is an unscanned root, and the optimiser is part
+  of the collector's contract.** Two findings from rebasing the collector
+  onto 0.6.0's tree. Root discovery was written when this language had no
+  fibers; 0.4.0 gave it a scheduler, so `each_root`'s walk — current stack,
+  spilled registers, globals — now has a named gap: an object reachable only
+  from a parked fiber's stack would be freed live. Latent, because only the
+  single-fiber exercises trigger collection; recorded in GC_DESIGN.md as
+  Stage 3's next task rather than a wait on threads. And the sweep gate's 2
+  MiB root sat in a global written and never read, which the optimised build
+  was within its rights to drop — the exercise now reads the root back after
+  collecting, the check that is also what keeps the store alive.
+
 ## 0.6.0 — 2026-09-01
 
 **A file reaches exactly what it imports, and a mistake dies where it
@@ -782,7 +949,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 4,044 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,292 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2291,7 +2458,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 4,044-line library and nothing else. Every other
+  written against iyi's own 5,292-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
@@ -2483,6 +2650,19 @@ the same flags.
   byte 0, `(?<=(?:a|$))` searched from 0 reports byte 0, the same pattern
   anchored at 0 reports nothing, and the ungrouped `(?<=a|$)` is right, so the
   trigger is the wrapping group rather than the branch lengths.
+
+### Found
+
+- **`UInt32` is barely usable in iyi's own prelude, and its `==` is wrong.**
+  `x = 99_u32; x == 99_u32` answers **false**. There is also no `<`, no `>`, no
+  `to_i64` and no `to_u64` on `UInt32`. Found while checking the collector's
+  header, where the `type_id` is a `u32`: the memory was provably correct, since
+  the containing 64-bit word read back as 99, while a `UInt32` comparison
+  against the literal said otherwise, which sent two checks chasing a defect
+  that was not there. The collector reads that field as part of its 64-bit word
+  and is unaffected, and the exercises now do the same and say why. This
+  predates the collector work and wants a fix of its own rather than a
+  correction buried in a GC stage.
 
 ### Fixed
 

@@ -1,0 +1,10 @@
+# A second module the break programs import, so that a trait and a type can
+# live in two different places and an impl can be written in a third.
+module dep/user
+
+pub struct User
+  getter name : String
+
+  def initialize(@name : String)
+  end
+end

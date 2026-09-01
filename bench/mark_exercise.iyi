@@ -1,0 +1,292 @@
+# Stage 5 marking, exercised rather than asserted. GC_DESIGN.md names the
+# verification: live objects are marked, unreachable objects stay white, and the
+# tri-colour representation supports what Stage 7 will do to it.
+#
+#   ./bin/iyi run -Dgc_iyi bench/mark_exercise.iyi
+#
+# Everything here needs `-Dgc_iyi`, because `IyiMark` only exists behind that
+# flag. Built without it the program says so in one line and exits 0, which is
+# what stops a build that compiled the whole section out from reading as a pass.
+# Every check raises on a wrong answer, and a panic exits non-zero, which is
+# what the driver keys on.
+#
+# The shape of every check here is the same: build a graph whose liveness this
+# program knows for certain, mark, then ask each object its colour. What makes
+# that honest is where the bookkeeping lives. A list of "objects I expect to be
+# dead" cannot itself be a heap object, because the class variable naming it is
+# a global, a global is a root range, and every object it named would be live.
+# So the ledgers are their own mappings, exactly as `bench/root_exercise.iyi`
+# does it and for the same reason.
+#
+# Not under `samples/`: the sample count is a gated number, and samples are
+# explanations rather than torture tests.
+
+{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+  def count(value : UInt64) : String
+    value.to_i64.to_s
+  end
+
+  def hex(value : UInt64) : String
+    value.to_i64.to_s(16)
+  end
+
+  # A ledger of addresses in its own mapping. Nothing in here is reachable from
+  # the heap, so recording an object does not keep it alive.
+  class Ledger
+    # Big enough for the deepest chain below, and checked rather than trusted:
+    # recording past the end of the mapping is a write into whatever follows it,
+    # which is how this file crashed the first time it ran the 20,000 case. A
+    # harness that corrupts memory while testing a collector is worse than no
+    # harness, so an overflow raises here.
+    LIMIT = 32768_u64
+
+    @@live : UInt64 = 0_u64
+    @@live_count : UInt64 = 0_u64
+    @@dead : UInt64 = 0_u64
+    @@dead_count : UInt64 = 0_u64
+
+    def self.live_buffer : UInt64
+      @@live = __iyi_mmap(LIMIT * 8_u64).address if @@live == 0
+      @@live
+    end
+
+    def self.dead_buffer : UInt64
+      @@dead = __iyi_mmap(LIMIT * 8_u64).address if @@dead == 0
+      @@dead
+    end
+
+    def self.expect_live(base : UInt64) : Nil
+      raise "the ledger's live side is full at #{@@live_count.to_i64.to_s}" if @@live_count >= LIMIT
+      Pointer(UInt64).new(live_buffer + @@live_count * 8_u64).value = base
+      @@live_count = @@live_count + 1_u64
+    end
+
+    def self.expect_dead(base : UInt64) : Nil
+      raise "the ledger's dead side is full at #{@@dead_count.to_i64.to_s}" if @@dead_count >= LIMIT
+      Pointer(UInt64).new(dead_buffer + @@dead_count * 8_u64).value = base
+      @@dead_count = @@dead_count + 1_u64
+    end
+
+    def self.forget : Nil
+      @@live_count = 0_u64
+      @@dead_count = 0_u64
+    end
+
+    def self.live_at(index : UInt64) : UInt64
+      Pointer(UInt64).new(live_buffer + index * 8_u64).value
+    end
+
+    def self.dead_at(index : UInt64) : UInt64
+      Pointer(UInt64).new(dead_buffer + index * 8_u64).value
+    end
+
+    def self.live_count : UInt64
+      @@live_count
+    end
+
+    def self.dead_count : UInt64
+      @@dead_count
+    end
+  end
+
+  # The graph's roots. A class variable is a global, so whatever this holds is
+  # rooted, which is exactly what makes the live half of every check live.
+  class Held
+    @@head : UInt64 = 0_u64
+    @@cycle : UInt64 = 0_u64
+
+    def self.head : UInt64
+      @@head
+    end
+
+    def self.head=(value : UInt64) : Nil
+      @@head = value
+    end
+
+    def self.cycle : UInt64
+      @@cycle
+    end
+
+    def self.cycle=(value : UInt64) : Nil
+      @@cycle = value
+    end
+  end
+
+  def fresh(size : UInt64) : UInt64
+    Pointer(UInt8).malloc(size).address
+  end
+
+  def link(parent : UInt64, slot : UInt64, child : UInt64) : Nil
+    Pointer(UInt64).new(parent + slot * 8_u64).value = child
+  end
+
+  def colour_of(base : UInt64) : UInt64
+    IyiMark.colour(base)
+  end
+
+  def require_black(base : UInt64, what : String) : Nil
+    colour = colour_of(base)
+    return if colour == IyiMark::BLACK
+    raise "#{what}: 0x#{hex(base)} should be black and its colour is #{count(colour)}"
+  end
+
+  def require_white(base : UInt64, what : String) : Nil
+    colour = colour_of(base)
+    return if colour == IyiMark::WHITE
+    raise "#{what}: 0x#{hex(base)} should be white and its colour is #{count(colour)}"
+  end
+
+  # A chain of `length` objects, each pointing at the next, rooted by the
+  # global. Every one of them is live and the last one is only reachable by
+  # walking the whole chain, which is what makes this a test of the queue
+  # rather than of the root scan.
+  def build_chain(length : UInt64) : Nil
+    head = fresh(64_u64)
+    Held.head = head
+    Ledger.expect_live(head)
+    node = head
+    built = 1_u64
+    while built < length
+      nxt = fresh(64_u64)
+      link(node, 0_u64, nxt)
+      Ledger.expect_live(nxt)
+      node = nxt
+      built = built + 1_u64
+    end
+  end
+
+  # Objects that look exactly like the chain's and are referenced by nothing.
+  # Written after the chain so they are not left over in a register or a stack
+  # slot that the conservative scan would legitimately find.
+  def build_garbage(number : UInt64) : Nil
+    made = 0_u64
+    while made < number
+      Ledger.expect_dead(fresh(64_u64))
+      made = made + 1_u64
+    end
+  end
+
+  puts "== the exercise, -Dgc_iyi"
+
+  # 1. A chain, and garbage beside it.
+  build_chain(400_u64)
+  build_garbage(200_u64)
+
+  black = IyiMark.mark
+  index = 0_u64
+  while index < Ledger.live_count
+    require_black(Ledger.live_at(index), "chain")
+    index = index + 1_u64
+  end
+  index = 0_u64
+  strays = 0_u64
+  while index < Ledger.dead_count
+    strays = strays + 1_u64 if colour_of(Ledger.dead_at(index)) != IyiMark::WHITE
+    index = index + 1_u64
+  end
+  puts "    chain: #{count(Ledger.live_count)} live objects all black, #{count(black)} marked in total"
+  # A conservative scan is allowed to retain garbage: a stale word anywhere in
+  # the root ranges can alias one of these addresses. What it is never allowed
+  # to do is miss a live object, which the loop above is what checks. So this
+  # reports rather than fails, and says how many.
+  puts "    garbage: #{count(Ledger.dead_count - strays)} of #{count(Ledger.dead_count)} unreferenced objects stayed white, #{count(strays)} retained conservatively"
+
+  # 2. Idempotence. Not "the same count twice": after one pass every live
+  # object is already black, and `shade` only enqueues white objects, so a
+  # second pass correctly finds almost nothing to do. That is the tri-colour
+  # invariant working rather than a miss. What must hold is that nothing live
+  # lost its colour, so that is asserted and the count is reported.
+  again = IyiMark.mark
+  index = 0_u64
+  while index < Ledger.live_count
+    require_black(Ledger.live_at(index), "chain, second pass")
+    index = index + 1_u64
+  end
+  puts "    idempotent: every live object is still black after a second pass, which found #{count(again)} still-white objects"
+
+  # 3. Unmark, and the colours really do go back.
+  IyiMark.unmark
+  require_white(Held.head, "after unmark")
+  puts "    unmark: the chain's head is white again, so a phase can be run twice"
+
+  # 4. A live cycle terminates and is fully marked; an unreachable cycle stays
+  # white. A collector that follows a cycle without checking colour first does
+  # not return, so this check either passes or hangs, and a hang is a failure
+  # the driver's timeout catches.
+  Ledger.forget
+  first = fresh(64_u64)
+  second = fresh(64_u64)
+  third = fresh(64_u64)
+  link(first, 0_u64, second)
+  link(second, 0_u64, third)
+  link(third, 0_u64, first)
+  Held.cycle = first
+  Ledger.expect_live(first)
+  Ledger.expect_live(second)
+  Ledger.expect_live(third)
+
+  loner = fresh(64_u64)
+  link(loner, 0_u64, loner)
+  Ledger.expect_dead(loner)
+
+  orphan_a = fresh(64_u64)
+  orphan_b = fresh(64_u64)
+  link(orphan_a, 0_u64, orphan_b)
+  link(orphan_b, 0_u64, orphan_a)
+  Ledger.expect_dead(orphan_a)
+  Ledger.expect_dead(orphan_b)
+
+  IyiMark.mark
+  require_black(first, "live cycle")
+  require_black(second, "live cycle")
+  require_black(third, "live cycle")
+  puts "    cycles: a three-node cycle reachable from a global is fully black, and the walk terminated"
+  puts "    self-loop and unreachable cycle: #{count(colour_of(loner))}, #{count(colour_of(orphan_a))} and #{count(colour_of(orphan_b))} as colours, 0 meaning white"
+
+  # 5. An interior pointer roots the object it points into. The global holds
+  # the middle of the object rather than its base, which is the case a
+  # conservative collector meets constantly and the one that silently frees
+  # live memory if `base_of` is wrong.
+  IyiMark.unmark
+  Ledger.forget
+  target = fresh(128_u64)
+  Held.cycle = target + 64_u64
+  Ledger.expect_live(target)
+  IyiMark.mark
+  require_black(target, "interior root")
+  puts "    interior root: a global holding byte 64 of a 128-byte object marks the object"
+
+  # 6. Depth. A chain longer than the queue's first mapping proves the queue
+  # grows rather than dropping what it cannot hold, and that the walk is not
+  # the call stack: 20,000 frames of recursion would not survive this.
+  IyiMark.unmark
+  Ledger.forget
+  Held.cycle = 0_u64
+  build_chain(20000_u64)
+  IyiMark.mark
+  index = 0_u64
+  bad = 0_u64
+  bad_at = 0_u64
+  bad_colour = 0_u64
+  found_bad = false
+  while index < Ledger.live_count
+    base = Ledger.live_at(index)
+    if colour_of(base) != IyiMark::BLACK
+      bad = bad + 1_u64
+      if !found_bad
+        found_bad = true
+        bad_at = index
+        bad_colour = colour_of(base)
+      end
+    end
+    index = index + 1_u64
+  end
+  if bad != 0
+    raise "deep chain: #{count(bad)} of #{count(Ledger.live_count)} not black, first at index #{count(bad_at)} with colour #{count(bad_colour)}"
+  end
+  puts "    depth: a #{count(Ledger.live_count)}-object chain is fully marked, so the queue grew and the walk is not the stack"
+
+  puts "    all mark checks passed"
+{% else %}
+  puts "    marking needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here"
+{% end %}

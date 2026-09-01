@@ -1,0 +1,22 @@
+# Proof that freeing a large object releases its mapping — the second half of
+# the large-object check in GC_DESIGN.md's Stage 2 verification, split into
+# its own program because the observation is the process's death.
+#
+#   ./bin/iyi build -Dgc_iyi bench/arena_large_probe.iyi
+#
+# The program allocates over the top size class, frees through
+# `IyiHeap.free`, and then reads the first byte of the mapping. If `munmap`
+# released it, that read faults and the kernel kills the process with
+# SIGSEGV, which `bench/arena_exercise.sh` asserts. If the read prints, the
+# mapping survived and free is broken. Nothing allocates between the free
+# and the read, so nothing can remap the region first and make a released
+# mapping look held. Built only with `-Dgc_iyi`: the default allocator has
+# no free for this to probe.
+
+big = 2097153
+large = Pointer(UInt8).malloc(big.to_u64)
+large[0] = 7_u8
+large[big - 1] = 9_u8
+IyiHeap.free(large.as(Void*))
+byte = large[0]
+puts "iyi: a freed large mapping survived the read (got #{byte.to_i32}); munmap did not release it"

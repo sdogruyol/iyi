@@ -1,0 +1,46 @@
+---
+/**
+ * A STRUCTURAL number: a line count, a target count, a sample count.
+ *
+ * Exact, reproducible on any machine, and already gated in CI by
+ * bench/doc_numbers.py. So it needs no frame, no machine, and no apology. It
+ * is set flat, inline, in the machine's voice, and that visual plainness is
+ * the whole distinction from a recorded number.
+ *
+ * There is no `fallback` prop and there will not be one. A missing key fails
+ * the build, because a page that renders a blank where a number belongs is
+ * worse than a page that does not exist.
+ */
+import facts from "../generated/facts.json";
+
+interface Props {
+  of: keyof typeof facts.structural;
+  unit?: string;
+}
+
+const { of, unit } = Astro.props;
+const value = facts.structural[of];
+
+if (value === undefined || value === null) {
+  throw new Error(
+    `Measure: "${of}" is not a structural fact. bench/doc_numbers.py measures ` +
+      `${Object.keys(facts.structural).join(", ")}. Add it there rather than ` +
+      `typing the number into a page.`,
+  );
+}
+
+const shown = typeof value === "number" ? value.toLocaleString("en-GB") : value;
+---
+
+<span class="structural mono">{shown}{unit ? ` ${unit}` : ""}</span>
+
+<style>
+  /* Flat. No border, no tick edge, no stamp. The absence is the signal: this
+   * number is the same on your machine as on mine. */
+  .structural {
+    font-weight: 600;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+</style>

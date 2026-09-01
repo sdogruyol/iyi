@@ -34,7 +34,7 @@ module Iyi::IyiMod
 
   # Bumped when the layout of any section changes incompatibly. IV.5: a
   # `.iyimod` from another version is rejected and rebuilt, never migrated.
-  FORMAT_VERSION = 42_u32
+  FORMAT_VERSION = 43_u32
 
   FORMAT = IO::ByteFormat::LittleEndian
 
@@ -131,6 +131,21 @@ module Iyi::IyiMod
     # `ldflags`, `framework`, static — is already on the consumer's own copy of
     # the annotation. What was missing is only that somebody used it.
     Libs = 18
+
+    # iyi: the pointer maps of the types this module owns, one `TypeLayout`
+    # per type, keyed in the file by the type's name. Same reason as
+    # `TypeIds` for keying by name rather than by the number: two programs
+    # number their types differently, and the numbering is the consuming
+    # program's (IV.1g). What an entry carries is GC_DESIGN.md Stage 1.
+    #
+    # 64, and deliberately nowhere near the others. This section has moved
+    # twice, 12 to 14 to here, because upstream allocates the next free number
+    # for each new section it ships and this fork was sitting on it both times.
+    # A section number is on-disk format, so losing that race costs a format
+    # bump and a migration for everyone. Sitting at 64 leaves upstream fifty
+    # numbers of room, which is more than the format has spent in its whole
+    # life, so the next merge is about content rather than about arithmetic.
+    Layouts = 64
   end
 
   # A regex literal's constant: the name its object code reads, and what a
@@ -669,6 +684,46 @@ module Iyi::IyiMod
   record ObjectUnit,
     name : String,
     code : Bytes
+  # GC_DESIGN.md Stage 1: the pointer map of one type, so a collector reads
+  # an object's shape out of the artifact instead of discovering it at run
+  # time. Heap-layout precision is the one REQUIREMENT SPEC.md II.5 makes of
+  # the collector design, and this record is where it is kept.
+  #
+  # *type_id* is the design's key, and it carries the producing build's
+  # numbering. The section keys its entries by the type's NAME for the reason
+  # `TypeIds` is names rather than values: the numbering belongs to the
+  # consuming program, so a consumer re-keys by name to its own ids.
+  #
+  # *alloc_size* is what an allocation of the type occupies: the LLVM
+  # struct's size, tail padding included. *scan_cap* is the unrounded
+  # instance size, the end of the last field. It caps the conservative
+  # fallback a collector takes when it finds no layout for an object, so the
+  # fallback word-scans real fields and stops before tail padding.
+  #
+  # *scan_offsets* is every byte offset in the object that holds a pointer
+  # word: reference fields, `Pointer(T)` fields, a proc's context word, and
+  # the pointer words inside inlined struct, tuple and static array fields,
+  # flattened to the object they sit in. A mixed union field contributes the
+  # pointer words of every arm, because which arm is live is runtime
+  # business; over-marking retains, and under-marking loses.
+  #
+  # The offsets describe the object as it is laid out today, type id word
+  # included. When Stage 2 puts the mark word header on live objects the
+  # map shifts with it, and that migration is Stage 2's.
+  #
+  # *noscan_offsets* is empty today, on purpose, and a guess would be worse.
+  # The design's two examples do not classify yet: a weak reference is
+  # registration-based (Boehm's disappearing links), with nothing in the type
+  # system marking the field, and an `Array(Int32)` buffer's pointee holds no
+  # pointers, which a headered collector already gets for free because raw
+  # buffer memory carries no type id to recurse into. What noscan *means* is
+  # Stage 6's to say; until then the empty list says nothing falsely.
+  record TypeLayout,
+    type_id : Int32,
+    alloc_size : UInt32,
+    scan_cap : UInt32,
+    scan_offsets : Array(UInt16),
+    noscan_offsets : Array(UInt16)
 
   # What a `.iyimod` says about the module it was built from.
   #
@@ -820,6 +875,14 @@ module Iyi::IyiMod
     #
     # Settable alongside `object_code`, and for the same reason.
     property constants : Array(String)
+    # The pointer maps of the types this module owns, as `(name, layout)`
+    # pairs sorted by name. See `TypeLayout`.
+    #
+    # Settable alongside `object_code`, and for the same reason: a byte
+    # offset is LLVM's answer about a lowered type, which does not exist
+    # until codegen has run. From a `--no-codegen` build this is empty,
+    # exactly as the object code is absent from one.
+    property layouts : Array({String, TypeLayout})
 
     # What the synthesised regex constants above were made from.
     #
@@ -1036,7 +1099,8 @@ module Iyi::IyiMod
                    @regexes = [] of RegexConst, @class_vars = [] of ClassVarRef,
                    @match_types = [] of String, @symbols = [] of String,
                    @top_level = [] of Signature,
-                   @reopened = [] of TypeDecl, @libs = [] of String)
+                   @reopened = [] of TypeDecl, @libs = [] of String,
+                   @layouts = [] of {String, TypeLayout})
     end
   end
 
@@ -1092,6 +1156,12 @@ module Iyi::IyiMod
 
     unless artifact.constants.empty?
       sections << {Section::Constants, encode_constants(artifact)}
+    end
+    # With the object code rather than with the declarations, for the reason
+    # `TypeIds` sits here: a front-end reader has nothing to number, and so
+    # nothing to lay out.
+    unless artifact.layouts.empty?
+      sections << {Section::Layouts, encode_layouts(artifact)}
     end
 
     # Right behind the names it completes, and read the same way: what a
@@ -1263,6 +1333,7 @@ module Iyi::IyiMod
       mono_bodies = {} of String => String
       macro_bodies = [] of String
       initialiser = ""
+
       type_ids = [] of String
       constants = [] of String
       regexes = [] of RegexConst
@@ -1274,6 +1345,7 @@ module Iyi::IyiMod
       reopened = [] of TypeDecl
       requires = [] of String
       hashes = Hashes.empty
+      layouts = [] of {String, TypeLayout}
 
       table.each do |(kind, length, sum)|
         section = Section.from_value?(kind)
@@ -1308,6 +1380,7 @@ module Iyi::IyiMod
         when Section::Reopened    then reopened = decode_reopened(payload)
         when Section::Requires    then requires = decode_requires(payload)
         when Section::Hashes      then hashes = decode_hashes(payload)
+        when Section::Layouts     then layouts = decode_layouts(payload)
         else
           # Written by a later compiler, or a section this one does not need.
           # Skipping is the point of the table.
@@ -1324,7 +1397,7 @@ module Iyi::IyiMod
         hashes, constants, macro_bodies, requires, header[:crystal_library],
         header[:class_root], header[:filled], header[:module_extends_self],
         regexes, class_vars, match_types, symbols,
-        top_level, reopened, libs)
+        top_level, reopened, libs, layouts)
     end
   rescue ex : Error
     raise ex
@@ -1444,6 +1517,17 @@ module Iyi::IyiMod
       io.puts "constants"
       constants.each { |name| io.puts "  #{name}" }
     end
+    layouts = artifact.layouts
+    if layouts.empty?
+      io.puts "layouts       (none)"
+    else
+      io.puts "layouts"
+      layouts.each do |(name, layout)|
+        io.puts "  #{name}: type id #{layout.type_id}, #{layout.alloc_size} bytes " \
+                "(scan cap #{layout.scan_cap}), scan #{layout.scan_offsets}, " \
+                "noscan #{layout.noscan_offsets}"
+      end
+    end
 
     # With the pattern, because the name is a digest: a reader looking at
     # `$Regex:5f2b…` in the list above has no way to tell which literal it is.
@@ -1506,17 +1590,17 @@ module Iyi::IyiMod
       object_code.each { |unit| io.puts "  #{unit.name} — #{unit.code.size} bytes" }
     end
 
-    # Said out loud on every dump. What is missing is no longer whole
-    # declarations but the parts of them codegen needs, and a reader has no way
-    # to tell a field list that is absent from one that is empty.
+    # Said out loud on every dump, because a reader has no way to tell a field
+    # list that is absent from one that is empty.
     io.puts
     io.puts "note          format v#{FORMAT_VERSION} carries declarations,"
     io.puts "              signatures, field lists in declaration order, the"
     io.puts "              the constants and class variables this module's"
     io.puts "              own code reads, the macros and"
-    io.puts "              bodies a consumer has to compile for itself, and"
-    io.puts "              the object code of this module's own non-generic"
-    io.puts "              types (SPEC.md IV.2)."
+    io.puts "              bodies a consumer has to compile for itself, the"
+    io.puts "              object code of this module's own non-generic"
+    io.puts "              types, and the pointer maps of the types this"
+    io.puts "              module owns (SPEC.md IV.2, GC_DESIGN.md Stage 1)."
   end
 
   # The artifact as the iyi declarations it was built from.
@@ -2466,6 +2550,40 @@ module Iyi::IyiMod
 
   private def self.decode_type_ids(payload : Bytes) : Array(String)
     read_strings(IO::Memory.new(payload))
+  end
+
+  private def self.encode_layouts(artifact : Artifact) : Bytes
+    io = IO::Memory.new
+    layouts = artifact.layouts
+    io.write_bytes layouts.size.to_u32, FORMAT
+    layouts.each do |(name, layout)|
+      write_string io, name
+      io.write_bytes layout.type_id, FORMAT
+      io.write_bytes layout.alloc_size, FORMAT
+      io.write_bytes layout.scan_cap, FORMAT
+      io.write_bytes layout.scan_offsets.size.to_u32, FORMAT
+      layout.scan_offsets.each { |offset| io.write_bytes offset, FORMAT }
+      io.write_bytes layout.noscan_offsets.size.to_u32, FORMAT
+      layout.noscan_offsets.each { |offset| io.write_bytes offset, FORMAT }
+    end
+    io.to_slice
+  end
+
+  private def self.decode_layouts(payload : Bytes) : Array({String, TypeLayout})
+    io = IO::Memory.new(payload)
+    Array({String, TypeLayout}).new(io.read_bytes(UInt32, FORMAT)) do
+      name = read_string(io)
+      type_id = io.read_bytes(Int32, FORMAT)
+      alloc_size = io.read_bytes(UInt32, FORMAT)
+      scan_cap = io.read_bytes(UInt32, FORMAT)
+      scan_offsets = Array(UInt16).new(io.read_bytes(UInt32, FORMAT)) do
+        io.read_bytes(UInt16, FORMAT)
+      end
+      noscan_offsets = Array(UInt16).new(io.read_bytes(UInt32, FORMAT)) do
+        io.read_bytes(UInt16, FORMAT)
+      end
+      {name, TypeLayout.new(type_id, alloc_size, scan_cap, scan_offsets, noscan_offsets)}
+    end
   end
 
   private def self.encode_object_code(artifact : Artifact) : Bytes

@@ -1,0 +1,431 @@
+# Stage 3 root discovery, exercised rather than asserted. GC_DESIGN.md names
+# the verification: "write a test that allocates objects and embeds pointers in
+# global memory, stack, and registers; verify that manual root discovery finds
+# them". This is that program and `bench/root_exercise.sh` drives it.
+#
+#   ./bin/iyi run -Dgc_iyi bench/root_exercise.iyi
+#
+# Everything here needs `-Dgc_iyi`, because `IyiRoots` only exists behind that
+# flag. Built without it the program says so in one line and exits 0, which is
+# what stops a build that compiled the whole section out from reading as a
+# pass. Every check raises on a wrong answer, and a panic exits non-zero, which
+# is what the driver keys on.
+#
+# Not under `samples/`: the sample count is a gated number and samples are
+# explanations, not torture tests.
+
+{% if flag?(:gc_iyi) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+  def hex(value : UInt64) : String
+    value.to_i64.to_s(16)
+  end
+
+  def count(value : UInt64) : String
+    value.to_i64.to_s
+  end
+
+  # Where the discovered roots are recorded, and where the addresses this
+  # program expects to see are recorded. Both are mappings of their own rather
+  # than heap allocations, and that is the whole reason they exist in this
+  # shape. A recorder that was a heap object holding raw pointers would be
+  # reachable from the class variable naming it, which is a global, which is a
+  # root range: every object it recorded would become globally rooted and every
+  # negative check below would stop being negative.
+  class Tally
+    LIMIT = 4096_u64
+
+    @@found : UInt64 = 0_u64
+    @@found_count : UInt64 = 0_u64
+    @@want : UInt64 = 0_u64
+    @@want_count : UInt64 = 0_u64
+
+    def self.found_buffer : UInt64
+      @@found = __iyi_mmap(LIMIT * 8_u64).address if @@found == 0
+      @@found
+    end
+
+    def self.want_buffer : UInt64
+      @@want = __iyi_mmap(LIMIT * 8_u64).address if @@want == 0
+      @@want
+    end
+
+    def self.reset : Nil
+      @@found_count = 0_u64
+    end
+
+    def self.forget_wanted : Nil
+      @@want_count = 0_u64
+    end
+
+    def self.add(base : UInt64) : Nil
+      buffer = found_buffer
+      return if @@found_count >= LIMIT
+      Pointer(UInt64).new(buffer + @@found_count * 8_u64).value = base
+      @@found_count = @@found_count + 1_u64
+    end
+
+    def self.want(base : UInt64) : Nil
+      buffer = want_buffer
+      raise "tally: more wanted roots than the buffer holds" if @@want_count >= LIMIT
+      Pointer(UInt64).new(buffer + @@want_count * 8_u64).value = base
+      @@want_count = @@want_count + 1_u64
+    end
+
+    def self.found?(base : UInt64) : Bool
+      buffer = found_buffer
+      index = 0_u64
+      while index < @@found_count
+        return true if Pointer(UInt64).new(buffer + index * 8_u64).value == base
+        index = index + 1_u64
+      end
+      false
+    end
+
+    # The same question asked without the raw address ever being a value in
+    # the caller's frame. With optimisation on, a raw address the caller still
+    # needs after a scan is a value the compiler keeps live across that scan,
+    # which means a stack slot, which means the scan finds it and a check that
+    # meant to isolate one root has quietly stopped isolating anything.
+    # Unmasking one frame down, after the scan has run, is what avoids that.
+    @[NoInline]
+    def self.found_masked?(hidden : UInt64, mask : UInt64) : Bool
+      found?(hidden ^ mask)
+    end
+
+    def self.wanted(index : UInt64) : UInt64
+      Pointer(UInt64).new(want_buffer + index * 8_u64).value
+    end
+
+    def self.wanted_count : UInt64
+      @@want_count
+    end
+
+    def self.reported : UInt64
+      @@found_count
+    end
+
+    # Distinct bases, which is what "the found set" means: one object reached
+    # by four roots is reported four times, because marking is idempotent and
+    # `each_root` deliberately does not carry a set.
+    def self.distinct : UInt64
+      buffer = found_buffer
+      total = 0_u64
+      index = 0_u64
+      while index < @@found_count
+        base = Pointer(UInt64).new(buffer + index * 8_u64).value
+        earlier = 0_u64
+        seen = false
+        while earlier < index
+          seen = true if Pointer(UInt64).new(buffer + earlier * 8_u64).value == base
+          earlier = earlier + 1_u64
+        end
+        total = total + 1_u64 unless seen
+        index = index + 1_u64
+      end
+      total
+    end
+  end
+
+  # The callback captures nothing, on purpose. A closure that captured a local
+  # would move that local into a heap-allocated environment, and a check that
+  # means to keep its only reference on the stack would quietly be keeping it
+  # in the heap instead.
+  RECORD = ->(base : UInt64) { Tally.add(base); nil }
+
+  # A pointer in a global. Class variables are what this language has: `$`
+  # globals are refused, and a literal initializer folds to a static zero, so
+  # this starts in the zero-filled part of the image's data and is written at
+  # run time.
+  class Globals
+    @@slot : UInt64 = 0_u64
+    @@extra_a : UInt64 = 0_u64
+    @@extra_b : UInt64 = 0_u64
+    @@extra_c : UInt64 = 0_u64
+
+    def self.slot=(value : UInt64) : Nil
+      @@slot = value
+    end
+
+    def self.slot : UInt64
+      @@slot
+    end
+
+    def self.slot_address : UInt64
+      pointerof(@@slot).address
+    end
+
+    def self.hold(index : Int32, value : UInt64) : Nil
+      @@extra_a = value if index == 0
+      @@extra_b = value if index == 1
+      @@extra_c = value if index == 2
+    end
+  end
+
+  # 0x5A5A... hides an address from the compiler's view: the plain value never
+  # needs to live in a stack slot, so a check that means to keep its only
+  # reference in a register is not quietly helped by a spill the compiler made
+  # for its own reasons.
+  MASK = 0x5A5A5A5A5A5A5A5A_u64
+
+  # The allocation happens one frame down and only the masked value comes
+  # back, so the raw pointer is never a value in the frame that runs the
+  # register check. `@[NoInline]` is what makes that true with optimisation
+  # on: inlined, the pointer lands back in the caller's frame and the
+  # register check finds it on the stack, which is a check proving nothing.
+  @[NoInline]
+  def hidden_allocation(size : UInt64) : UInt64
+    Pointer(UInt8).malloc(size).address ^ MASK
+  end
+
+  # Overwrites the frames below this one, which is where the copies the
+  # allocation left behind are. Each level keeps a word in a slot the frame
+  # holds across the call, so the level cannot be optimised into nothing, and
+  # the word is the mask rather than zero so a scrubbed slot is recognisable
+  # if this ever needs debugging.
+  @[NoInline]
+  def scrub(depth : Int32) : UInt64
+    filler = MASK &+ depth.to_u64
+    slot = pointerof(filler)
+    return filler if depth == 0
+    scrub(depth - 1) &+ slot.value
+  end
+
+  status = 0
+
+  # --- The bounds themselves, before anything relies on them ---
+  base = IyiRoots.stack_base
+  here = IyiRoots.stack_pointer
+  raise "stack bounds: pointer 0x#{hex(here)} is not below base 0x#{hex(base)}" if here >= base
+  raise "stack bounds: base 0x#{hex(base)} is more than 512 MiB above the pointer" if base - here > 536870912_u64
+  print "  stack bounds: sp 0x#{hex(here)} up to base 0x#{hex(base)}, #{count((base - here).unsafe_div(1024_u64))} KiB in use\n"
+
+  data_low = IyiRoots.data_low
+  data_high = IyiRoots.data_high
+  const_low = IyiRoots.const_low
+  const_high = IyiRoots.const_high
+  raise "global range: __data_start.._end is empty" if data_high <= data_low
+  slot_at = Globals.slot_address
+  in_data = slot_at >= data_low && slot_at < data_high
+  in_const = const_high > const_low && slot_at >= const_low && slot_at < const_high
+  raise "global range: a class variable at 0x#{hex(slot_at)} is in neither 0x#{hex(data_low)}..0x#{hex(data_high)} nor 0x#{hex(const_low)}..0x#{hex(const_high)}" unless in_data || in_const
+  print "  global range: 0x#{hex(data_low)}..0x#{hex(data_high)}"
+  print " and 0x#{hex(const_low)}..0x#{hex(const_high)}" if const_high > const_low
+  print ", a class variable at 0x#{hex(slot_at)} inside it\n"
+
+  # --- A root on the stack is found ---
+  # `pointerof` is what makes this a stack check rather than a register one:
+  # taking the address forces the local into a slot in the frame.
+  stack_block = Pointer(UInt8).malloc(64_u64)
+  stack_slot = pointerof(stack_block).address
+  raise "stack root: the local is at 0x#{hex(stack_slot)}, outside the scanned range" if stack_slot < here || stack_slot >= base
+  Tally.reset
+  IyiRoots.each_stack_root(RECORD)
+  raise "stack root: 0x#{hex(stack_block.address)} was not found by a stack scan" unless Tally.found?(stack_block.address)
+  print "  stack root: found, from a slot at 0x#{hex(stack_slot)}\n"
+
+  # --- A root in a register is found ---
+  # The only reference is put in a callee-saved register and nowhere else, and
+  # the check refuses to pass unless that is true of the build it is running
+  # in. Three premises, each asserted rather than assumed.
+  #
+  # The pointer is allocated one frame down and comes back masked, and the
+  # frames it passed through are overwritten, so no copy of the raw address is
+  # a value in this frame. The stack and the globals are then scanned without
+  # the registers and must find nothing: a copy the compiler kept anyway shows
+  # up there and fails the check rather than making the next one pass for the
+  # wrong reason. Only then is the register loaded, and the full root set
+  # scanned, and the object must be found. Last the register is read back,
+  # because an allocator that had reused it would leave the whole thing
+  # proving nothing.
+  #
+  # The order is load-the-register, then scan, with nothing between them, and
+  # that is the whole reason this holds with optimisation on as well as off.
+  # With work in between, the optimiser sees a value that is dead the moment
+  # the asm block ends and reuses the register before the scan runs, and the
+  # read-back below reports exactly that. Keeping the value live instead is
+  # worse rather than better: it puts the pointer in a stack slot, which the
+  # negative scan then finds, which is the same check failing for the opposite
+  # reason. A register-residency check is a check about the register
+  # allocator, so it says out loud when its premise is gone.
+  register_hidden = hidden_allocation(96_u64)
+  scrub(64)
+  Tally.reset
+  IyiRoots.each_stack_root(RECORD)
+  stale_on_stack = Tally.found_masked?(register_hidden, MASK)
+  Tally.reset
+  IyiRoots.each_global_root(RECORD)
+  stale_in_globals = Tally.found_masked?(register_hidden, MASK)
+  raise "register root: the pointer was already on the stack without the registers, so this check would prove nothing" if stale_on_stack
+  raise "register root: the pointer was already in a global without the registers, so this check would prove nothing" if stale_in_globals
+  register_value = register_hidden ^ MASK
+  Tally.reset
+  {% if flag?(:x86_64) %}
+    asm("" :: "{r12}"(register_value) :: "volatile")
+  {% else %}
+    asm("" :: "{x19}"(register_value) :: "volatile")
+  {% end %}
+  register_value = 0_u64
+  IyiRoots.each_root(RECORD)
+  register_check = uninitialized UInt64
+  {% if flag?(:x86_64) %}
+    asm("" : "={r12}"(register_check) :: : "volatile")
+  {% else %}
+    asm("" : "={x19}"(register_check) :: : "volatile")
+  {% end %}
+  raise "register root: the register no longer held the pointer when the scan ran, so nothing here proved anything" if register_check ^ MASK != register_hidden
+  raise "register root: the pointer was in the register and the spill did not find it" unless Tally.found_masked?(register_hidden, MASK)
+  print "  register root: found, and neither on the stack nor in a global without the spill\n"
+
+  # --- A root in a global is found ---
+  global_block = Pointer(UInt8).malloc(48_u64)
+  Globals.slot = global_block.address
+  global_hidden = global_block.address ^ MASK
+  global_block = Pointer(UInt8).new(0_u64)
+  Tally.reset
+  IyiRoots.each_global_root(RECORD)
+  raise "global root: 0x#{hex(global_hidden ^ MASK)} was not found by a scan of the globals" unless Tally.found?(global_hidden ^ MASK)
+  print "  global root: found, from a class variable at 0x#{hex(slot_at)}\n"
+
+  # --- An interior pointer resolves to the object's base ---
+  interior = Pointer(UInt8).malloc(64_u64)
+  raise "interior pointer: byte 0 of the chunk did not resolve to itself" if IyiRoots.base_of(interior.address) != interior.address
+  raise "interior pointer: byte 8 resolved to 0x#{hex(IyiRoots.base_of(interior.address + 8_u64))}, not 0x#{hex(interior.address)}" if IyiRoots.base_of(interior.address + 8_u64) != interior.address
+  raise "interior pointer: byte 63 resolved to 0x#{hex(IyiRoots.base_of(interior.address + 63_u64))}, not 0x#{hex(interior.address)}" if IyiRoots.base_of(interior.address + 63_u64) != interior.address
+  raise "interior pointer: the header word under the chunk did not resolve to it" if IyiRoots.base_of(interior.address - 8_u64) != interior.address
+  big = Pointer(UInt8).malloc(2097152_u64)
+  raise "interior pointer: byte 1000 of a large object resolved to 0x#{hex(IyiRoots.base_of(big.address + 1000_u64))}, not 0x#{hex(big.address)}" if IyiRoots.base_of(big.address + 1000_u64) != big.address
+  print "  interior pointer: bytes 0, 8 and 63 of a 64-byte chunk and byte 1000 of a 2 MiB one all resolve to the base\n"
+
+  # --- A word that is not a pointer is rejected ---
+  raise "not a pointer: the small integer 7 resolved to 0x#{hex(IyiRoots.base_of(7_u64))}" if IyiRoots.base_of(7_u64) != 0
+  raise "not a pointer: zero resolved to 0x#{hex(IyiRoots.base_of(0_u64))}" if IyiRoots.base_of(0_u64) != 0
+  raise "not a pointer: a stack address resolved to 0x#{hex(IyiRoots.base_of(stack_slot))}" if IyiRoots.base_of(stack_slot) != 0
+  raise "not a pointer: a global address resolved to 0x#{hex(IyiRoots.base_of(slot_at))}" if IyiRoots.base_of(slot_at) != 0
+  outside = Tally.found_buffer
+  raise "not a pointer: an address in a mapping that is not an arena resolved to 0x#{hex(IyiRoots.base_of(outside))}" if IyiRoots.base_of(outside) != 0
+  raise "not a pointer: a code address resolved to 0x#{hex(IyiRoots.base_of(IyiRoots.data_low - 4096_u64))}" if IyiRoots.base_of(IyiRoots.data_low - 4096_u64) != 0
+  print "  not a pointer: a small integer, zero, a stack address, a global address, a foreign mapping and a code address are all rejected\n"
+
+  # --- The untouched tail of an arena is not an object ---
+  # A word can land inside an arena and still be no chunk anybody was handed,
+  # which the fill cursor is what answers.
+  tail_probe = Pointer(UInt8).malloc(24_u64)
+  tail_arena = IyiHeap.containing(tail_probe.as(Void*))
+  raise "arena tail: a 24-byte allocation is in no arena" if tail_arena == 0
+  tail_word = IyiHeap.arena_cursor(tail_arena) + 16_u64
+  raise "arena tail: 0x#{hex(tail_word)} is past the arena" if tail_word >= tail_arena + IyiHeap.arena_map(tail_arena)
+  raise "arena tail: a word past the fill cursor resolved to 0x#{hex(IyiRoots.base_of(tail_word))}" if IyiRoots.base_of(tail_word) != 0
+  print "  arena tail: a word past the fill cursor is rejected\n"
+
+  # --- A freed chunk is not reported live ---
+  stale = Pointer(UInt8).malloc(128_u64).address
+  raise "freed chunk: 0x#{hex(stale)} did not resolve while it was allocated" if IyiRoots.base_of(stale) != stale
+  IyiHeap.free(Pointer(Void).new(stale))
+  raise "freed chunk: 0x#{hex(stale)} still resolved after it was freed" if IyiRoots.base_of(stale) != 0
+  raise "freed chunk: an interior word of 0x#{hex(stale)} still resolved after it was freed" if IyiRoots.base_of(stale + 32_u64) != 0
+  print "  freed chunk: a stale word pointing at a freed chunk is rejected\n"
+
+  # A freed large object's mapping is released, so the question is answered by
+  # the list rather than by reading memory that is gone.
+  large_stale = Pointer(UInt8).malloc(1572864_u64).address
+  raise "freed large: 0x#{hex(large_stale)} did not resolve while it was allocated" if IyiRoots.base_of(large_stale) != large_stale
+  IyiHeap.free(Pointer(Void).new(large_stale))
+  raise "freed large: 0x#{hex(large_stale)} still resolved after it was freed" if IyiRoots.base_of(large_stale) != 0
+  print "  freed large: a stale word pointing at a released mapping is rejected\n"
+
+  # --- Every root of many is found ---
+  # One object per frame, in a slot the frame keeps, all the way down; the scan
+  # runs at the bottom while every frame is still live. Recursion rather than an
+  # array because an array's storage is a heap chunk, and a pointer inside a
+  # heap chunk is not a root at all: it is a field, which is Stage 5's business
+  # to trace and not this stage's to find.
+  SIZES = [24, 48, 100, 300, 900, 3000, 20000, 70000]
+
+  def descend(depth : Int32, limit : Int32) : Nil
+    if depth == limit
+      Tally.reset
+      IyiRoots.each_root(RECORD)
+      return
+    end
+    size = SIZES[depth % SIZES.size]
+    size = 1310720 if depth % 97 == 96
+    block = Pointer(UInt8).malloc(size.to_u64)
+    slot = pointerof(block)
+    Tally.want(block.address)
+    # Every byte written, so a chunk handed out twice would corrupt a
+    # neighbour's pattern rather than pass unnoticed.
+    index = 0
+    while index < size
+      block[index] = ((depth + index * 31) % 256).to_u8
+      index = index + 1
+    end
+    descend(depth + 1, limit)
+    # The slot is read after the recursion returns, which is what stops the
+    # compiler deciding the local is dead before the scan runs.
+    raise "many roots: the slot at depth #{depth.to_s} changed" if slot.value.address != Tally.wanted(depth.to_u64)
+  end
+
+  # The mix the verification asks for: 384 on the stack, one per frame; three
+  # in globals; and one placed in a callee-saved register before the descent
+  # starts, which the frames below spill to their own stack as they reuse the
+  # register, so it is reached by one path or the other. Their addresses are
+  # recorded as wanted only after the descent returns, because the recursion
+  # checks its own slot against `Tally.wanted(depth)` and shifting those
+  # indices would break that check rather than strengthen this one.
+  Tally.forget_wanted
+  hidden_a = Pointer(UInt8).malloc(200_u64).address ^ MASK
+  hidden_b = Pointer(UInt8).malloc(2000_u64).address ^ MASK
+  hidden_c = Pointer(UInt8).malloc(40000_u64).address ^ MASK
+  Globals.hold(0, hidden_a ^ MASK)
+  Globals.hold(1, hidden_b ^ MASK)
+  Globals.hold(2, hidden_c ^ MASK)
+  hidden_d = Pointer(UInt8).malloc(160_u64).address ^ MASK
+  carried = hidden_d ^ MASK
+  {% if flag?(:x86_64) %}
+    asm("" :: "{r12}"(carried) :: "volatile")
+  {% else %}
+    asm("" :: "{x19}"(carried) :: "volatile")
+  {% end %}
+  carried = 0_u64
+  descend(0, 384)
+  Tally.want(hidden_a ^ MASK)
+  Tally.want(hidden_b ^ MASK)
+  Tally.want(hidden_c ^ MASK)
+  Tally.want(hidden_d ^ MASK)
+  missing = 0_u64
+  first_missing = 0_u64
+  index = 0_u64
+  while index < Tally.wanted_count
+    unless Tally.found?(Tally.wanted(index))
+      first_missing = Tally.wanted(index) if missing == 0
+      missing = missing + 1_u64
+    end
+    index = index + 1_u64
+  end
+  print "  many roots: #{count(Tally.wanted_count - missing)} of #{count(Tally.wanted_count)} expected found, #{count(Tally.distinct)} distinct bases reported from #{count(Tally.reported)} roots\n"
+  raise "many roots: #{count(missing)} of #{count(Tally.wanted_count)} were missed, the first at 0x#{hex(first_missing)}" if missing != 0
+
+  # --- The maps parser, on both targets ---
+  # The Linux stack base is read out of `/proc/self/maps`, and the syscalls
+  # that read it cannot leave Linux. The parsing can, so it is exercised
+  # everywhere against a captured file rather than only where it runs.
+  SAMPLE = "55d0d4a00000-55d0d4a01000 r--p 00000000 08:01 1 /tmp/prog\n7ffd9b3f2000-7ffd9b413000 rw-p 00000000 00:00 0 [stack]\n7ffd9b5f9000-7ffd9b5fd000 r--p 00000000 00:00 0 [vvar]\n"
+  parsed = IyiRoots.stack_end_in_maps(SAMPLE.to_unsafe.address, SAMPLE.bytesize.to_u64)
+  raise "maps parser: read 0x#{hex(parsed)}, not 0x7ffd9b413000" if parsed != 0x7ffd9b413000_u64
+  NO_STACK = "55d0d4a00000-55d0d4a01000 r--p 00000000 08:01 1 /tmp/prog\n7ffd9b5f9000-7ffd9b5fd000 r--p 00000000 00:00 0 [vvar]\n"
+  raise "maps parser: found a [stack] line in a file that has none" if IyiRoots.stack_end_in_maps(NO_STACK.to_unsafe.address, NO_STACK.bytesize.to_u64) != 0
+  TRUNCATED = "55d0d4a00000-55d0d4a01000 r--p 00000000 08:01 1 /tmp/prog\n7ffd9b3f2000-7ffd9b41"
+  raise "maps parser: read an address out of a truncated line" if IyiRoots.stack_end_in_maps(TRUNCATED.to_unsafe.address, TRUNCATED.bytesize.to_u64) != 0
+  # The kernel's file ends with a newline, but a read that stopped on a buffer
+  # boundary does not, and neither does the last line of a file whose `[stack]`
+  # region is the final mapping. The parser has to treat the end of the buffer
+  # as the end of a line.
+  UNTERMINATED = "55d0d4a00000-55d0d4a01000 r--p 00000000 08:01 1 /tmp/prog\n7ffd9b3f2000-7ffd9b413000 rw-p 00000000 00:00 0 [stack]"
+  last = IyiRoots.stack_end_in_maps(UNTERMINATED.to_unsafe.address, UNTERMINATED.bytesize.to_u64)
+  raise "maps parser: an unterminated last [stack] line read 0x#{hex(last)}, not 0x7ffd9b413000" if last != 0x7ffd9b413000_u64
+  print "  maps parser: the [stack] end is read, terminated or not, and a file without one and a truncated line both answer zero\n"
+
+  print "  all root checks passed\n"
+  __iyi_exit(status)
+{% else %}
+  print "  root discovery needs -Dgc_iyi on linux-x86_64, linux-aarch64 or darwin; nothing to exercise here\n"
+{% end %}

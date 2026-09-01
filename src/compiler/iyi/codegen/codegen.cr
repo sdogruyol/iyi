@@ -661,6 +661,13 @@ module Iyi
         iyi_define_all_artifact_const_reads
       end
 
+      # iyi: the mark loop runs inside the built program, so the pointer
+      # maps it reads must be embedded in that program's own image (GC_DESIGN.md
+      # Stage 5). The prelude's `IyiMark` reaches them through an external
+      # global named `__iyi_gc_layouts`; `gc_layouts.cr` gives the symbol its
+      # one real definition whenever this flag selected the iyi heap.
+      iyi_define_gc_layouts if @program.has_flag?("gc_iyi")
+
       env_dump = ENV["DUMP"]?
       dump_llvm_regex : Rx::Pattern? = nil
       case env_dump

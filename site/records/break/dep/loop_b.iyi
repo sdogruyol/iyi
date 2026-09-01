@@ -1,0 +1,9 @@
+# The other half of the cycle. `dep/loop_a` imports this module and this
+# module imports `dep/loop_a`, which is the edge that closes it.
+module dep/loop_b
+
+import dep/loop_a
+
+pub def b : String
+  "b"
+end

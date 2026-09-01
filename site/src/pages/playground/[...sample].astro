@@ -1,0 +1,124 @@
+---
+/**
+ * One route per recorded sample, and each one really runs.
+ *
+ * WHAT THESE PAGES ARE. `/playground/` itself is parked: the playground worth
+ * having is an editor with iyi's own compiler running in the tab, and that
+ * waits on language work. These routes are the part that honestly works today.
+ * Each one carries one program, its recorded colouring from the compiler's own
+ * lexer, and a run that fetches the module the compiler built from that file,
+ * checks its digest against the record, and executes it in this page.
+ *
+ * So the lessons' deep links keep resolving to something that does something,
+ * which is the whole reason the routes survived the parking of the page above
+ * them. `index.astro` owns `/playground/` and a static route wins over a rest
+ * parameter, so the bare path is not generated here.
+ *
+ * WHY A ROUTE PER SAMPLE RATHER THAN A PICKER THAT SWAPS IN THE BROWSER. Each
+ * page carries exactly one program and one recorded colouring. The alternative
+ * was one page holding all thirteen, which would have meant shipping every
+ * listing to every visitor so a control could reveal one of them. A site
+ * arguing that a program should link only what it uses does not get to do that,
+ * and there is a second reason that matters more: a real URL resolves before
+ * any script runs, so a lesson's link works with scripts off and survives being
+ * bookmarked or shared.
+ */
+import Page from "../../layouts/Page.astro";
+import Playground from "../../components/Playground.astro";
+import type { CuratedSample } from "../../playground/samples";
+import { curatedSamples } from "../../playground/samples";
+
+export function getStaticPaths() {
+  /* One per recorded sample, and nothing else. The recording decides what
+   * exists, so a sample that failed to record has no page rather than a page
+   * that cannot run. */
+  return curatedSamples.map((sample) => ({
+    params: { sample: sample.id },
+    props: { sample },
+  }));
+}
+
+interface Props {
+  sample: CuratedSample;
+}
+
+const { sample } = Astro.props as Props;
+const base = import.meta.env.BASE_URL.replace(/\/*$/, "/");
+---
+
+<Page
+  title={`Playground: ${sample.id} | iyi`}
+  summary={`${sample.path}, cross-compiled to wasm32-wasi by the iyi compiler and executed on this page against a WASI host written in TypeScript. It does not compile, and it says so.`}
+>
+  <Playground sample={sample} />
+
+  <section class="spread">
+    <div class="to-wide honest">
+      <hr class="rule" />
+      <h2>What is not here</h2>
+      <p>
+        Three sentences, because two of these are structural and will not be
+        fixed by finishing something.
+      </p>
+      <ul>
+        <li>
+          <strong>Nothing in this page compiles iyi.</strong> A browser has no
+          linker, and producing a program out of a module shells out to a linker
+          driver, which a page cannot do because it has no subprocesses. So the
+          module this page runs was built elsewhere and editing the pane cannot
+          change it, which the pane says the moment you type. A compile service
+          would have closed that gap and was refused: compiling somewhere else
+          proves only that somewhere else has a compiler.
+        </li>
+        <li>
+          <strong>There are no threads, and there cannot be.</strong> GitHub
+          Pages cannot set HTTP response headers, so{" "}
+          <code>Cross-Origin-Opener-Policy</code> and{" "}
+          <code>Cross-Origin-Embedder-Policy</code> cannot be sent, so this
+          document is never cross-origin isolated and{" "}
+          <code>SharedArrayBuffer</code> does not exist here. That rules out wasm
+          threads and synchronous standard input through{" "}
+          <code>Atomics.wait</code>. It is also why output arrives in the chunks
+          the program wrote but only once <code>_start</code> returns: a wasm
+          call in this page cannot be suspended.
+        </li>
+        <li>
+          <strong>There is no standard input and no filesystem.</strong> Reads
+          from descriptor zero succeed and report end of file, and no directory
+          is preopened, so every path call fails the way it would under a host
+          that granted no capabilities. One sample fails on purpose for exactly
+          that reason and the recording marks it, because a target that cannot
+          open a file is a thing worth knowing about the target.
+        </li>
+      </ul>
+      <p>
+        <a href={`${base}playground/evidence/`}>The recordings behind this</a>{" "}
+        say which bytes ran and what checked them.
+      </p>
+    </div>
+  </section>
+</Page>
+
+<style>
+  .honest {
+    margin-block: 1rem 3rem;
+  }
+
+  .honest h2 {
+    margin-block: 1.6rem 0.7rem;
+  }
+
+  .honest p {
+    max-width: var(--measure);
+  }
+
+  .honest ul {
+    padding-inline-start: 1.1rem;
+    margin-block: 0 1.05em;
+    max-width: var(--measure);
+  }
+
+  .honest li {
+    margin-block: 0.65em;
+  }
+</style>
