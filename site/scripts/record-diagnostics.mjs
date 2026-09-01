@@ -18,8 +18,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
-  writeFileSync,
-} from "node:fs";
+  writeFileSync, readFileSync} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -132,9 +131,17 @@ const commit = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
 
 const machine = (() => {
   const uname = execFileSync("uname", ["-srm"], { encoding: "utf8" }).trim();
-  const cpu = execFileSync("sysctl", ["-n", "machdep.cpu.brand_string"], {
-    encoding: "utf8",
-  }).trim();
+  // The CPU's name, asked of the platform that knows it: sysctl is darwin's
+  // spelling and /proc/cpuinfo is Linux's. A record is made on either.
+  const cpu = process.platform === "darwin"
+    ? execFileSync("sysctl", ["-n", "machdep.cpu.brand_string"], {
+        encoding: "utf8",
+      }).trim()
+    : readFileSync("/proc/cpuinfo", "utf8")
+        .split("\n")
+        .find((line) => line.startsWith("model name"))
+        .split(":")[1]
+        .trim();
   return `${uname}, ${cpu}`;
 })();
 
