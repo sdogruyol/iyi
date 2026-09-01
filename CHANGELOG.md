@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-09-01
+
+**The collector is the default.** 0.7.0 built it; this release seats it: a
+plain `iyi build` on Linux x86_64, Linux aarch64 and darwin allocates from
+the owned arena, collects under its own allocation-pressure trigger, hands
+empty mappings back to the kernel, and times every pause on the kernel's
+own clock — with the dependency floor exactly where it was, and on darwin
+lower: `malloc`, `realloc` and `memset` left the symbol list, `mmap` and
+`munmap` joined it, and on Linux the object still leaves nothing undefined
+at all. The measurement came before the decision (`bench/gc_default.py`):
+the collector wins or ties every time column against both predecessors and
+holds RSS at the live set where a heap that never frees holds it at the
+garbage.
+
+The doors out are chosen now, not shipped: `-Dgc_none` is the bump pointer
+— the old default, the last nanosecond, unbounded memory — and
+`-Dgc_boehm` is libgc, arriving only when asked for. Along the way the
+header learned to say *atomic* (an `Array(Int32)` buffer is never
+word-scanned again), the sweep learned to return whole arenas, the pauses
+got `last`/`max`/`total` in nanoseconds, and every property has a gate
+that fails by name when the mechanism is removed.
+
+`.iyimod` format is unchanged at v43, and identity is the released version
+as ever: a 0.7.0 artifact is rejected by a 0.8.0 build and rebuilt, never
+migrated.
 
 ### Added
 
