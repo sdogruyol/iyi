@@ -70,14 +70,16 @@ stands.
 
 What that does to the stages, restated against the tree as it is:
 
-* **Stage 3's fiber enumeration is no longer blocked — it is missing.** The
-  root walk covers the current stack, the spilled registers and the globals,
-  and a *parked* fiber's stack is an unscanned root range: an object
-  reachable only from one would be freed live. Latent rather than active,
-  because nothing triggers a collection except the exercises and they are
-  single-fiber — but it is the next Stage 3 task, not a wait on III.4:
-  walk the scheduler's registry, each parked fiber's
-  [saved stack pointer, stack top] as a range.
+* **Stage 3's fiber enumeration is closed.** The scheduler keeps an
+  all-fibers registry — its wait queues could not serve the walk, since a
+  channel-parked fiber lives in the channel's own nodes — and
+  `each_fiber_root` scans every suspended fiber from its saved stack
+  pointer to its stack top; the running stack's own scan caps at the
+  current fiber's top rather than the thread base, because the gap
+  between the two mappings is unmapped. `bench/root_exercise.sh` holds
+  it both ways: an address held only on a suspended fiber's stack is
+  found, and a prelude with the fiber walk removed exits 1 at that
+  check's own name.
 * **Stage 4's thread suspension** still has nothing to suspend: fibers yield
   cooperatively at suspension points and never inside the marker, so a
   single-threaded collection needs no stopping. Register capture, the part

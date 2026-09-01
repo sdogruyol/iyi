@@ -1031,16 +1031,15 @@ require "./file"
     #    because a missing root range is a collector that frees live objects
     #    and an empty range looks exactly like a clean scan.
     #
-    # Fibers are Stage 3's fourth task, and since 0.4.0 they exist: the
-    # concurrency runtime in `concurrency.iyi` parks fibers whose 256 KiB
-    # stacks this walk never reaches. **A parked fiber's stack is an
-    # unscanned root range**, so an object reachable only from one would be
-    # freed live if a collection ran while it was parked. That has no way to
-    # happen today — nothing triggers a collection except the exercises, and
-    # they are single-fiber — which is why this is a recorded gap rather
-    # than a bug: before anything calls `IyiMark.collect` from a program
-    # that spawns, `each_root` must grow a walk of the scheduler's registry,
-    # each parked fiber's [saved stack pointer, stack top] as a range.
+    # 4. Every suspended fiber's stack (Stage 3's fourth task, closed).
+    #    The scheduler keeps an all-fibers registry precisely because its
+    #    wait queues cannot serve this walk — a channel-parked fiber lives
+    #    in the channel's own nodes — and `each_fiber_root` scans each
+    #    suspended fiber from its saved stack pointer to its stack top.
+    #    This was a recorded gap between 0.4.0's scheduler landing and
+    #    this walk: an object reachable only from a parked fiber's stack
+    #    would have been freed live, latent only because nothing but the
+    #    exercises triggers a collection.
     #
     # What is NOT here, for the same reason: nothing suspends a thread. Stage
     # 4's `SIGSTOP` on Linux and Mach `thread_suspend` on darwin stop threads
@@ -1425,8 +1424,41 @@ require "./file"
         end
       end
 
+      # The running stack. Its high end is the thread's own base unless a
+      # spawned fiber is executing, in which case it is that fiber's mmap'd
+      # top — scanning up to the thread base from a fiber stack would walk
+      # the unmapped gap between the two mappings and fault.
       def self.each_stack_root(visit : Proc(UInt64, Nil)) : Nil
-        scan_range(stack_pointer, stack_base, visit)
+        top = stack_base
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          fiber_top = IyiScheduler.current_stack_top
+          top = fiber_top if fiber_top != 0
+        {% end %}
+        scan_range(stack_pointer, top, visit)
+      end
+
+      # Every suspended fiber's stack, from its saved stack pointer to its
+      # top (GC_DESIGN.md Stage 3's fourth task, closed). The registry is
+      # the scheduler's all-fibers list, because the wait queues cannot
+      # serve this walk: a channel-parked fiber lives in the channel's own
+      # nodes. Skipped by state: the running fiber is `each_stack_root`'s
+      # business, a done fiber's stack holds nothing live, and a fiber that
+      # never suspended has no saved pointer to scan from. The main fiber's
+      # top is 0 in the registry, standing for the thread base this module
+      # discovered. On the targets with no scheduler there is nothing to
+      # walk and this is the empty walk it looks like.
+      def self.each_fiber_root(visit : Proc(UInt64, Nil)) : Nil
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          fiber = IyiScheduler.first_fiber
+          while fiber.is_a?(IyiFiber)
+            if fiber.state != 0 && fiber.state != 6 && fiber.saved_sp != 0
+              top = fiber.stack_top
+              top = stack_base if top == 0
+              scan_range(fiber.saved_sp, top, visit)
+            end
+            fiber = fiber.next_fiber
+          end
+        {% end %}
       end
 
       # The spill buffer as a root range. Writing the registers somewhere the
@@ -1441,16 +1473,16 @@ require "./file"
         scan_range(const_low, const_high, visit)
       end
 
-      # The current stack, registers and globals — NOT the whole root set:
-      # parked fiber stacks are missing, the recorded gap the block above
-      # states, and the reason nothing may trigger a collection from a
-      # program that spawns until the scheduler's registry is walked. The
+      # The whole root set: the running stack, the spilled registers, the
+      # globals, and every suspended fiber's stack — the gap the block
+      # above used to record, closed by the scheduler's registry. The
       # spill happens first and before anything calls back into user code,
       # because the callback is user code and user code uses registers.
       def self.each_root(visit : Proc(UInt64, Nil)) : Nil
         spill_registers
         each_register_root(visit)
         each_stack_root(visit)
+        each_fiber_root(visit)
         each_global_root(visit)
       end
     end

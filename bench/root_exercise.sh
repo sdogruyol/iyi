@@ -289,6 +289,13 @@ prove_fails "narrowed global range" narrow "global root:" '
         "scan_range(data_low, data_low + 128_u64, visit)"); print }
 '
 
+# The fiber walk removed from the root set: the address held only on a
+# suspended fiber's stack goes unfound, which is exactly the freed-live
+# defect the walk exists to prevent.
+prove_fails "no fiber walk" nofiber "fiber root:" '
+  { sub(/each_fiber_root\(visit\)/, "each_global_root(visit)"); print }
+'
+
 echo
 if [ "$status" -eq 0 ]; then
   echo "Roots: stack, registers and globals are all found, an interior pointer"

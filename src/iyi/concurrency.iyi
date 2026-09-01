@@ -340,6 +340,14 @@ class IyiFiber
   property next_child : IyiFiber?
   property joiner : IyiFiber?
 
+  # The registry link and the stack's high end, for the collector's root
+  # walk (GC_DESIGN.md Stage 3): a parked fiber's live values sit between
+  # its saved stack pointer and this top, and a walk that cannot reach
+  # them frees live objects. The main fiber's top stays 0 — its stack is
+  # the thread's own and the root walk already knows that one's base.
+  property next_fiber : IyiFiber?
+  property stack_top : UInt64
+
   property deadline : Int64
   property wait_fd : Int32
 
@@ -376,6 +384,8 @@ class IyiFiber
     @deadline = 0_i64
     @wait_fd = -1
     @park_nonce = 0_u64
+    @next_fiber = nil
+    @stack_top = 0_u64
   end
 
   # The running program's own context: no stack to build, the kernel gave
@@ -410,6 +420,7 @@ class IyiFiber
       __iyi_conc_syscall3(IYI_SYS_MPROTECT, base.to_i64, PAGE.to_i64, 0_i64)
     {% end %}
     top = base + STACK_BYTES
+    @stack_top = top
     {% if flag?(:x86_64) %}
       # The first resume pops seven zeroed callee-saved slots and returns
       # into the trampoline. The entry slot is placed so the trampoline
@@ -441,6 +452,12 @@ class IyiFiber
 
   def sp_slot : Pointer(UInt64)
     pointerof(@sp)
+  end
+
+  # The saved stack pointer as a value, for the root walk. Meaningful only
+  # while suspended, which is the only time the walk asks.
+  def saved_sp : UInt64
+    @sp
   end
 end
 
@@ -527,7 +544,35 @@ class IyiScheduler
     return fiber if fiber.is_a?(IyiFiber)
     main = IyiFiber.main
     @@current = main
+    register(main)
     main
+  end
+
+  # Every fiber ever made, intrusively linked, for the collector's root
+  # walk (GC_DESIGN.md Stage 3). The queues cannot serve that walk: a
+  # channel-parked fiber lives in the channel's own node list, which the
+  # scheduler cannot see, and a joiner hangs off the fiber it waits on.
+  # One list that only grows is exact by construction, and a done fiber
+  # is skipped by state rather than unlinked — its stack is never reused
+  # anyway (state 6's own rule above).
+  @@all_head : IyiFiber?
+
+  def self.register(fiber : IyiFiber) : Nil
+    fiber.next_fiber = @@all_head
+    @@all_head = fiber
+  end
+
+  def self.first_fiber : IyiFiber?
+    @@all_head
+  end
+
+  # The running fiber's stack top, 0 when it is the main fiber (or no
+  # fiber exists yet): the thread stack's base is the root walk's own
+  # discovery, not this file's.
+  def self.current_stack_top : UInt64
+    fiber = @@current
+    return 0_u64 if fiber.is_a?(Nil)
+    fiber.stack_top
   end
 
   # A channel park: the nonce that distinguishes this suspension from
@@ -1026,6 +1071,7 @@ class IyiGroup
       runner.child_finished(value.is_a?(::Error) && !fiber.cancelled)
     end
     fiber.prepare_stack
+    IyiScheduler.register(fiber)
     fiber.next_child = @first_child
     @first_child = fiber
     fiber.group = self

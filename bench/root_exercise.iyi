@@ -424,6 +424,40 @@
   raise "maps parser: an unterminated last [stack] line read 0x#{hex(last)}, not 0x7ffd9b413000" if last != 0x7ffd9b413000_u64
   print "  maps parser: the [stack] end is read, terminated or not, and a file without one and a truncated line both answer zero\n"
 
+  # --- A suspended fiber's stack is a root range ---
+  # The fiber allocates, records the address in the ledger (mmap, not a
+  # root), and suspends with the only reference in its own frame. The walk
+  # then runs from the main fiber, and the address must be among the found
+  # bases — the case that was this collector's recorded gap: an object
+  # reachable only from a fiber the scheduler holds. The channel dance is
+  # what pins the timeline: `ready.receive` parks main so the fiber runs
+  # as far as its own `ready.send`, after which its saved stack holds
+  # `keep` and the walk can ask about it.
+  {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+    Tally.forget_wanted
+    Tally.reset
+    ready = Channel(Int32).new
+    release = Channel(Int32).new
+    group do |g|
+      g.spawn do
+        keep = Pointer(UInt8).malloc(96_u64)
+        Tally.want(keep.address)
+        ready.send(1)
+        release.receive
+        keep[0] = 1_u8
+        0
+      end
+      ready.receive
+      IyiRoots.each_root(RECORD)
+      fiber_root = Tally.wanted(0_u64)
+      unless Tally.found?(fiber_root)
+        raise "fiber root: 0x#{hex(fiber_root)} lives only on a suspended fiber's stack and the walk did not find it"
+      end
+      release.send(1)
+    end
+    print "  fiber root: an address held only on a suspended fiber's stack was found by the walk\n"
+  {% end %}
+
   print "  all root checks passed\n"
   __iyi_exit(status)
 {% else %}

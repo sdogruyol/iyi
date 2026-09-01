@@ -4,6 +4,22 @@
 
 ### Added
 
+- **A suspended fiber's stack is a root now — Stage 3's fourth task,
+  closed.** The recorded gap from the collector's rebase: 0.4.0's
+  scheduler parks fibers whose 256 KiB stacks the root walk never
+  reached, so an object reachable only from one would have been freed
+  live. The scheduler now keeps an all-fibers registry — its wait queues
+  could not serve the walk, since a channel-parked fiber lives in the
+  channel's own nodes and a joiner hangs off the fiber it waits on — and
+  `each_fiber_root` scans every suspended fiber from its saved stack
+  pointer to its stack top, runnable fibers included, done ones skipped
+  by state. The running stack's own scan caps at the current fiber's top
+  rather than the thread base, because from a spawned fiber the range up
+  to the thread base crosses an unmapped gap and faults.
+  `bench/root_exercise.sh` holds both directions: an address held only
+  on a suspended fiber's stack is found by the walk, and a prelude with
+  the fiber walk removed exits 1 at that check's own name.
+
 - **The collector sweeps, so the memory comes back.** GC_DESIGN.md Stage 6, and
   with it the collector works end to end behind `-Dgc_iyi`: allocate, mark,
   sweep, and the chunk is handed out again. One walk over every carved chunk. A
@@ -949,7 +965,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,296 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,374 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2458,7 +2474,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,296-line library and nothing else. Every other
+  written against iyi's own 5,374-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
