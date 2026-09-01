@@ -56,6 +56,21 @@ mark word's FREE flag: the free-list walk this design called "fine until a
 profile asks" made every sweep quadratic the day one did, 106 seconds of
 exercise against 0.1 after the flag.
 
+The heap breathes in both directions now. A sweep that finds an arena with
+no live chunk hands the whole mapping back to the kernel — the class's
+free list stripped first, the arena unlinked from the heap's own walk,
+then the `munmap` — with one warm arena per class kept as the cushion
+that spares a spike-then-idle program the mmap on its next allocation.
+And the pauses have numbers rather than adjectives: a collection times
+itself on the kernel's own monotonic clock (a raw syscall on Linux into a
+page of the collector's own, libSystem's `clock_gettime_nsec_np` on
+darwin), and `last`/`max`/`total` ride the statistics.
+`bench/collect_trigger.sh` holds both: a 64 MiB spike's arenas go back
+when the root drops — the check fails by name when the scavenge is
+disabled — and the pause line is printed from a real run, reported
+rather than asserted because a budget would be a number the gate made
+up.
+
 The default-allocator question now has its measurement (`bench/gc_default.py`,
 release builds, best of five, worst peak RSS of the same five):
 

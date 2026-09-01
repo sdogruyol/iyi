@@ -57,6 +57,24 @@
     arenas
   end
 
+  # The scavenge step's 64 MiB chain, built in its own frame so no local
+  # holding a node outlives the build — a register still naming the last
+  # node would root the whole chain through the conservative scan, and a
+  # spike that cannot die measures nothing. The head lands in the global
+  # and nowhere else.
+  @[NoInline]
+  def build_spike(nodes : UInt64) : Nil
+    head = 0_u64
+    built = 0_u64
+    while built < nodes
+      node = Pointer(Pointer(Void)).malloc(2048_u64)
+      Pointer(UInt64).new(node.address).value = head
+      head = node.address
+      built = built + 1_u64
+    end
+    Held.keep = head
+  end
+
   puts "== the trigger, the default allocator"
 
   # 1. Below the budget, nothing runs. A quarter MiB of garbage is a quarter
@@ -149,6 +167,40 @@
     raise "fiber: the churn beside a parked fiber triggered nothing" if fiber_wave == 0
     puts "    fiber: #{count(fiber_wave)} collections triggered beside a parked fiber, its 80 bytes intact"
   {% end %}
+
+  # 5. The memory goes back to the kernel, and the pauses have numbers. A
+  # 64 MiB chain of top-class chunks is held live in a global — the arenas
+  # it forces into existence cannot be reclaimed while it stands — then the
+  # root is dropped and one collection runs. Every chunk in those arenas is
+  # garbage now, so the sweep hands the mappings back: the arena count
+  # falls to at most the cushion (one warm arena per class the program
+  # touched), and `arenas_released` says the kernel got them. A collector
+  # that reclaims chunks but never mappings has a high-water heap, which is
+  # the defect this step exists to refuse. The pause line is reported
+  # rather than asserted: a budget would be a number this file made up,
+  # and the honest claim today is that the numbers exist and are measured.
+  build_spike(4096_u64)
+  IyiMark.collect
+  peak = arena_count
+  raise "scavenge: 64 MiB live built only #{count(peak)} arenas" if peak < 4_u64
+  released_before = IyiMark.arenas_released
+  Held.keep = 0_u64
+  # A small churn between the drop and the collections scrubs whatever
+  # register or stack slot still names a spike node, the same laundering
+  # the mark exercise's garbage step relies on.
+  churn(65536_u64)
+  IyiMark.collect
+  IyiMark.collect
+  settled = arena_count
+  released = IyiMark.arenas_released - released_before
+  if released == 0
+    raise "scavenge: #{count(peak)} arenas at the peak and none went back to the kernel"
+  end
+  if settled + 2_u64 > peak
+    raise "scavenge: #{count(settled)} arenas still mapped after the spike's #{count(peak)}, so the heap is high-water"
+  end
+  puts "    scavenge: #{count(peak)} arenas at the peak, #{count(released)} released to the kernel, #{count(settled)} still mapped"
+  puts "    pauses: last #{count(IyiMark.pause_last_ns)} ns, max #{count(IyiMark.pause_max_ns)} ns, #{count(IyiMark.pause_total_ns)} ns across #{count(IyiMark.collections)} collections"
 
   puts "    all trigger checks passed"
 {% else %}

@@ -624,6 +624,10 @@ require "./file"
       lib LibC
         fun mmap(addr : Void*, len : UInt64, prot : Int32, flags : Int32, fd : Int32, offset : Int64) : Void*
         fun munmap(address : Void*, length : UInt64) : Int32
+        # The pause clock (IyiMark), the same call the scheduler's clock
+        # uses on the concurrency targets and the same declaration, so the
+        # two `lib` reopenings agree the way `mmap`'s do.
+        fun clock_gettime_nsec_np(clock_id : Int32) : UInt64
       end
 
       fun __iyi_mmap(length : UInt64) : Pointer(Void)
@@ -876,6 +880,46 @@ require "./file"
           node = read64(node)
         end
         __iyi_munmap(base, read64(base + 8))
+      end
+
+      # Hand one empty arena's mapping back to the kernel — the sweep's
+      # scavenge, kept here because every word it touches is this class's
+      # own state. The class's current fill arena answers false: one warm
+      # arena per class is the cushion that keeps spike-then-idle from
+      # paying an mmap on its next allocation. Everything else is three
+      # steps whose order is the safety argument: the class's free list is
+      # stripped of every chunk this mapping holds *before* the unmap, the
+      # arena leaves the heap's own list so `containing` never walks into a
+      # hole, and only then does the mapping go back.
+      def self.release_arena(previous : UInt64, arena : UInt64) : Bool
+        chunk = read64(arena + OFF_CHUNK)
+        index = class_index(chunk - HEADER)
+        table = directory
+        return false if table[FILL + index] == arena
+        low = arena
+        high = arena + read64(arena + OFF_MAP)
+        node = table[index]
+        leader = 0_u64
+        while node != 0
+          upcoming = read64(node)
+          if node >= low && node < high
+            if leader == 0
+              table[index] = upcoming
+            else
+              write64(leader, upcoming)
+            end
+          else
+            leader = node
+          end
+          node = upcoming
+        end
+        if previous == 0
+          @@arenas = read64(arena + OFF_NEXT)
+        else
+          write64(previous + OFF_NEXT, read64(arena + OFF_NEXT))
+        end
+        __iyi_munmap(arena, read64(arena + OFF_MAP))
+        true
       end
 
       # Same-chunk growth within a class, allocate-and-copy across one,
@@ -1606,6 +1650,39 @@ require "./file"
       @@bytes_freed : UInt64 = 0_u64
       @@bytes_kept : UInt64 = 0_u64
       @@collections : UInt64 = 0_u64
+      @@arenas_released : UInt64 = 0_u64
+      @@pause_last : UInt64 = 0_u64
+      @@pause_max : UInt64 = 0_u64
+      @@pause_total : UInt64 = 0_u64
+
+      # The pause clock. Linux asks the kernel directly — clock_gettime,
+      # CLOCK_MONOTONIC — writing the timespec into a page of this module's
+      # own, because a collector must not allocate from the heap it is
+      # collecting, not even sixteen bytes for a stamp. darwin asks
+      # libSystem's clock_gettime_nsec_np, the scheduler's own clock.
+      @@stamp : UInt64 = 0_u64
+
+      def self.now_ns : UInt64
+        {% if flag?(:linux) %}
+          @@stamp = __iyi_mmap(4096_u64).address if @@stamp == 0
+          stamp = @@stamp
+          result = uninitialized Int64
+          {% if flag?(:x86_64) %}
+            asm("syscall" : "={rax}"(result)
+                          : "{rax}"(228_i64), "{rdi}"(1_i64), "{rsi}"(Pointer(Void).new(stamp))
+                          : "rcx", "r11", "memory"
+                          : "volatile")
+          {% else %}
+            asm("svc #0" : "={x0}"(result)
+                         : "{x8}"(113_i64), "{x0}"(1_i64), "{x1}"(Pointer(Void).new(stamp))
+                         : "memory"
+                         : "volatile")
+          {% end %}
+          IyiHeap.read64(stamp) * 1000000000_u64 + IyiHeap.read64(stamp + 8_u64)
+        {% else %}
+          LibC.clock_gettime_nsec_np(6)
+        {% end %}
+      end
 
       def self.colour(base : UInt64) : UInt64
         IyiHeap.read64(base - 8_u64) & COLOUR
@@ -1802,9 +1879,19 @@ require "./file"
         @@bytes_freed = 0_u64
         @@bytes_kept = 0_u64
 
+        # The arena walk keeps a trailing pointer, because a sweep that
+        # finds an arena with no live chunk hands the whole mapping back to
+        # the kernel (GC_DESIGN.md's scavenge: a collector that reclaims
+        # chunks but never mappings has a high-water heap, not a heap). The
+        # class's current fill arena is exempt even when empty — one warm
+        # arena per class is the cushion that keeps a spike-then-idle
+        # program from paying an mmap on its next allocation.
+        previous = 0_u64
         arena = IyiHeap.first_arena
         while arena != 0
+          following = IyiHeap.arena_next(arena)
           chunk = IyiHeap.arena_chunk(arena)
+          live = 0_u64
           cursor = arena + IyiHeap::HEAD
           stop = IyiHeap.arena_cursor(arena)
           while cursor < stop
@@ -1818,11 +1905,17 @@ require "./file"
                 @@bytes_kept = @@bytes_kept + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
                 recolour(base, WHITE)
                 @@kept = @@kept + 1_u64
+                live = live + 1_u64
               end
             end
             cursor = cursor + chunk
           end
-          arena = IyiHeap.arena_next(arena)
+          if live == 0 && IyiHeap.release_arena(previous, arena)
+            @@arenas_released = @@arenas_released + 1_u64
+          else
+            previous = arena
+          end
+          arena = following
         end
 
         node = IyiHeap.first_large
@@ -1889,11 +1982,16 @@ require "./file"
       # calls reset the pressure clock too — a collection is a collection,
       # whoever asked for it.
       def self.collect : Nil
+        started = now_ns
         mark
         sweep
         @@allocated_since = 0_u64
         doubled = @@bytes_kept * 2_u64
         @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
+        pause = now_ns - started
+        @@pause_last = pause
+        @@pause_max = pause if pause > @@pause_max
+        @@pause_total = @@pause_total + pause
       end
 
       def self.budget : UInt64
@@ -1924,6 +2022,22 @@ require "./file"
 
       def self.collections : UInt64
         @@collections
+      end
+
+      def self.arenas_released : UInt64
+        @@arenas_released
+      end
+
+      def self.pause_last_ns : UInt64
+        @@pause_last
+      end
+
+      def self.pause_max_ns : UInt64
+        @@pause_max
+      end
+
+      def self.pause_total_ns : UInt64
+        @@pause_total
       end
     end
   {% elsif flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}

@@ -47,13 +47,13 @@ fi
 
 echo
 echo "== every check reported"
-for phrase in quiet trigger bounded_or_budget fiber; do
+for phrase in quiet trigger bounded_or_budget fiber scavenge pauses; do
   case "$phrase" in
     bounded_or_budget) grep -q "budget:" "$WORK/trigger.out" || { echo "  MISSING: budget"; status=1; } ;;
     *) grep -q "$phrase:" "$WORK/trigger.out" || { echo "  MISSING: $phrase"; status=1; } ;;
   esac
 done
-[ "$status" -eq 0 ] && echo "  quiet, trigger, budget and fiber all reported"
+[ "$status" -eq 0 ] && echo "  quiet, trigger, budget, fiber, scavenge and pauses all reported"
 
 echo
 echo "== the same program with optimisation on"
@@ -126,12 +126,18 @@ prove_fails "nothing triggers" notrigger "trigger:" \
 prove_fails "budget never grows" nogrow "budget:" \
   '{ sub(/@@budget = doubled < MIN_BUDGET \? MIN_BUDGET : doubled/, "@@budget = MIN_BUDGET"); print }'
 
+# The scavenge disabled: sweeps keep reclaiming chunks, mappings never go
+# back, and the heap is high-water — the check names it.
+prove_fails "mappings never return" noscavenge "scavenge:" \
+  '{ sub(/live == 0 && IyiHeap\.release_arena\(previous, arena\)/, "false"); print }'
+
 echo
 if [ "$status" -eq 0 ]; then
   echo "Trigger: collections come from allocation pressure alone, the heap"
-  echo "stays bounded, the budget grows with what survives, a parked fiber's"
-  echo "reference lives through it, and the checks fail when the trigger is"
-  echo "broken."
+  echo "stays bounded, empty arenas go back to the kernel, the pauses have"
+  echo "measured numbers, the budget grows with what survives, a parked"
+  echo "fiber's reference lives through it, and the checks fail when any"
+  echo "of it is broken."
 else
   echo "Trigger: something above failed."
 fi

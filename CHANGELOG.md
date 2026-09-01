@@ -4,6 +4,30 @@
 
 ### Added
 
+- **The heap breathes out, and the pauses have numbers.** Two things a
+  collector must do before "collector" stops needing qualifiers. A sweep
+  that finds an arena with no live chunk now hands the whole 16 MiB
+  mapping back to the kernel — the class's free list stripped of that
+  mapping's chunks first, the arena unlinked from the heap's own walk,
+  then the `munmap`, in that order because the order is the safety
+  argument. One warm arena per class stays as the cushion that spares a
+  spike-then-idle program the mmap on its next allocation. Before this a
+  heap only ever reached a high-water mark: chunks came back, mappings
+  never did.
+
+  And every collection times itself — a raw `clock_gettime` syscall on
+  Linux writing into a page of the collector's own, because a collector
+  must not allocate a timespec from the heap it is collecting, and
+  libSystem's `clock_gettime_nsec_np` on darwin — with `last`, `max` and
+  `total` nanoseconds riding the statistics. `bench/collect_trigger.sh`
+  grew the step that holds both: a 64 MiB chain forced ten arenas into
+  existence, dropping its root gave four back to the kernel with the
+  count asserted and named when the scavenge is disabled, and the pause
+  line prints from the real run — sub-millisecond steady-state
+  collections, tens of milliseconds at the spike's conservative peak —
+  reported rather than asserted, because a pause budget would be a
+  number the gate made up before anything reads it.
+
 - **The owned collector is the default allocator.** A plain `iyi build` on
   Linux x86_64, Linux aarch64 and darwin now allocates from the arena,
   collects under the allocation-pressure trigger, and hands memory back —
@@ -1113,7 +1137,7 @@ and flags reads them.
   Not built, and said so in III.4's margin: `Share` (one thread cannot
   race, so it would refuse nothing testable), and every platform that is
   not Linux — wasm32 cannot switch stacks, and an imitation is the thing
-  III.4.8 refused to ship. The prelude stands at 5,560 lines against a
+  III.4.8 refused to ship. The prelude stands at 5,674 lines against a
   ceiling of 3,734 — remeasured, not raised: the ceiling is Crystal
   0.1.0's core, that core shipped concurrency (`thread.cr`, `fiber/`, 183
   lines), and the original list had left it out because iyi then had
@@ -2622,7 +2646,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,560-line library and nothing else. Every other
+  written against iyi's own 5,674-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
