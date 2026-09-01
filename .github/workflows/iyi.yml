@@ -1011,7 +1011,7 @@ jobs:
       - name: Build the static LLVM (cache miss)
         if: steps.llvm-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get update -qq && apt-get install -y -qq cmake xz-utils > /dev/null
+          apt-get update -qq && apt-get install -y -qq cmake curl xz-utils > /dev/null
           curl -sSL -o /tmp/llvm.tar.xz \
             https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.2/llvm-project-20.1.2.src.tar.xz
           tar -xf /tmp/llvm.tar.xz -C /tmp
