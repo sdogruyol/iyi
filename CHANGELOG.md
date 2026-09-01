@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-09-01
+
+**The language owns a collector, and it runs itself.** Behind `-Dgc_iyi`,
+the whole machine: a size-class arena allocator that costs no symbol and
+no library, roots from the stack, the spilled registers, the globals and
+every suspended fiber's stack, marking that is precise where the header
+names a type and conservative everywhere else, a sweep that hands memory
+back, and an allocation-pressure trigger — one collection per live-set of
+garbage, floored at a MiB, with nobody calling `collect`. Every stage is
+gated, every gate proves it can fail, and all of them run in CI.
+
+What it is not, said here rather than found: opt-in — the default build
+still allocates and never frees, and moving that default is 0.8.0's
+measurement, not this release's side effect. Collections run on the
+allocating fiber at allocation points only; arenas stay mapped for their
+free lists; finalizers and weak references wait on the language having
+the features; threads, and with them parallel marking, wait on threads.
+
+And a fix every released compiler needed: the prelude's own `memset`
+strode eight elements where it meant eight bytes, so every runtime-sized
+clear left seven of eight bytes dirty and wrote one word in eight far
+past its count. Invisible on the bump allocator's zero tail, consistent
+with everything the Windows watch ever recorded, fixed on all three
+targets that carried it.
+
+`.iyimod` format is v43 — the `Layouts` section carries each type's
+pointer map — so a 0.6.0 artifact is rejected by a 0.7.0 build and
+rebuilt, never migrated.
 
 ### Added
 
