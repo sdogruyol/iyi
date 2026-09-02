@@ -253,9 +253,35 @@ sweep's own free flag off the chunk. The price, measured by
 `bench/defer_cost.sh` (a `defer` reaches `IyiScheduler.current` twice):
 about 8 ns per defer against about 5, the accessor's two calls, and
 one `mrs TPIDR_EL0`/`%fs:` load in the whole scheduler where there were
-none. The allocator's fast path is the half not yet cut over: it becomes
-per-thread state with the shared arena list behind the atomics, and it
-waits for the thread that will contend for it. The other absence
+none. **The allocator is cut over the same way.** `IyiHeap` is a cache
+per thread and a centre everything shares: the cache is one page a
+`@[ThreadLocal]` address names, laid out as the old directory was (a
+free-list head and a fill arena per class) and linked on `@@caches`
+for the scavenge; the centre is the class lists the sweep fills, the
+arena list and the large list, behind one spin lock on the prelude's
+`Atomic`. The fast path — pop the cache, or carve the cache's own
+arena — takes no lock and touches no shared word; a cache that runs
+dry takes the centre's whole list for the class under the lock (one
+pointer swap; a bounded batch is the fairness a two-thread profile may
+ask for, not guessed); `free` goes to the caller's own cache, because
+a grow-by-doubling loop that sent it to the centre paid two lock
+cycles a step and measured 61 ns an alloc+free pair against 27; the
+sweep links an arena's white chunks as it walks and splices them to
+the centre under one take of the lock, and pause totals in
+`bench/collect_trigger.sh` fell from 86 ms to 70 ms over 87
+collections with the batching. The price of the split, on
+`bench/arena_exercise.sh` which now measures release builds too: 4 ns
+to 6 ns an allocation in release (the one `%fs:` load), 23 ns to 27
+in a plain build (one call). **And a Stage 4 design input this
+decides:** a thread stopped while it holds the heap lock — inside a
+refill, a carve that maps, a large free — deadlocks the sweep that
+needs it, so the stop handler must not park a thread holding it; the
+lock word is the thread's own to check, and a held lock defers the
+park to the release. Go's "no preemption inside mallocgc", arrived at
+from the other end. What is still one thread's is the trigger's
+`allocated_since`, a class variable every `take` adds to; it becomes
+a per-cache count folded at the collection, and that waits for the
+thread that would race it. The other absence
 is closed: the prelude has `Atomic(T)` now (`src/iyi/atomic.iyi`, SPEC.md
 III.4.10), built for the probe as its first caller and gated by it —
 `get`, `set`, `add`, `sub`, `swap`, `compare_and_set` on the four

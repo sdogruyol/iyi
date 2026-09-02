@@ -93,6 +93,14 @@ echo
 echo "== the exercise, the default (the collector's arena)"
 build_and_run "default" exercise-gc "$REPO/bench/arena_exercise.iyi"
 
+# The same two, --release: the speed a shipped program sees, which is the
+# number that moved when the fast path grew a thread-local read (one call
+# in a plain build, one `%fs:` load in a release one).
+echo
+echo "== the same two, --release"
+build_and_run "gc_none, release" exercise-default-release "$REPO/bench/arena_exercise.iyi" -Dgc_none --release
+build_and_run "default, release" exercise-gc-release "$REPO/bench/arena_exercise.iyi" --release
+
 # Every check in the program prints a line, and the arena-only ones print
 # nothing without the flag. Naming them here is what stops a build that
 # silently compiled the whole arena section out from reading as a pass.
@@ -230,13 +238,16 @@ for source in "$REPO"/samples/iyi/*.iyi; do
 done
 
 echo
-echo "== speed, same program, same machine"
+echo "== speed, same program, same machine, plain build and --release"
 bump_ns="$(grep -m1 '^ *speed:' "$WORK/exercise-default.out" 2>/dev/null | awk '{ print $2 }')"
 arena_ns="$(grep -m1 '^ *speed:' "$WORK/exercise-gc.out" 2>/dev/null | awk '{ print $2 }')"
 pair_ns="$(grep 'alloc+free' "$WORK/exercise-gc.out" 2>/dev/null | awk '{ print $2 }')"
-printf '  bump pointer      %s ns per allocation\n' "${bump_ns:-?}"
-printf '  size-class arena  %s ns per allocation\n' "${arena_ns:-?}"
-printf '  size-class arena  %s ns per alloc+free pair\n' "${pair_ns:-?}"
+bump_rel="$(grep -m1 '^ *speed:' "$WORK/exercise-default-release.out" 2>/dev/null | awk '{ print $2 }')"
+arena_rel="$(grep -m1 '^ *speed:' "$WORK/exercise-gc-release.out" 2>/dev/null | awk '{ print $2 }')"
+pair_rel="$(grep 'alloc+free' "$WORK/exercise-gc-release.out" 2>/dev/null | awk '{ print $2 }')"
+printf '  bump pointer      %s ns per allocation, %s ns --release\n' "${bump_ns:-?}" "${bump_rel:-?}"
+printf '  size-class arena  %s ns per allocation, %s ns --release\n' "${arena_ns:-?}" "${arena_rel:-?}"
+printf '  size-class arena  %s ns per alloc+free pair, %s ns --release\n' "${pair_ns:-?}" "${pair_rel:-?}"
 echo "  A size-class allocator is expected to cost more than a bump pointer on"
 echo "  the fast path. The number is reported rather than hidden, and it is the"
 echo "  price of a heap that can hand memory back."

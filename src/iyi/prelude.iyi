@@ -540,13 +540,16 @@ require "./file"
     # first 64 bytes of an arena are its header: the next arena in the heap's
     # list, the mapped length, the chunk size, and the fill cursor with the
     # count of chunks never handed out. Everything that varies per class
-    # lives in the directory, one mapped page holding seventeen free-list
-    # heads and seventeen fill-arena pointers: the language has no array
-    # class variable, so seventeen scalars would mean a seventeen-way branch
-    # on every allocation, and one zeroed page is the whole table.
+    # lives in one mapped page holding seventeen free-list heads and
+    # seventeen fill-arena pointers — the thread's cache, since the split
+    # the class's own comment describes; the centre's page is seventeen
+    # heads and the lock: the language has no array class variable, so
+    # seventeen scalars would mean a seventeen-way branch on every
+    # allocation, and one zeroed page is the whole table.
     #
-    # Allocation pops the class's free list; with the list empty it carves
-    # the next fresh chunk from the class's fill arena, and with the arena
+    # Allocation pops the class's free list in the thread's cache, refills
+    # it from the centre when it is empty, and with both empty carves the
+    # next fresh chunk from the cache's fill arena, and with the arena
     # spent it maps another and links it in. Free reads the class back out of
     # the size the header carries and pushes the chunk onto that class's
     # list. Neither walks the arena list: the list exists to be
@@ -612,8 +615,8 @@ require "./file"
     # `large_next` the large objects, and a list nothing can enumerate would
     # fail the next stage.
     #
-    # The state is three class variables with literal zero initializers plus
-    # the directory page, under the bump branch's rule: `$` globals are
+    # The state is five class variables with literal zero initializers plus
+    # the cache and centre pages, under the bump branch's rule: `$` globals are
     # refused, a `fun` body cannot reach `@@` state, and literal initializers
     # fold into the LLVM global's static zero, so zero means "not yet mapped"
     # rather than a value startup installs. The entry points below stay
@@ -744,7 +747,49 @@ require "./file"
       OFF_CURSOR = 24_u64
       OFF_LEFT = 32_u64
 
-      @@directory : UInt64 = 0_u64
+      # ── Whose state is whose ──────────────────────────────────────────
+      #
+      # The allocator was one thread's class variables — the directory
+      # page of free-list heads and fill arenas — and the thread floor named
+      # that as the first cost of a second thread (GC_DESIGN.md). It is two
+      # things now, and the split is Go's: a **cache per thread** and a
+      # **centre** everything else shares.
+      #
+      # The cache is one page a `@[ThreadLocal]` address names — `Tls.line`
+      # in the probe, the scheduler's state pointer here — laid out as the
+      # directory was: a free-list head per class at `[index]`, the class's
+      # fill arena at `[FILL + index]`, and word `CACHE_NEXT` linking every
+      # cache ever made from `@@caches`, so the sweep's scavenge can strip
+      # all of them and a stopped thread's cache is reachable by the thread
+      # that stops it. The fast path — pop the cache's list, or carve the
+      # cache's own arena — takes no lock and touches no shared word; what
+      # it costs is one thread-local read per allocation, and
+      # `bench/arena_exercise.sh` prints the number.
+      #
+      # The centre is the class free lists the sweep fills, the arena list
+      # and the large list, behind one spin lock (`CENTRAL_LOCK`, a word on
+      # the centre's page, taken with the prelude's `Atomic`). A cache that
+      # runs dry takes the lock and takes the class's whole central list —
+      # one pointer swap, the same cost as today with one thread; a bounded
+      # batch is the fairness a profile with two threads may ask for, and
+      # it is not guessed here. `map_arena` and `take_large` push under the
+      # lock; `free` pushes to the centre under it, and the sweep frees an
+      # arena's chunks as one batch under one take of it.
+      #
+      # What this decides for Stage 4, said now: a thread stopped while it
+      # holds `CENTRAL_LOCK` — inside a refill, a carve that maps, a free —
+      # deadlocks a sweep that needs the lock. So the stop handler must not
+      # park a thread that holds it: the lock word is the thread's own to
+      # check, and a held lock defers the park to the release, which is
+      # Go's "no preemption inside mallocgc". One thread never contends,
+      # and the lock is one uncontended `compare_and_set` per refill.
+      CACHE_NEXT = 272_u64
+      CENTRAL_LOCK = 272_u64
+
+      @[ThreadLocal]
+      @@cache : UInt64 = 0_u64
+      @@caches : UInt64 = 0_u64
+      @@central : UInt64 = 0_u64
       @@arenas : UInt64 = 0_u64
       @@large : UInt64 = 0_u64
 
@@ -756,11 +801,48 @@ require "./file"
         Pointer(UInt64).new(address).value = value
       end
 
-      def self.directory : Pointer(UInt64)
-        if @@directory == 0
-          @@directory = __iyi_mmap(DIR_LEN).address
+      # This thread's cache, mapped on first touch and linked for the
+      # scavenge before the thread-local names it.
+      def self.cache : Pointer(UInt64)
+        page = @@cache
+        if page == 0
+          page = __iyi_mmap(DIR_LEN).address
+          lock
+          write64(page + CACHE_NEXT, @@caches)
+          @@caches = page
+          unlock
+          @@cache = page
         end
-        Pointer(UInt64).new(@@directory)
+        Pointer(UInt64).new(page)
+      end
+
+      def self.first_cache : UInt64
+        @@caches
+      end
+
+      def self.cache_next(page : UInt64) : UInt64
+        read64(page + CACHE_NEXT)
+      end
+
+      def self.central : Pointer(UInt64)
+        if @@central == 0
+          @@central = __iyi_mmap(DIR_LEN).address
+        end
+        Pointer(UInt64).new(@@central)
+      end
+
+      def self.lock_word : Pointer(Atomic(UInt64))
+        Pointer(Atomic(UInt64)).new(central.address + CENTRAL_LOCK)
+      end
+
+      def self.lock : Nil
+        word = lock_word
+        while !word.value.compare_and_set(0_u64, 1_u64)[1]
+        end
+      end
+
+      def self.unlock : Nil
+        lock_word.value.set(0_u64)
       end
 
       def self.class_index(size : UInt64) : Int32
@@ -796,8 +878,9 @@ require "./file"
         IyiMark.pressure(size)
         return take_large(size, clear) if size > TOP
         index = class_index(size)
-        table = directory
+        table = cache
         head = table[index]
+        head = refill(table, index) if head == 0
         if head != 0
           table[index] = read64(head)
           # The type id and the mark word go first, on both paths: they are
@@ -813,6 +896,20 @@ require "./file"
         end
         head = carve(table, size, index)
         write64(head + OFF_MARK, ATOMIC_FLAG) unless clear
+        head
+      end
+
+      # The cache's list for this class is empty: take the centre's whole
+      # list for it, under the lock. Answers the new head, 0 if the centre
+      # had nothing either.
+      def self.refill(table : Pointer(UInt64), index : Int32) : UInt64
+        centre = central
+        return 0_u64 if centre[index] == 0
+        lock
+        head = centre[index]
+        centre[index] = 0_u64
+        unlock
+        table[index] = head
         head
       end
 
@@ -832,33 +929,43 @@ require "./file"
       def self.map_arena(index : Int32) : UInt64
         base = __iyi_mmap(MAP).address
         chunk = payload(index) + HEADER
-        write64(base + OFF_NEXT, @@arenas)
         write64(base + OFF_MAP, MAP)
         write64(base + OFF_CHUNK, chunk)
         write64(base + OFF_CURSOR, base + HEAD)
         write64(base + OFF_LEFT, (MAP - HEAD).unsafe_div(chunk))
+        lock
+        write64(base + OFF_NEXT, @@arenas)
         @@arenas = base
+        unlock
         base
       end
 
       def self.take_large(size : UInt64, clear : Bool) : UInt64
         mapped = size + LARGE_USER
         base = __iyi_mmap(mapped).address
-        write64(base + OFF_NEXT, @@large)
         write64(base + OFF_MAP, mapped)
         write64(base + 16 + OFF_SIZE, size)
         write64(base + 16 + OFF_MARK, ATOMIC_FLAG) unless clear
+        lock
+        write64(base + OFF_NEXT, @@large)
         @@large = base
+        unlock
         base + 16
       end
 
+      # One chunk back, to the calling thread's own cache and no lock:
+      # `realloc`'s old chunk, and the exercises' hand-frees, come from the
+      # thread that will allocate next, and a grow-by-doubling loop that
+      # paid two lock cycles per step measured 61 ns an alloc+free pair
+      # against 27 with the chunk kept local. The sweep does not come
+      # through here; it has `free_batch`, to the centre.
       def self.free(pointer : Void*) : Nil
         return if pointer.address == 0
         head = pointer.address - HEADER
         size = read64(head)
         if size <= TOP
           index = class_index(size)
-          table = directory
+          table = cache
           write64(head + OFF_MARK, read64(head + OFF_MARK) | FREE_FLAG)
           write64(head, table[index])
           table[index] = head
@@ -867,9 +974,21 @@ require "./file"
         end
       end
 
+      # An arena's worth of swept chunks, already flagged and linked head to
+      # tail by the sweep, spliced onto the centre's list for the class
+      # under one take of the lock.
+      def self.free_batch(index : Int32, head : UInt64, tail : UInt64) : Nil
+        centre = central
+        lock
+        write64(tail, centre[index])
+        centre[index] = head
+        unlock
+      end
+
       def self.free_large(head : UInt64) : Nil
         base = head - 16
         previous = 0_u64
+        lock
         node = @@large
         while node != 0
           if node == base
@@ -883,32 +1002,20 @@ require "./file"
           previous = node
           node = read64(node)
         end
+        unlock
         __iyi_munmap(base, read64(base + 8))
       end
 
-      # Hand one empty arena's mapping back to the kernel — the sweep's
-      # scavenge, kept here because every word it touches is this class's
-      # own state. The class's current fill arena answers false: one warm
-      # arena per class is the cushion that keeps spike-then-idle from
-      # paying an mmap on its next allocation. Everything else is three
-      # steps whose order is the safety argument: the class's free list is
-      # stripped of every chunk this mapping holds *before* the unmap, the
-      # arena leaves the heap's own list so `containing` never walks into a
-      # hole, and only then does the mapping go back.
-      def self.release_arena(previous : UInt64, arena : UInt64) : Bool
-        chunk = read64(arena + OFF_CHUNK)
-        index = class_index(chunk - HEADER)
-        table = directory
-        return false if table[FILL + index] == arena
-        low = arena
-        high = arena + read64(arena + OFF_MAP)
-        node = table[index]
+      # Every chunk of `[low, high)` off one free list, whose head is at
+      # `slot`.
+      def self.strip_list(slot : Pointer(UInt64), low : UInt64, high : UInt64) : Nil
+        node = slot.value
         leader = 0_u64
         while node != 0
           upcoming = read64(node)
           if node >= low && node < high
             if leader == 0
-              table[index] = upcoming
+              slot.value = upcoming
             else
               write64(leader, upcoming)
             end
@@ -916,6 +1023,35 @@ require "./file"
             leader = node
           end
           node = upcoming
+        end
+      end
+
+      # Hand one empty arena's mapping back to the kernel — the sweep's
+      # scavenge, kept here because every word it touches is this class's
+      # own state. Any cache's current fill arena answers false: one warm
+      # arena per class per thread is the cushion that keeps spike-then-idle
+      # from paying an mmap on its next allocation. Everything else is three
+      # steps whose order is the safety argument: every free list — the
+      # centre's and each cache's — is stripped of every chunk this mapping
+      # holds *before* the unmap, the arena leaves the heap's own list so
+      # `containing` never walks into a hole, and only then does the
+      # mapping go back. The sweep runs with every other thread stopped,
+      # which is what makes another thread's cache safe to edit here.
+      def self.release_arena(previous : UInt64, arena : UInt64) : Bool
+        chunk = read64(arena + OFF_CHUNK)
+        index = class_index(chunk - HEADER)
+        page = @@caches
+        while page != 0
+          return false if Pointer(UInt64).new(page)[FILL + index] == arena
+          page = read64(page + CACHE_NEXT)
+        end
+        low = arena
+        high = arena + read64(arena + OFF_MAP)
+        strip_list(central + index.to_i64, low, high)
+        page = @@caches
+        while page != 0
+          strip_list(Pointer(UInt64).new(page) + index.to_i64, low, high)
+          page = read64(page + CACHE_NEXT)
         end
         if previous == 0
           @@arenas = read64(arena + OFF_NEXT)
@@ -1929,12 +2065,17 @@ require "./file"
         # class's current fill arena is exempt even when empty — one warm
         # arena per class is the cushion that keeps a spike-then-idle
         # program from paying an mmap on its next allocation.
+        # Each arena's white chunks are linked as they are found and go to
+        # the centre as one batch under one take of the heap lock — or not
+        # at all, when the arena goes back to the kernel with them in it.
         previous = 0_u64
         arena = IyiHeap.first_arena
         while arena != 0
           following = IyiHeap.arena_next(arena)
           chunk = IyiHeap.arena_chunk(arena)
           live = 0_u64
+          batch_head = 0_u64
+          batch_tail = 0_u64
           cursor = arena + IyiHeap::HEAD
           stop = IyiHeap.arena_cursor(arena)
           while cursor < stop
@@ -1943,7 +2084,10 @@ require "./file"
               if colour(base) == WHITE
                 @@bytes_freed = @@bytes_freed + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
                 @@swept = @@swept + 1_u64
-                IyiHeap.free(Pointer(Void).new(base))
+                IyiHeap.write64(cursor + IyiHeap::OFF_MARK, IyiHeap.read64(cursor + IyiHeap::OFF_MARK) | IyiHeap::FREE_FLAG)
+                IyiHeap.write64(cursor, batch_head)
+                batch_tail = cursor if batch_head == 0
+                batch_head = cursor
               else
                 @@bytes_kept = @@bytes_kept + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
                 recolour(base, WHITE)
@@ -1956,6 +2100,7 @@ require "./file"
           if live == 0 && IyiHeap.release_arena(previous, arena)
             @@arenas_released = @@arenas_released + 1_u64
           else
+            IyiHeap.free_batch(IyiHeap.class_index(chunk - IyiHeap::HEADER), batch_head, batch_tail) if batch_head != 0
             previous = arena
           end
           arena = following

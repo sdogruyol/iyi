@@ -102,9 +102,10 @@ prove_fails() {
     "$(grep -m1 "$phrase" "$WORK/$dir/out" | sed 's/^iyi: panic: //')"
 }
 
-# The walk still counts and repaints, it just never hands the chunk back.
+# The walk still counts, repaints and links, it just never hands the batch
+# to the centre.
 prove_fails "sweep frees nothing" nofree "sweep:" \
-  '{ if ($0 ~ /^                IyiHeap\.free\(Pointer\(Void\)\.new\(base\)\)$/) { print "                # removed"; next } print }'
+  '{ if ($0 ~ /^            IyiHeap\.free_batch\(/) { print "            # removed"; next } print }'
 
 # The colour test stops mattering, so a live object goes on the free list.
 prove_fails "sweep frees the live" reckless "sweep:" \

@@ -369,8 +369,44 @@
   local-exec, every thread-local descriptor names dyld's thunk, and
   every darwin program reaches the scheduler — recorded in the five
   gates that hold darwin's floor in this commit, by that script's own
-  rule. The allocator's fast path is the half not cut over; it waits
-  for the thread that will contend for it.
+  rule. The allocator's fast path was the half not cut over; the entry
+  below is its cutover.
+
+- **The allocator is a cache per thread and a centre under one lock,
+  and the fast path touches no shared word.** `IyiHeap` was the
+  directory page — a free-list head and a fill arena per class — as one
+  thread's class variables, the other half of the thread floor's first
+  cost. The split is Go's. The cache is one page a `@[ThreadLocal]`
+  address names, laid out as the directory was and linked on
+  `@@caches` when it is made, so the scavenge can strip every thread's
+  lists and a stopped thread's cache is reachable by the thread that
+  stops it; the centre is the class lists the sweep fills, the arena
+  list and the large list, behind a spin lock that is one
+  `Atomic(UInt64).compare_and_set` on a word of the centre's page.
+  Allocation pops the cache or carves the cache's own arena, no lock;
+  a cache that runs dry takes the centre's whole list for the class
+  under the lock, one pointer swap (a bounded batch is the fairness a
+  two-thread profile may ask for, and is not guessed); `map_arena` and
+  `take_large` push under the lock; the sweep links an arena's white
+  chunks as it walks and splices them to the centre under one take of
+  it, and the scavenge strips the centre and every cache before the
+  unmap. `free` goes to the caller's own cache: sent to the centre it
+  cost a grow-by-doubling loop two lock cycles a step, 61 ns an
+  alloc+free pair against 27, and the chunk a thread frees is the
+  chunk it allocates next. The numbers, from `bench/arena_exercise.sh`,
+  which measures release builds now beside plain ones because a person
+  ships release: 4 ns to 6 ns an allocation in release — the one
+  `%fs:` load — and 23 ns to 27 in a plain build, the one call; and
+  `bench/collect_trigger.sh`'s pause total fell from 86 ms to 70 ms
+  over 87 collections, the batched splice being cheaper than a `free`
+  per chunk. Every collector gate holds, and `bench/sweep_exercise.sh`'s
+  "frees nothing" proof now removes the splice rather than the `free`
+  it no longer calls. What the split decides for Stage 4 is written in
+  GC_DESIGN.md: a thread stopped while it holds the heap lock deadlocks
+  the sweep, so the stop must defer past a held lock — Go's "no
+  preemption inside mallocgc". The trigger's `allocated_since` is
+  still one class variable every `take` adds to; it becomes a
+  per-cache count when the thread that would race it exists.
 
 ### Fixed
 
@@ -3188,7 +3224,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,886-line library and nothing else. Every other
+  written against iyi's own 6,031-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
