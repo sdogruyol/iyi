@@ -299,6 +299,25 @@ stand on darwin with more force: marking workers and the mutator's M
 are bounded by the core count, or a resume is tens of milliseconds by
 construction.
 
+The obvious other darwin stop was measured and refused. A signal is not
+the only way to hold a thread there: Mach's `thread_suspend` on the
+port `pthread_mach_thread_np` answers returns with the thread held —
+XNU waits for it — and `thread_get_state` with ARM_THREAD_STATE64 then
+reads its registers with no handler and no park, which is what Boehm
+does on darwin. Four libSystem names for the signal arm's four, and it
+is kept under `-Dtf_mach` with its own exact list and its own table in
+the driver, because the comparison should stay a measurement. Same
+machine, same rounds: stop 1 thread 3.8 µs best to the signal's 2.0;
+4 threads 24 / 52 µs to 23 / 35; 8 threads 58 µs / 160 µs to 54 / 100;
+16 threads best 110 µs but mean 5.4 ms to 0.95; 64 threads mean 31 ms
+to 2.2. Resume is worse still past 4 threads: 3 ms mean for 8 against
+155 µs. The reading is serial against parallel: each `thread_suspend`
+returns only once its target has been through a core and stopped, and
+the next begins after it, where N `pthread_kill`s are queued at once
+and the handlers stop in parallel as their threads get a core. So
+Stage 4's darwin stop is the signal and the per-thread lock, and its
+register capture is the handler's `ucontext`, as on Linux.
+
 **Owner's Decision:** Own the garbage collector. Concurrency, parallelism, and performance control are the reasons. gcry is prior art: measurements, design hints, and a record of what has already been tried and cost what. iyi writes the heap, the STW mechanism, root discovery, and finalizers from scratch.
 
 ---

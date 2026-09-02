@@ -9,7 +9,8 @@
 # Five steps, and the last two are failure proofs, because a gate that
 # cannot fail is not a gate:
 #
-#   1. The program holds every property, plain and --release: N threads,
+#   1. The program holds every property, plain and --release (and on darwin
+#      the -Dtf_mach stop, release): N threads,
 #      each with a tid of its own and a thread-local block of its own;
 #      every one stopped where it ran by a signal and a handler, released
 #      by one wake; every one joined; every `@[ThreadLocal]` slot still its
@@ -74,6 +75,20 @@ if ! timeout 60 ./floor-release 4 100 > answers-release.txt 2>&1; then
 fi
 grep -q 'every property held' answers-release.txt || { cat answers-release.txt; exit 1; }
 
+# darwin has a second stop: `-Dtf_mach`, Mach's thread_suspend and
+# thread_get_state in place of a signal and a park. Built and held to its
+# own list so the comparison in step 3 stays reproducible.
+if [ "$(uname -s)" = Darwin ]; then
+  step "thread floor, release build, the Mach stop"
+  if ! "$IYI" build --release -Dtf_mach "$REPO/bench/thread_floor.iyi" -o floor-mach > build-mach.log 2>&1; then
+    cat build-mach.log; exit 1
+  fi
+  if ! timeout 60 ./floor-mach 4 100 > answers-mach.txt 2>&1; then
+    cat answers-mach.txt; exit 1
+  fi
+  grep -q 'every property held' answers-mach.txt || { cat answers-mach.txt; exit 1; }
+fi
+
 # ── 2. The floor ──────────────────────────────────────────────────────────
 case "$(uname -s)" in
   Linux)
@@ -117,9 +132,15 @@ case "$(uname -s)" in
     step "dependency floor: what a thread costs darwin, by name"
     runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pthread_get_stackaddr_np _pthread_self _write'
     thread='__tlv_bootstrap _os_unfair_lock_lock _os_unfair_lock_unlock _pthread_create _pthread_join _pthread_kill _pthread_threadid_np _sigaction'
+    # The Mach stop swaps the four stop-and-park names for four of its own:
+    #   pthread_mach_thread_np                       the thread's port
+    #   thread_suspend, thread_resume                the stop
+    #   thread_get_state                             the registers, read held
+    mach='__tlv_bootstrap _pthread_create _pthread_join _pthread_mach_thread_np _pthread_threadid_np _thread_get_state _thread_resume _thread_suspend'
     printf '%s\n' $runtime $thread | LC_ALL=C sort > expected-floor.txt
     printf '%s\n' $runtime $thread _bzero | LC_ALL=C sort > expected-floor-release.txt
-    for bin in floor floor-release; do
+    printf '%s\n' $runtime $mach _bzero | LC_ALL=C sort > expected-floor-mach.txt
+    for bin in floor floor-release floor-mach; do
       nm -u "$bin" | sed -e 's/^ *//' | awk '{ print $NF }' | LC_ALL=C sort > "found-$bin.txt"
       if ! diff "expected-$bin.txt" "found-$bin.txt" > "diff-$bin.txt"; then
         echo "$bin moved the darwin floor (< expected, > found):"
@@ -133,7 +154,7 @@ case "$(uname -s)" in
         exit 1
       fi
     done
-    echo "  the runtime's twelve names, the thread's eight, libSystem alone; release adds bzero"
+    echo "  the runtime's twelve names, the thread's eight (the Mach stop's other eight), libSystem alone; release adds bzero"
     ;;
 esac
 
@@ -143,6 +164,17 @@ for count in 1 4 8 16 64; do
   echo "  $count threads:"
   timeout 120 ./floor-release "$count" 200 | grep -E '^  (stop|resume)' | sed 's/^/  /'
 done
+if [ "$(uname -s)" = Darwin ]; then
+  # The other stop, same table: thread_suspend returns held, so its stop is
+  # the loop alone, and its resume is measured from thread_resume to every
+  # counter moving. It loses at every count (CHANGELOG.md has the reading),
+  # and the table is printed so that stays a measurement.
+  step "the same, by thread_suspend and thread_get_state (-Dtf_mach)"
+  for count in 1 4 8 16 64; do
+    echo "  $count threads:"
+    timeout 120 ./floor-mach "$count" 200 | grep -E '^  (stop|resume)' | sed 's/^/  /'
+  done
+fi
 # And what the cutover's spelling costs: one read-modify-write of a
 # `@[ThreadLocal]` against one of a plain class variable, in the release
 # build, printed for the same reason the pauses are.

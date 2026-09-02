@@ -215,8 +215,19 @@
   3.2 ns to 2.0 on darwin — two thunk calls at some 0.6 ns each, since
   dyld's fast path is a `tpidrro_el0` read and a table lookup — so the
   cutover's thread-local scheduler state is a call on darwin but not a
-  cost; the driver prints the line beside the pauses. And the probe's
-  "best" sentinel was 0,
+  cost; the driver prints the line beside the pauses. The other darwin
+  stop was measured and refused: Mach's `thread_suspend` on the port
+  `pthread_mach_thread_np` answers, which returns held, and
+  `thread_get_state` for the registers — Boehm's darwin mechanism, no
+  handler, no park, four names for the signal arm's four. Kept under
+  `-Dtf_mach` with its own exact list and its own table in the driver.
+  It loses at every count: stop 3.8 µs to 2.0 for one thread, 52 µs
+  to 35 mean for 4, 5.4 ms to 0.95 for 16, 31 ms to 2.2 for 64, and a
+  3 ms mean resume for 8 threads against 155 µs — each suspend returns
+  only once its target has been through a core and stopped, one after
+  another, where N kills are queued at once and the handlers stop in
+  parallel. So Stage 4's darwin stop is the signal and the per-thread
+  lock. And the probe's "best" sentinel was 0,
   which a microsecond clock can measure; it is the first round now.
   GC_DESIGN.md carries the reading.
 

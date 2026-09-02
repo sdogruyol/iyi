@@ -565,7 +565,13 @@
     # the broadcast does. The last is what is here. `sched_yield` was
     # measured too and is not here: the main thread spins on the counters
     # with a `yield` hint instead, which costs no name and, below the core
-    # count, no time.
+    # count, no time. And the stop has an alternative with no signal in
+    # it at all — Mach's `thread_suspend`, which returns with the thread
+    # held, and `thread_get_state` for its registers — kept under
+    # `-Dtf_mach` below because it was the obvious other answer and it
+    # loses at every count: each suspend returns only once its target has
+    # been through a core and stopped, one target after another, where N
+    # signals are queued at once and the handlers stop in parallel.
     lib LibC
       fun pthread_create(thread : UInt64*, attributes : Void*, start : Void*, argument : Void*) : Int32
       fun pthread_join(thread : Void*, value : Void*) : Int32
@@ -693,81 +699,189 @@
       fail("pthread_join failed: #{result}") if result != 0
     end
 
-    # ── Stop the world ──────────────────────────────────────────────────────
-    #
-    # The handler runs on the signalled thread, wherever it was. It counts
-    # itself suspended, parks on its own line's lock, which the main
-    # thread took before signalling, and counts itself resumed once it has
-    # been handed the lock and let it go. What the collector would do
-    # between the two counts is the same as on Linux: the thread's
-    # registers are in the ucontext libSystem passes as the third argument.
-    def park_word(line : UInt64) : Pointer(Void)
-      Pointer(Void).new(line + TF_PARK)
-    end
-
-    fun __tf_stop_handler(signal : Int32, info : Void*, context : Void*) : Nil
-      __tf_add(Threads.suspended, 1_u64)
-      LibC.os_unfair_lock_lock(park_word(Tls.line))
-      LibC.os_unfair_lock_unlock(park_word(Tls.line))
-      __tf_add(Threads.resumed, 1_u64)
-    end
-
-    @[NoInline]
-    @[Naked]
-    fun __tf_stop_handler_address : UInt64
-      asm("adrp x0, ___tf_stop_handler@PAGE
-           add x0, x0, ___tf_stop_handler@PAGEOFF
-           ret" :::: "volatile")
-      0_u64
-    end
-
-    def install_stop_handler : Nil
-      action = Pointer(UInt64).malloc(2_u64)
-      action[0] = __tf_stop_handler_address
-      action[1] = TF_SA_WORD
-      result = LibC.sigaction(TF_SIGUSR1, action.as(Void*), Pointer(Void).new(0_u64))
-      fail("sigaction failed: #{result}") if result != 0
-    end
-
-    # One round: take every thread's lock, signal every thread, wait until
-    # every handler has counted itself in, then drop every lock and wait
-    # until every handler has counted itself out. Answers the two pause
-    # halves in ns.
-    def stop_the_world : Tuple(Int64, Int64)
-      __tf_store(Threads.suspended, 0_u64)
-      __tf_store(Threads.resumed, 0_u64)
-      count = Threads.count
-      index = 0_i64
-      while index < count
-        LibC.os_unfair_lock_lock(park_word(Threads.line(index)))
-        index = index + 1_i64
+    {% if flag?(:tf_mach) %}
+      # ── Stop the world, the Mach way ────────────────────────────────────────
+      #
+      # `-Dtf_mach`: no signal, no handler, no park. Every pthread has a Mach
+      # thread port, `pthread_mach_thread_np` answers it, and
+      # `thread_suspend` on that port returns once the thread is held — XNU
+      # waits for it (thread_hold, then thread_wait) — so the stop is the
+      # loop itself. `thread_get_state` with ARM_THREAD_STATE64 then reads
+      # the held thread's registers, which is what the collector would do
+      # with the ucontext in the other arm, and `thread_resume` lets it go.
+      # Four libSystem names for the other arm's four (`sigaction`,
+      # `pthread_kill`, the two lock calls); the numbers say which is the
+      # cheaper stop, and bench/thread_floor.sh prints both.
+      lib LibC
+        fun pthread_mach_thread_np(thread : Void*) : Int32
+        fun thread_suspend(thread : Int32) : Int32
+        fun thread_resume(thread : Int32) : Int32
+        fun thread_get_state(thread : Int32, flavor : Int32, state : Void*, count : Int32*) : Int32
       end
 
-      started = __iyi_monotonic_ns
-      index = 0_i64
-      while index < count
-        handle = Pointer(Void).new(__tf_load(Threads.line(index)))
-        result = LibC.pthread_kill(handle, TF_SIGUSR1)
-        fail("pthread_kill failed: #{result}") if result != 0
-        index = index + 1_i64
-      end
-      while __tf_load(Threads.suspended) < count.to_u64
-        yield_cpu
-      end
-      stopped = __iyi_monotonic_ns
+      # The thread's Mach port, on its line at this offset; and the counter
+      # value it was held at, at the next word, so the resume can be waited
+      # for the way the handler's count is.
+      TF_PORT = 40_u64
+      TF_HELD = 48_u64
+      # arm_thread_state64_t: x0..x28, fp, lr, sp, pc, cpsr and padding —
+      # 68 32-bit words (an Int32 here, the prelude's spelling for a u32 at
+      # the ABI). sp sits at byte 248 and pc at 256.
+      TF_ARM_THREAD_STATE64 = 6_i32
+      TF_STATE_WORDS = 68_i32
 
-      index = 0_i64
-      while index < count
-        LibC.os_unfair_lock_unlock(park_word(Threads.line(index)))
-        index = index + 1_i64
-      end
-      while __tf_load(Threads.resumed) < count.to_u64
-        yield_cpu
-      end
-      resumed = __iyi_monotonic_ns
+      class Stop
+        @@state : UInt64 = 0_u64
 
-      {stopped - started, resumed - stopped}
-    end
+        def self.state : UInt64
+          @@state = __iyi_mmap(4096_u64).address if @@state == 0_u64
+          @@state
+        end
+      end
+
+      def install_stop_handler : Nil
+        Stop.state
+        index = 0_i64
+        while index < Threads.count
+          line = Threads.line(index)
+          port = LibC.pthread_mach_thread_np(Pointer(Void).new(__tf_load(line)))
+          fail("pthread_mach_thread_np answered no port for thread #{index}") if port == 0
+          __tf_store(line + TF_PORT, port.to_i64.to_u64)
+          index = index + 1_i64
+        end
+      end
+
+      # One round: suspend every thread — each call returns held — and read
+      # its registers; then resume every thread and wait until every counter
+      # has moved past where it was held. Answers the two pause halves in ns.
+      def stop_the_world : Tuple(Int64, Int64)
+        count = Threads.count
+        state = Stop.state
+        started = __iyi_monotonic_ns
+        index = 0_i64
+        while index < count
+          line = Threads.line(index)
+          port = __tf_load(line + TF_PORT).to_i32
+          result = LibC.thread_suspend(port)
+          fail("thread_suspend failed: #{result}") if result != 0
+          index = index + 1_i64
+        end
+        stopped = __iyi_monotonic_ns
+
+        # Held: the registers are readable, the stack pointer and program
+        # counter are real, and the counter does not move while they are read.
+        index = 0_i64
+        while index < count
+          line = Threads.line(index)
+          held = __tf_load(line + 16_u64)
+          words = TF_STATE_WORDS
+          result = LibC.thread_get_state(__tf_load(line + TF_PORT).to_i32, TF_ARM_THREAD_STATE64, Pointer(Void).new(state), pointerof(words))
+          fail("thread_get_state failed: #{result}") if result != 0
+          sp = Pointer(UInt64).new(state + 248_u64).value
+          pc = Pointer(UInt64).new(state + 256_u64).value
+          fail("thread #{index} held with no stack pointer or program counter") if sp == 0_u64 || pc == 0_u64
+          fail("thread #{index} counted while held") if __tf_load(line + 16_u64) != held
+          __tf_store(line + TF_HELD, held)
+          index = index + 1_i64
+        end
+
+        released = __iyi_monotonic_ns
+        index = 0_i64
+        while index < count
+          result = LibC.thread_resume(__tf_load(Threads.line(index) + TF_PORT).to_i32)
+          fail("thread_resume failed: #{result}") if result != 0
+          index = index + 1_i64
+        end
+        index = 0_i64
+        while index < count
+          line = Threads.line(index)
+          while __tf_load(line + 16_u64) == __tf_load(line + TF_HELD)
+            yield_cpu
+          end
+          index = index + 1_i64
+        end
+        resumed = __iyi_monotonic_ns
+
+        {stopped - started, resumed - released}
+      end
+    {% else %}
+      # ── Stop the world ──────────────────────────────────────────────────────
+      #
+      # The handler runs on the signalled thread, wherever it was. It counts
+      # itself suspended, parks on its own line's lock, which the main
+      # thread took before signalling, and counts itself resumed once it has
+      # been handed the lock and let it go. What the collector would do
+      # between the two counts is the same as on Linux: the thread's
+      # registers are in the ucontext libSystem passes as the third argument.
+      def park_word(line : UInt64) : Pointer(Void)
+        Pointer(Void).new(line + TF_PARK)
+      end
+
+      fun __tf_stop_handler(signal : Int32, info : Void*, context : Void*) : Nil
+        __tf_add(Threads.suspended, 1_u64)
+        LibC.os_unfair_lock_lock(park_word(Tls.line))
+        LibC.os_unfair_lock_unlock(park_word(Tls.line))
+        __tf_add(Threads.resumed, 1_u64)
+      end
+
+      @[NoInline]
+      @[Naked]
+      fun __tf_stop_handler_address : UInt64
+        asm("adrp x0, ___tf_stop_handler@PAGE
+             add x0, x0, ___tf_stop_handler@PAGEOFF
+             ret" :::: "volatile")
+        0_u64
+      end
+
+      def install_stop_handler : Nil
+        action = Pointer(UInt64).malloc(2_u64)
+        action[0] = __tf_stop_handler_address
+        action[1] = TF_SA_WORD
+        result = LibC.sigaction(TF_SIGUSR1, action.as(Void*), Pointer(Void).new(0_u64))
+        fail("sigaction failed: #{result}") if result != 0
+      end
+
+      # One round: take every thread's lock, signal every thread, wait until
+      # every handler has counted itself in, then drop every lock and wait
+      # until every handler has counted itself out. Answers the two pause
+      # halves in ns.
+      def stop_the_world : Tuple(Int64, Int64)
+        __tf_store(Threads.suspended, 0_u64)
+        __tf_store(Threads.resumed, 0_u64)
+        count = Threads.count
+        index = 0_i64
+        while index < count
+          LibC.os_unfair_lock_lock(park_word(Threads.line(index)))
+          index = index + 1_i64
+        end
+
+        started = __iyi_monotonic_ns
+        index = 0_i64
+        while index < count
+          handle = Pointer(Void).new(__tf_load(Threads.line(index)))
+          result = LibC.pthread_kill(handle, TF_SIGUSR1)
+          fail("pthread_kill failed: #{result}") if result != 0
+          index = index + 1_i64
+        end
+        while __tf_load(Threads.suspended) < count.to_u64
+          yield_cpu
+        end
+        stopped = __iyi_monotonic_ns
+
+        index = 0_i64
+        while index < count
+          LibC.os_unfair_lock_unlock(park_word(Threads.line(index)))
+          index = index + 1_i64
+        end
+        while __tf_load(Threads.resumed) < count.to_u64
+          yield_cpu
+        end
+        resumed = __iyi_monotonic_ns
+
+        {stopped - started, resumed - stopped}
+      end
+
+    {% end %}
 
     def describe_threads : String
       "started by pthread_create, each with a thread id of its own"
