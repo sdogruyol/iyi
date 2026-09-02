@@ -209,7 +209,14 @@
   names it too — and no gate had seen it because
   `bench/dependency_floor.sh` builds plain; the thread floor's release
   list carries it, labelled as the release build's and not the
-  thread's. And the probe's "best" sentinel was 0,
+  thread's. The price of the spelling is measured too: ten million
+  read-modify-writes of a `@[ThreadLocal]` against a plain class
+  variable, release build, each in its own `@[NoInline]` frame, cost
+  3.2 ns to 2.0 on darwin — two thunk calls at some 0.6 ns each, since
+  dyld's fast path is a `tpidrro_el0` read and a table lookup — so the
+  cutover's thread-local scheduler state is a call on darwin but not a
+  cost; the driver prints the line beside the pauses. And the probe's
+  "best" sentinel was 0,
   which a microsecond clock can measure; it is the first round now.
   GC_DESIGN.md carries the reading.
 

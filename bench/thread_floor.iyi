@@ -782,6 +782,30 @@
     end
   {% end %}
 
+  class Plain
+    @@slot : UInt64 = 0_u64
+
+    def self.slot : UInt64
+      @@slot
+    end
+
+    def self.slot=(value : UInt64) : Nil
+      @@slot = value
+    end
+  end
+
+  @[NoInline]
+  def bump_plain : UInt64
+    Plain.slot = Plain.slot &+ 1_u64
+    Plain.slot
+  end
+
+  @[NoInline]
+  def bump_thread_local : UInt64
+    Tls.slot = Tls.slot &+ 1_u64
+    Tls.slot
+  end
+
   # ── The run ─────────────────────────────────────────────────────────────
   # `thread_floor THREADS ROUNDS`; 4 and 200 unless told otherwise, so the
   # driver can ask how the pause scales with the count.
@@ -796,6 +820,7 @@
   # would be caught below.
   fail("main thread's seed is #{Tls.seed.to_i64}, not the image's 7") if Tls.seed != 7_u64
   Tls.slot = own_tid.to_u64
+  Plain.slot = own_tid.to_u64
 
   index = 0_i64
   while index < count
@@ -857,6 +882,34 @@
   puts "joined: #{describe_join}"
   fail("the main thread's thread-local slot was overwritten") if Tls.slot != own_tid.to_u64
   puts "thread-local: #{describe_thread_local}"
+
+  # ── What a touch costs ──────────────────────────────────────────────────
+  # The runtime's cutover makes the scheduler's current fiber and the
+  # allocator's fast path `@[ThreadLocal]`, so what one touch of such a
+  # variable costs against a plain class variable is the price of that
+  # spelling, per platform: a `tpidr_el0`/`%fs`-relative address on Linux,
+  # a call through the descriptor's thunk on darwin. The touch is a
+  # read-modify-write in its own @[NoInline] frame — a scheduler entry
+  # point's shape, and a store is what keeps the optimiser from hoisting
+  # the address out of the loop or summing the reads in closed form, which
+  # it did to a pure read and measured nothing.
+  touches = 10000000_i64
+  started = __iyi_monotonic_ns
+  index = 0_i64
+  while index < touches
+    bump_plain
+    index = index + 1_i64
+  end
+  plain_ns = __iyi_monotonic_ns - started
+  started = __iyi_monotonic_ns
+  index = 0_i64
+  while index < touches
+    bump_thread_local
+    index = index + 1_i64
+  end
+  local_ns = __iyi_monotonic_ns - started
+  fail("the main thread's thread-local slot did not count") if Tls.slot != own_tid.to_u64 &+ touches.to_u64
+  puts "touch: plain class variable #{plain_ns * 100_i64 // touches} / 100 ns, thread-local #{local_ns * 100_i64 // touches} / 100 ns, over #{touches} read-modify-writes"
   puts "every property held"
 {% else %}
   puts "thread floor: measured on Linux x86_64 and aarch64 and on darwin aarch64; nothing to measure here"

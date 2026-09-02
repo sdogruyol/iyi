@@ -248,8 +248,16 @@ That last name is what a thread-local costs darwin. There is no
 local-exec on Mach-O: the compiler emits `adrp`/`add` to a 24-byte
 descriptor in `__thread_vars`, loads its thunk and calls it, and the
 thunk the linker wrote is `__tlv_bootstrap`, which dyld rebinds to its
-own `tlv_get_addr` at load. Every `@[ThreadLocal]` read on darwin is
-that call; on Linux it is one load. The block itself costs nothing:
+own `tlv_get_addr` at load. Every `@[ThreadLocal]` access on darwin is
+that call; on Linux it is one load. Measured, because the cutover puts
+the scheduler's current fiber behind it: the probe's release build
+does ten million read-modify-writes of a `@[ThreadLocal]` and of a
+plain class variable, each in its own `@[NoInline]` frame, and the
+thread-local costs 3.2 ns to the plain 2.0 — two thunk calls, one for
+the load and one for the store, at some 0.6 ns each, because dyld's
+fast path is a `tpidrro_el0` read and a table lookup. A call, but not
+a cost the cutover has to design around. The block itself costs
+nothing:
 dyld lays it out per thread from `__thread_data` on first touch,
 however the thread was made, so `Tls.make` has no darwin arm and the
 probe's proof is the assertion alone — every thread read the image's 7

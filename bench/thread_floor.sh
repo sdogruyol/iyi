@@ -21,9 +21,11 @@
 #      darwin, where III.9's rule is that every call is libSystem's: the
 #      exact list below, which is the runtime's names plus what a thread
 #      costs there, spelled out one by one.
-#   3. The pause, by thread count, printed from real runs. Reported rather
-#      than budgeted: a budget would be a number this script made up, and
-#      the shape (how it scales past the core count) is the finding.
+#   3. The pause, by thread count, printed from real runs, and what one
+#      touch of a `@[ThreadLocal]` costs against a plain class variable.
+#      Reported rather than budgeted: a budget would be a number this
+#      script made up, and the shape (how it scales past the core count)
+#      is the finding.
 #   4. The ran-its-loop assertion is reachable: a thread that counts into
 #      the wrong word exits 1 at that check's own name.
 #   5. The thread-local assertion is reachable. On Linux, `clone` without
@@ -141,6 +143,10 @@ for count in 1 4 8 16 64; do
   echo "  $count threads:"
   timeout 120 ./floor-release "$count" 200 | grep -E '^  (stop|resume)' | sed 's/^/  /'
 done
+# And what the cutover's spelling costs: one read-modify-write of a
+# `@[ThreadLocal]` against one of a plain class variable, in the release
+# build, printed for the same reason the pauses are.
+grep '^touch:' answers-release.txt | sed 's/^/  /'
 
 # ── 4. Failure proof: the ran-its-loop assertion is reachable ─────────────
 # A thread that counts into the wrong word looks alive to every earlier
