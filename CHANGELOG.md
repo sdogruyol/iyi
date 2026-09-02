@@ -269,8 +269,13 @@
   optimiser dropped the store, the chain was collected before `peak`
   was measured, and the scavenge check compared a heap that had
   already shrunk with itself — the same defect the sweep gate's 2 MiB
-  root had and fixed, on a step written after that fix. The exercise
-  reads both of its roots back now, which is what makes them roots.
+  root had and fixed, on a step written after that fix. Linux was not
+  spared the elision — the release IR for x86_64-linux-gnu carries no
+  trace of the global at all, on either target it is gone — and its
+  gate passed only because something on that machine still named a
+  node when the collect ran, which is the kind of pass a conservative
+  scan hands out and a gate must not rely on. The exercise reads both
+  of its roots back now, which is what makes them roots on either.
   `sweep_exercise.sh` and `defer_cost.sh` passed as they were. All six
   are steps in the darwin job beside the thread floor.
 
