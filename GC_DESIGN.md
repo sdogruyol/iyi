@@ -217,8 +217,75 @@ state with the shared arena list behind the atomics. Which is the other
 absence: the prelude has no atomic because nothing in it has had a
 second thread to race with; the probe's `lock xadd` and
 `ldaxr`/`stlxr` loop are what the mark word's CAS and every shared
-counter will be. darwin's thread is libSystem's `pthread_create` and
-`pthread_kill` by III.9's own rule, and its floor is that job's to read.
+counter will be.
+
+**darwin's thread is measured too, and it is the pthreads price by
+name.** III.9's rule there is the opposite of Linux's: raw syscalls are
+not a stable ABI and libSystem is the platform, so the same probe
+(`{% elsif flag?(:darwin) %}`, the same table, atomics, run and
+assertions) is `pthread_create`, `pthread_join`, `pthread_kill`,
+`pthread_threadid_np` for the tid both the thread and its parent can
+ask for, and `sigaction` with libSystem's sixteen-byte struct and
+libSystem's own trampoline for the handler's return. The park is where
+darwin differs in kind: there is no futex, and the `__ulock_wait`
+beneath libSystem's locks is private ABI, so a stopped thread parks on
+what libSystem exports. Three were measured. A mutex and condition are
+four names; one `os_unfair_lock` the main thread holds is two, but the
+kernel hands it waiter to waiter and the resume becomes a chain at some
+40 µs a link (177 µs mean for 4 threads, 415 µs for 8); one
+`os_unfair_lock` per thread, on its line, taken by the main thread
+before it signals and released by N unlocks issued back to back, is two
+names and resumes as fast as the broadcast. That is the probe's park,
+and the handler finds its own lock through a `@[ThreadLocal]`, which is
+what Stage 4's handler will do for the thread's state. `sched_yield`
+was measured and left out: it is a name, its own reschedule is 4 µs on
+the one-thread stop, and a `yield` hint in the main thread's spin costs
+neither. The floor is therefore held as an exact list by
+`bench/thread_floor.sh`: the runtime's twelve names, plus these eight
+— the five above, the two lock calls, and `__tlv_bootstrap`.
+
+That last name is what a thread-local costs darwin. There is no
+local-exec on Mach-O: the compiler emits `adrp`/`add` to a 24-byte
+descriptor in `__thread_vars`, loads its thunk and calls it, and the
+thunk the linker wrote is `__tlv_bootstrap`, which dyld rebinds to its
+own `tlv_get_addr` at load. Every `@[ThreadLocal]` read on darwin is
+that call; on Linux it is one load. The block itself costs nothing:
+dyld lays it out per thread from `__thread_data` on first touch,
+however the thread was made, so `Tls.make` has no darwin arm and the
+probe's proof is the assertion alone — every thread read the image's 7
+in its own copy and its own tid in its own slot for the whole run — and
+the driver's failure proof is to delete the annotation, after which the
+slots are one thread's class variables and the program names the clash
+on the first thread joined. One more name appears in a darwin
+`--release` binary and it is not the thread's: `bzero`, LLVM's spelling
+of the zeroing memset it makes of the arena's clearing loops on
+aarch64, present in a release `hello` too and unseen by
+`bench/dependency_floor.sh`, which builds plain. The thread floor's
+release list carries it, labelled.
+
+The numbers, release build, an M2 Pro (10 cores, 6 performance and 4
+efficiency), 200 rounds, threads spinning the whole time, read on the
+24 MHz counter because the prelude's CLOCK_MONOTONIC ticks in
+microseconds on darwin: stop 1 thread best 2.0 µs / mean 2.2 µs; 4
+threads 23 / 35 µs; 8 threads 54 / 100 µs with a 1.9 ms worst; 16
+threads best 90 µs but mean 0.95 ms and worst 15 ms; 64 threads best
+0.5 ms, mean 2.2 ms, worst 35–54 ms. Resume: 0.2 µs for 1 thread, 10 /
+45 µs for 4, 18 / 155 µs for 8 — and then 4 ms best and 20 ms mean for
+16, 13–44 ms best and 110 ms mean for 64. Two readings. The stop is the
+`pthread_kill` loop itself: timing the loop apart from the handlers'
+arrival gives 0.5 µs for one kill and 24, 83 and 612 µs for 4, 8 and
+16, so every kill after the first costs 6–7 µs in the call — delivery
+is serialised somewhere the sender waits on — where Linux's `tgkill`
+costs about one, and a darwin stop below the core count is linear in
+threads at that slope. Past the core count the resume, not the stop,
+is the timeslice: the released threads run and spin, and a thread the
+unlock woke has to wait for one of them to be descheduled, which on
+XNU's default 10 ms quantum is the 4 ms best and 20 ms mean 16 threads
+show — the same shape as Linux's oversubscribed stop, on the other
+half of the pause and at the larger quantum. The two decisions above
+stand on darwin with more force: marking workers and the mutator's M
+are bounded by the core count, or a resume is tens of milliseconds by
+construction.
 
 **Owner's Decision:** Own the garbage collector. Concurrency, parallelism, and performance control are the reasons. gcry is prior art: measurements, design hints, and a record of what has already been tried and cost what. iyi writes the heap, the STW mechanism, root discovery, and finalizers from scratch.
 

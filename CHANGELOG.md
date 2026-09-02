@@ -110,8 +110,7 @@
   arena are one thread's class variables; and no atomic in the prelude,
   so the probe's `lock xadd` and `ldaxr`/`stlxr` are what the mark
   word's CAS will be. GC_DESIGN.md carries the reading. darwin's thread
-  is libSystem's by III.9's rule and is that job's measurement, still to
-  be taken.
+  is libSystem's by III.9's rule and is measured in the entry below.
 
 - **Per-thread state has its mechanism, and it is the language's own
   `@[ThreadLocal]`, on the floor.** The thread floor's first run had no
@@ -144,6 +143,73 @@
   `spec/compiler/codegen/thread_local_spec.cr` and `class_var_spec.cr`
   pass, and the wasm32 cross-compile of a sample and of `--crystal`'s
   stdlib sample still compile to their objects.
+
+- **darwin's thread is measured, and its floor is the pthreads price by
+  name.** III.9's rule on darwin is the reverse of Linux's — raw
+  syscalls are not a stable ABI, libSystem is the platform — so
+  `bench/thread_floor.iyi` grew a `{% elsif flag?(:darwin) %}` arm that
+  runs the same table, atomics, run and assertions through libSystem,
+  and `bench/thread_floor.sh` now holds the darwin binary to an exact
+  symbol list and only libSystem on `otool -L`, with the same two
+  failure proofs, in the darwin CI job beside the dependency floor.
+  What a thread costs there, each name a dependency taken on and
+  recorded here: `pthread_create`, `pthread_join`, `pthread_kill`;
+  `pthread_threadid_np`, the 64-bit id asked once by the thread and
+  once by its parent of the handle, so the two views are compared the
+  way `gettid` and the tid word are on Linux; `sigaction`, libSystem's
+  sixteen-byte struct with `SA_SIGINFO` in the flags half of the
+  second word, and libSystem's own trampoline for the return, so there
+  is no sigreturn to write; `os_unfair_lock_lock` and
+  `os_unfair_lock_unlock`, the park; and `__tlv_bootstrap`, a
+  `@[ThreadLocal]`. Eight names over the runtime's twelve, none of
+  them in `bench/dependency_floor.sh`'s list, because no sample
+  spawns a thread and the list is a record of what samples cost. The
+  park was chosen by measurement, because darwin has no futex and the
+  `__ulock_wait` under libSystem's locks is private: a mutex and
+  condition (four names) resumed 4 threads in 39 µs mean and 8 in 89
+  µs; one shared `os_unfair_lock` (two names) resumed them in 177 and
+  415 µs, because the kernel hands the lock waiter to waiter, a
+  wakeup a link; one `os_unfair_lock` per thread on its own line,
+  released by N unlocks back to back, is two names and 28 and 107 µs,
+  and is what the probe keeps — the handler finds its lock through a
+  thread-local, as Stage 4's will find its thread. `sched_yield` in
+  the main thread's wait was measured and refused: a ninth name that
+  cost the one-thread stop its own 4 µs reschedule (6.1 µs mean
+  against 2.2) and bought nothing below the core count; above it the
+  yield halved the stop mean at 64 threads (1.1 ms against 2.2) and
+  left the resume at the same tens of milliseconds. A thread-local on
+  darwin arrives differently from Linux and it is the eighth name:
+  Mach-O has no local-exec, so a `@[ThreadLocal]` read is
+  `adrp`/`add` to a 24-byte descriptor in `__thread_vars`, a load of
+  its thunk and a `blr` — the thunk being `__tlv_bootstrap` from
+  libSystem, which dyld rebinds to its own `tlv_get_addr` at load
+  (`dyld_info -fixups` shows the bind) — and dyld lays every thread's
+  block out itself from `__thread_data` on first touch, so `Tls.make`
+  has no darwin arm and the isolation assertion is the whole proof:
+  every thread read the image's 7 in its own copy and its own tid in
+  its own slot, plain and release. The darwin failure proof deletes
+  the annotation, since there is no flag bit to drop, and the program
+  names the clash on the first thread joined. The numbers, release,
+  M2 Pro (10 cores), 200 rounds, spinning threads, on the 24 MHz
+  counter because the prelude's clock ticks in microseconds on darwin:
+  stop 1 thread 2.0 µs best / 2.2 mean; 4 threads 23 / 35 µs; 8
+  threads 54 / 100 µs; 16 threads 90 µs best, 0.95 ms mean, 15 ms
+  worst; 64 threads 0.5 ms best, 2.2 ms mean. Resume 0.2 µs for 1, 10
+  / 45 µs for 4, 18 / 155 µs for 8, then 4 ms best and 20 ms mean for
+  16 and 110 ms mean for 64. The stop is the `pthread_kill` loop: each
+  kill after the first costs 6–7 µs in the call itself (the loop alone
+  is 24, 83 and 612 µs for 4, 8 and 16) where Linux's `tgkill` is
+  about one. Past the core count the resume is XNU's 10 ms quantum,
+  the way the stop is Linux's timeslice, so the core-count bound on
+  marking workers and on M holds on darwin with more force. Two
+  things found on the way: `bzero` is in every darwin `--release`
+  binary, `hello` included — LLVM's spelling on aarch64 of the
+  zeroing memset it makes of the arena's clearing loops — and no gate
+  had seen it because `bench/dependency_floor.sh` builds plain; the
+  thread floor's release list carries it, labelled as the release
+  build's and not the thread's. And the probe's "best" sentinel was 0,
+  which a microsecond clock can measure; it is the first round now.
+  GC_DESIGN.md carries the reading.
 
 ### Fixed
 
