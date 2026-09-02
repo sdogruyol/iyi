@@ -203,15 +203,45 @@
   the way the stop is Linux's timeslice, so the core-count bound on
   marking workers and on M holds on darwin with more force. Two
   things found on the way: `bzero` is in every darwin `--release`
-  binary, `hello` included — LLVM's spelling on aarch64 of the
-  zeroing memset it makes of the arena's clearing loops — and no gate
-  had seen it because `bench/dependency_floor.sh` builds plain; the
-  thread floor's release list carries it, labelled as the release
-  build's and not the thread's. And the probe's "best" sentinel was 0,
+  binary, `hello` included — the aarch64 back end's lowering of a
+  memset it will not inline, and the compiler zeroes every
+  `Pointer.malloc` with one; a plain binary with a large constant one
+  names it too — and no gate had seen it because
+  `bench/dependency_floor.sh` builds plain; the thread floor's release
+  list carries it, labelled as the release build's and not the
+  thread's. And the probe's "best" sentinel was 0,
   which a microsecond clock can measure; it is the first round now.
   GC_DESIGN.md carries the reading.
 
 ### Fixed
+
+- **The collector's five gates and the defer cost now run in the darwin
+  job, and running them found what nobody had.** The owned collector
+  has been darwin's default allocator since the flip, and the darwin
+  job ran samples, III.4, III.1.4 and the floor — not
+  `bench/{arena,root,mark,sweep}_exercise.sh` or `collect_trigger.sh`,
+  which the samples job runs on Linux. Run on a Mac, four of the six
+  failed. Three were allowlists that predated the machine they were
+  read on: the arena, root and mark gates' darwin lists still carried
+  `malloc`, `memset` and `realloc` from before the flip — entries that
+  would have let a fall-back to libSystem's allocator pass — and had
+  never learned the names the poller (`kqueue`, `kevent`, `__error`,
+  `clock_gettime_nsec_np`) and root discovery (`pthread_self`,
+  `pthread_get_stackaddr_np`, the two `_dyld_get_image_*`) put on every
+  darwin program's line; each list is now the exact set the gate's
+  binary asks for, with a reason beside every name, `bzero` among the
+  root gate's because a 1.5 MiB `Pointer.malloc` there is zeroed by a
+  memset the aarch64 back end will not inline. The fourth was real:
+  `collect_trigger.iyi`'s release build on darwin panicked at
+  "scavenge: 6 arenas at the peak and none went back to the kernel",
+  because the spike's root sat in a global written and never read, the
+  optimiser dropped the store, the chain was collected before `peak`
+  was measured, and the scavenge check compared a heap that had
+  already shrunk with itself — the same defect the sweep gate's 2 MiB
+  root had and fixed, on a step written after that fix. The exercise
+  reads both of its roots back now, which is what makes them roots.
+  `sweep_exercise.sh` and `defer_cost.sh` passed as they were. All six
+  are steps in the darwin job beside the thread floor.
 
 - **`make -B iyi-tarball` packaged an unoptimised compiler past the guard
   that exists to refuse one.** `release := 1` is the goal's own variable

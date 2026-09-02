@@ -816,6 +816,28 @@ jobs:
       - name: The thread floor (III.9, GC_DESIGN.md Stage 4)
         run: bash bench/thread_floor.sh
 
+      # The collector's gates, which the collector's own darwin arm (the
+      # default allocator there since the flip) had never been held to in
+      # CI: the samples job runs all five on Linux, and nothing ran them
+      # here. Running them found what that costs — four gates whose darwin
+      # allowlists predated the poller and the collector, and a release
+      # build in which the trigger exercise's rooted spike was collected
+      # because its global was written and never read, so the scavenge
+      # measured nothing and no machine had noticed. The same defect the
+      # samples job's comment records, on the other platform.
+      - name: The collector holds, all five gates
+        run: |
+          bash bench/arena_exercise.sh
+          bash bench/root_exercise.sh
+          bash bench/mark_exercise.sh
+          bash bench/sweep_exercise.sh
+          bash bench/collect_trigger.sh
+
+      # Budgeted, unlike the pauses above: the budget is generous by design
+      # and a defer that blew it on a shared runner would be a finding.
+      - name: A defer costs nanoseconds, and stays priced
+        run: bash bench/defer_cost.sh
+
       - name: The language server session (III.8)
         run: python3 bench/lsp_session.py
 
