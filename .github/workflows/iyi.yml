@@ -731,8 +731,8 @@ jobs:
       # Crystal's compiler to bootstrap, coreutils for the gates' `timeout`,
       # pkgconf so `-Dgc_boehm` finds brew's bdw-gc (which already arrives
       # beside Crystal's compiler). brew's llvm is not asked for: the
-      # compiler this job ships links the static one built below, and the
-      # bootstrap Crystal brings whatever LLVM it needs for itself.
+      # compiler this job ships links the static one built below, and
+      # the Crystal bootstrap brings whatever LLVM it needs for itself.
       - name: Install the bootstrap toolchain
         run: |
           brew install crystal coreutils pkgconf
