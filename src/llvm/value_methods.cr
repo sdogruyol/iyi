@@ -51,6 +51,10 @@ module LLVM::ValueMethods
     LibLLVM.is_thread_local(self) != 0
   end
 
+  def thread_local_mode=(mode : ThreadLocalMode)
+    LibLLVM.set_thread_local_mode(self, mode)
+  end
+
   def linkage=(linkage)
     LibLLVM.set_linkage(self, linkage)
   end

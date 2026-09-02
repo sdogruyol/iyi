@@ -6,6 +6,18 @@ require "./codegen"
 # variable is read. There's an "initialized" flag too.
 
 class Iyi::CodeGenVisitor
+  # A `@[ThreadLocal]` class variable is local-exec, always: a program iyi
+  # links is an executable, never a shared object, so the offset from the
+  # thread pointer is a link-time constant and the access is one
+  # `%fs:`/`tpidr_el0` load. The general-dynamic default gets relaxed to
+  # the same instructions by the linker, but leaves `__tls_get_addr`
+  # undefined in the dynamic symbol table — a name on the link line the
+  # dependency floor (SPEC.md III.9) counts, for a call that is never
+  # made. bench/thread_floor.sh is where the difference is measured.
+  def declare_thread_local(global : LLVM::Value) : Nil
+    global.thread_local_mode = LLVM::ThreadLocalMode::LocalExec
+  end
+
   def declare_class_var(class_var : MetaTypeVar)
     global_name = class_var_global_name(class_var)
     global = @main_mod.globals[global_name]?
@@ -13,7 +25,7 @@ class Iyi::CodeGenVisitor
       main_llvm_type = @main_llvm_typer.llvm_type(class_var.type)
       global = @main_mod.globals.add(main_llvm_type, global_name)
       global.linkage = LLVM::Linkage::Internal if @single_module
-      global.thread_local = true if class_var.thread_local?
+      declare_thread_local(global) if class_var.thread_local?
       if !global.initializer && type.includes_type?(@program.nil_type)
         global.initializer = main_llvm_type.null
       end
@@ -30,7 +42,7 @@ class Iyi::CodeGenVisitor
       initialized_flag = @main_mod.globals.add(@main_llvm_context.int1, initialized_flag_name)
       initialized_flag.initializer = @main_llvm_context.int1.const_int(0)
       initialized_flag.linkage = LLVM::Linkage::Internal if @single_module
-      initialized_flag.thread_local = true if class_var.thread_local?
+      declare_thread_local(initialized_flag) if class_var.thread_local?
     end
     initialized_flag
   end
@@ -52,7 +64,7 @@ class Iyi::CodeGenVisitor
       global = @llvm_mod.globals[global_name]?
       unless global
         global = @llvm_mod.globals.add(llvm_type(class_var.type), global_name)
-        global.thread_local = true if class_var.thread_local?
+        declare_thread_local(global) if class_var.thread_local?
       end
     end
     global
@@ -64,7 +76,7 @@ class Iyi::CodeGenVisitor
       initialized_flag = @llvm_mod.globals[initialized_flag_name]?
       unless initialized_flag
         initialized_flag = @llvm_mod.globals.add(llvm_context.int1, initialized_flag_name)
-        initialized_flag.thread_local = true if class_var.thread_local?
+        declare_thread_local(initialized_flag) if class_var.thread_local?
       end
     end
     initialized_flag

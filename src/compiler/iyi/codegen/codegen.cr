@@ -1480,7 +1480,7 @@ module Iyi
 
         # Declare global in this module as external
         ptr = @llvm_mod.globals.add(llvm_type, name)
-        ptr.thread_local = true if thread_local
+        declare_thread_local(ptr) if thread_local
 
         if @llvm_mod == @main_mod
           ptr.initializer = initial_value || llvm_type.null
@@ -1493,7 +1493,7 @@ module Iyi
             main_llvm_type = @main_llvm_typer.llvm_type(type)
             main_ptr = @main_mod.globals.add(main_llvm_type, name)
             main_ptr.initializer = initial_value || main_llvm_type.null
-            main_ptr.thread_local = true if thread_local
+            declare_thread_local(main_ptr) if thread_local
           end
         end
       end

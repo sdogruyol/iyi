@@ -160,6 +160,7 @@ lib LibLLVM
   fun set_initializer = LLVMSetInitializer(global_var : ValueRef, constant_val : ValueRef)
   fun is_thread_local = LLVMIsThreadLocal(global_var : ValueRef) : Bool
   fun set_thread_local = LLVMSetThreadLocal(global_var : ValueRef, is_thread_local : Bool)
+  fun set_thread_local_mode = LLVMSetThreadLocalMode(global_var : ValueRef, mode : LLVM::ThreadLocalMode)
   fun is_global_constant = LLVMIsGlobalConstant(global_var : ValueRef) : Bool
   fun set_global_constant = LLVMSetGlobalConstant(global_var : ValueRef, is_constant : Bool)
   fun global_set_metadata = LLVMGlobalSetMetadata(global_var : ValueRef, kind : UInt, md : MetadataRef)

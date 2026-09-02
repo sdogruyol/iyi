@@ -214,6 +214,14 @@ module LLVM
     DLLExport
   end
 
+  enum ThreadLocalMode
+    NotThreadLocal
+    GeneralDynamic
+    LocalDynamic
+    InitialExec
+    LocalExec
+  end
+
   enum IntPredicate
     EQ  = 32
     NE
