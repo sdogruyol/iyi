@@ -452,7 +452,8 @@ jobs:
       # raw `clone`, a `tgkill` stop-the-world, a futex join, and the
       # assertion that none of it put a symbol on the link line. The pause
       # numbers are printed, not budgeted — a shared runner's clock is
-      # weather — and the aarch64 arm runs in cross-run.
+      # weather — the aarch64 arm runs in cross-run, and the darwin arm,
+      # libSystem's pthreads held as an exact list, in the darwin job.
       - name: The thread floor
         run: bash bench/thread_floor.sh
 
@@ -732,9 +733,10 @@ jobs:
   # the machine most developers sit in front of. The compiler is built here
   # rather than downloaded, because the artifact above is a Linux binary and
   # this job's whole point is the other platform. The gates are the same
-  # four a Linux push answers for: samples, III.4's exercise, III.1.4's
-  # panics and III.9's floor — the darwin floor being "libSystem and nothing
-  # else", which bench/dependency_floor.sh holds as an exact symbol list.
+  # ones a Linux push answers for: samples, III.4's exercise, III.1.4's
+  # panics, III.9's floor — the darwin floor being "libSystem and nothing
+  # else", which bench/dependency_floor.sh holds as an exact symbol list —
+  # and the thread floor, whose darwin arm is the pthreads price by name.
   # And darwin is a ship target too: the job packages the same relocatable
   # tarball the Linux `binary` job does and proves it the same way, because
   # the first darwin package shipped Crystal's library flattened into one
@@ -804,6 +806,15 @@ jobs:
 
       - name: The dependency floor (III.9)
         run: bash bench/dependency_floor.sh
+
+      # What a thread costs *this* floor, where every call is libSystem's:
+      # `pthread_create`, `pthread_kill`, `sigaction`, an `os_unfair_lock`
+      # to park on, and `__tlv_bootstrap` for a `@[ThreadLocal]` — held as
+      # the exact list, beside the runtime's twelve, with the pause printed
+      # by count. The Linux arm is the samples job's; the aarch64 Linux arm
+      # is cross-run's.
+      - name: The thread floor (III.9, GC_DESIGN.md Stage 4)
+        run: bash bench/thread_floor.sh
 
       - name: The language server session (III.8)
         run: python3 bench/lsp_session.py
