@@ -77,8 +77,12 @@ trap 'rm -rf "$WORK"' EXIT
 # `@[ThreadLocal]` pointer (concurrency.iyi, GC_DESIGN.md's thread cutover):
 # Mach-O has no local-exec, so every thread-local descriptor names dyld's
 # thunk, and every darwin program reaches the scheduler. Linux pays no name
-# for the same variable, which is the thread floor's finding.
-ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
+# for the same variable, which is the thread floor's finding. `pipe` and
+# `pthread_kill` joined with the runtime's kernel thread (thread.iyi, GC
+# Stage 4): every darwin program's collector can stop a thread — the stop
+# is `pthread_kill`, the park is a pipe — and the names are referenced
+# whether or not the program ever starts one; Linux's stop is syscalls.
+ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap pipe pthread_kill _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
 ALLOWED_SYMBOLS_LINUX="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
 
 # What a program may link. The platform libc only.

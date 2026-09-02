@@ -65,12 +65,46 @@
     end
   end
 
-  def build_list(length : Int32, seed : UInt64) : Node
+  # A list, and beside it a ledger of every node's address in a mapping
+  # of its own — not heap, so it roots nothing, which is the point: the
+  # free-flag check reads the sweep's word on each node through the
+  # ledger and never follows a link, because in the driver's failure
+  # proof a freed node's chunk may already be somebody's string, and
+  # following its link would read garbage instead of naming the fault.
+  class Ledger
+    @nodes : UInt64
+    @count : Int32
+
+    def initialize(count : Int32)
+      @count = count
+      @nodes = __iyi_mmap((count.to_u64 * 8_u64 + 4095_u64) & 0xFFFFFFFFFFFFF000_u64).address
+    end
+
+    def record(index : Int32, node : Node) : Nil
+      Pointer(UInt64).new(@nodes)[index] = node.object_id
+    end
+
+    # How many nodes the sweep has flagged free.
+    def freed : Int64
+      freed = 0_i64
+      index = 0
+      while index < @count
+        address = Pointer(UInt64).new(@nodes)[index]
+        freed = freed + 1_i64 if IyiHeap.read64(address - 8_u64) & IyiHeap::FREE_FLAG != 0
+        index = index + 1
+      end
+      freed
+    end
+  end
+
+  def build_list(length : Int32, seed : UInt64, ledger : Ledger) : Node
     head = Node.new(seed)
+    ledger.record(0, head)
     index = 1
     while index < length
       node = Node.new(seed &+ index.to_u64)
       node.next_node = head
+      ledger.record(index, node)
       head = node
       index = index + 1
     end
@@ -85,20 +119,6 @@
       node = node.next_node
     end
     sum
-  end
-
-  # The sweep's own word on every node: a live node on a free list is a
-  # node the collector freed out from under the thread. Checked before
-  # the checksum and answered at the first freed node, whose links the
-  # centre may have written over — a walk past it would read garbage
-  # instead of naming the fault.
-  def freed?(head : Node) : Bool
-    node = head
-    while node.is_a?(Node)
-      return true if IyiHeap.read64(node.object_id - 8_u64) & IyiHeap::FREE_FLAG != 0
-      node = node.next_node
-    end
-    false
   end
 
   def churn(count : Int32) : UInt64
@@ -118,7 +138,8 @@
   # and lets other threads' collections stop this one, the list checked
   # after each burst; then fibers of its own.
   def thread_body(seed : UInt64) : Nil
-    list = build_list(1000, seed)
+    ledger = Ledger.new(1000)
+    list = build_list(1000, seed, ledger)
     expected = checksum(list)
     # First, one collection nobody here triggers: the list built, this
     # thread counts in and spins allocating nothing while main collects
@@ -129,12 +150,14 @@
     Tally.ready.value.add(1_u64)
     while Tally.go.value.get == 0_u64
     end
-    fail("thread #{seed.to_i64}: a live node is on a free list after the collection that stopped this thread, so its frames were not scanned") if freed?(list)
+    freed = ledger.freed
+    fail("thread #{seed.to_i64}: #{freed} live nodes are on a free list after the collection that stopped this thread, so its frames were not scanned") if freed != 0_i64
     fail("thread #{seed.to_i64}: the live list's checksum changed under the collection that stopped this thread") if checksum(list) != expected
     burst = 0
     while burst < 20
       churn(20000)
-      fail("thread #{seed.to_i64}: a live node is on a free list, collected out from under the thread") if freed?(list)
+      freed = ledger.freed
+      fail("thread #{seed.to_i64}: #{freed} live nodes are on a free list, collected out from under the thread") if freed != 0_i64
       fail("thread #{seed.to_i64}: the live list's checksum changed under collection") if checksum(list) != expected
       burst = burst + 1
     end
@@ -147,12 +170,13 @@
     verdict = Channel(Int32).new
     group do |g|
       g.spawn do
-        keep = build_list(100, seed &+ 7000_u64)
+        kept = Ledger.new(100)
+        keep = build_list(100, seed &+ 7000_u64, kept)
         sum = checksum(keep)
         ready.send(1)
         release.receive
         bad = 0
-        bad = 1 if freed?(keep) || checksum(keep) != sum
+        bad = 1 if kept.freed != 0_i64 || checksum(keep) != sum
         verdict.send(bad)
         0
       end
@@ -193,7 +217,8 @@
   before = IyiMark.collections
   threads = start_threads(count)
   # The main thread churns beside them and holds a list of its own.
-  main_list = build_list(1000, 1_u64)
+  main_ledger = Ledger.new(1000)
+  main_list = build_list(1000, 1_u64, main_ledger)
   main_sum = checksum(main_list)
   # The one explicit collection, with every worker spinning on its list.
   while Tally.ready.value.get < count.to_u64
@@ -203,7 +228,7 @@
   burst = 0
   while burst < 20
     churn(20000)
-    fail("main: a live node is on a free list, collected out from under the main thread") if freed?(main_list)
+    fail("main: #{main_ledger.freed} live nodes are on a free list, collected out from under the main thread") if main_ledger.freed != 0_i64
     fail("main: the live list's checksum changed under collection") if checksum(main_list) != main_sum
     burst = burst + 1
   end
