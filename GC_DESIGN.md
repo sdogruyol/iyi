@@ -168,10 +168,24 @@ probe: `rt_sigaction` with the kernel's own four-word struct (a
 two-instruction `rt_sigreturn` restorer on x86_64, the vdso's on aarch64),
 `tgkill` to every thread, a handler that counts itself in, parks on a
 futex, and counts itself out on one wake. That is Stage 4's mechanism
-entire; what the collector adds between the two counts is reading the
-thread's registers from the `ucontext` the kernel hands the handler and
-scanning its stack from there — Stage 3's register capture, generalised
-to the thread that did not ask.
+entire, and the part between the two counts is in the probe now too:
+the handler reads the interrupted thread's sp and pc out of the
+`ucontext` — the kernel's on Linux, at 160/168 on x86_64 and 432/440
+on aarch64 past the 128-byte sigmask; libSystem's on darwin, through
+the mcontext pointer at 48 to sp at 264 and pc at 272 — and asserts
+the sp is on that thread's own stack, because a context that is not
+the thread's would scan the wrong stack and root nothing; the driver's
+third failure proof moves one offset by a word and every handler says
+so. Stage 3's register capture, generalised to the thread that did
+not ask. The handler also records how far below the interrupted sp it
+ran, and that number is a design input: 5.7 KB on x86_64 Linux and 4.7
+KB on aarch64 Linux (the kernel's frame carries the vector state), 1.2
+KB on darwin. A signal lands on whatever stack the thread is on, and a
+scheduler thread is on a fiber's 256 KiB mapping most of the time, so
+Stage 4 either keeps 8 KB above every fiber stack's guard page spare
+for the frame or gives each scheduler thread a `sigaltstack` — one
+more name on darwin, a syscall on Linux — and the number says the
+first is affordable.
 
 The numbers, release build, 20 cores, 200 rounds, threads spinning the
 whole time (the case a stop has to handle; a parked thread is the easy
@@ -196,7 +210,9 @@ variables today, one thread's globals. The second run answered where
 per-thread state can live, and it is the language's own
 `@[ThreadLocal]`, on the floor. The compiler now emits such a variable
 local-exec outright — one `%fs:`-relative or `tpidr_el0`-relative load at
-a link-time offset — because a program iyi links is always an
+a link-time offset, inside the `noinline` address accessor the compiler
+keeps for every thread-local so a fiber that changes threads never
+reads a cached address — because a program iyi links is always an
 executable; the general-dynamic default was relaxed to the same
 instructions by the linker but left `__tls_get_addr` undefined in the
 dynamic symbol table, a name the floor counts for a call never made,
@@ -249,15 +265,22 @@ local-exec on Mach-O: the compiler emits `adrp`/`add` to a 24-byte
 descriptor in `__thread_vars`, loads its thunk and calls it, and the
 thunk the linker wrote is `__tlv_bootstrap`, which dyld rebinds to its
 own `tlv_get_addr` at load. Every `@[ThreadLocal]` access on darwin is
-that call; on Linux it is one load. Measured, because the cutover puts
-the scheduler's current fiber behind it: the probe's release build
-does ten million read-modify-writes of a `@[ThreadLocal]` and of a
-plain class variable, each in its own `@[NoInline]` frame, and the
-thread-local costs 3.2 ns to the plain 2.0 — two thunk calls, one for
-the load and one for the store, at some 0.6 ns each, because dyld's
-fast path is a `tpidrro_el0` read and a table lookup. A call, but not
-a cost the cutover has to design around. The block itself costs
-nothing:
+that call. And on Linux it is a call too, which the IR says and the
+earlier "one load" did not: the compiler wraps every thread-local
+class variable's address in a `noinline` function (`*Tls::slot` in the
+release IR of both targets), on purpose — a fiber can move between
+threads, so the address must never be cached across a context switch
+— and the local-exec load lives inside it. Measured, because the
+cutover puts the scheduler's current fiber behind it: the probe's
+release build does ten million read-modify-writes of a
+`@[ThreadLocal]` and of a plain class variable, each in its own
+`@[NoInline]` frame, and the thread-local costs 3.2 ns to the plain
+2.0 on darwin (two accessor calls, one for the load and one for the
+store, each a thunk call inside, dyld's fast path being a
+`tpidrro_el0` read and a table lookup) and 4.7 to 3.0 on aarch64 Linux
+in a container. The price is the accessor call, not the platform; a
+call, but not a cost the cutover has to design around. The block
+itself costs nothing:
 dyld lays it out per thread from `__thread_data` on first touch,
 however the thread was made, so `Tls.make` has no darwin arm and the
 probe's proof is the assertion alone — every thread read the image's 7

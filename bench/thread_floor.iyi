@@ -76,6 +76,9 @@
   #   +24  the seed the thread found in its thread-local block
   #   +32  set if the thread ever saw another thread's value in its slot
   #   +40  darwin only: the thread's park word, an `os_unfair_lock`
+  #   +48  where the thread's stack is: on Linux the mapping's base, on
+  #        darwin the address of a local in the thread's first frame
+  #   +56  the most bytes a stop handler ran below the interrupted sp
   class Threads
     LINE = 64_u64
     @@table : UInt64 = 0_u64
@@ -85,15 +88,18 @@
     @@suspended : UInt64 = 0_u64
     @@resume : UInt64 = 0_u64
     @@resumed : UInt64 = 0_u64
+    # Handlers that read a context whose sp was not their thread's stack.
+    @@astray : UInt64 = 0_u64
 
     def self.setup(count : Int64) : Nil
       @@count = count
       @@table = __iyi_mmap(LINE * count.to_u64).address
-      shared = __iyi_mmap(LINE * 4_u64).address
+      shared = __iyi_mmap(LINE * 5_u64).address
       @@stop = shared
       @@suspended = shared + LINE
       @@resume = shared + LINE * 2_u64
       @@resumed = shared + LINE * 3_u64
+      @@astray = shared + LINE * 4_u64
     end
 
     def self.count : Int64
@@ -118,6 +124,29 @@
 
     def self.resumed : UInt64
       @@resumed
+    end
+
+    def self.astray : UInt64
+      @@astray
+    end
+
+    # What Stage 4's handler does between counting itself in and parking:
+    # read the interrupted thread's registers out of the context the kernel
+    # handed it. Here the two that root a stack scan, sp and pc, read at
+    # the platform's offsets by the caller; the stack pointer has to be on
+    # this thread's own stack (a context that is not the thread's would
+    # scan the wrong stack and root nothing), and the handler's own depth
+    # below that sp — the kernel's frame, the trampoline, this frame — is
+    # recorded, because it is what a fiber stack has to have spare for a
+    # signal to land on it, or a thread needs a `sigaltstack`.
+    def self.held(sp : UInt64, pc : UInt64, here : UInt64) : Nil
+      line = Tls.line
+      if sp == 0_u64 || pc == 0_u64 || !stack_holds(line, sp)
+        __tf_add(@@astray, 1_u64)
+        return
+      end
+      depth = sp &- here
+      __tf_store(line + 56_u64, depth) if depth > __tf_load(line + 56_u64)
     end
 
     # A thread's whole life after it has found its own tid, the same on
@@ -157,6 +186,10 @@
       # return: SA_RESTORER must name one, and it is the two-instruction
       # `rt_sigreturn` below.
       TF_SA_FLAGS = 0x04000004_u64
+      # The kernel's ucontext: uc_flags, uc_link, a 24-byte uc_stack, then
+      # sigcontext at 40 with rsp as its 16th word and rip its 17th.
+      TF_UC_SP = 160_u64
+      TF_UC_PC = 168_u64
     {% else %}
       TF_SYS_CLONE        = 220_i64
       TF_SYS_EXIT         =  93_i64
@@ -169,6 +202,11 @@
       # aarch64's kernel supplies the sigreturn trampoline from the vdso when
       # SA_RESTORER is absent; SA_SIGINFO alone.
       TF_SA_FLAGS = 0x00000004_u64
+      # The kernel's ucontext: uc_flags, uc_link, uc_stack, then a sigmask
+      # padded to 128 bytes and sigcontext 16-aligned at 176, whose sp
+      # follows fault_address and 31 registers.
+      TF_UC_SP = 432_u64
+      TF_UC_PC = 440_u64
     {% end %}
 
     # CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
@@ -252,7 +290,9 @@
     #
     # A `@[ThreadLocal]` class variable is one load at a link-time offset from
     # the thread pointer (local-exec, which the compiler now asks for
-    # outright). The main thread's block was laid out by the loader; a thread
+    # outright), inside the `noinline` accessor the compiler keeps for every
+    # thread-local so a fiber that changes threads never reads a cached
+    # address. The main thread's block was laid out by the loader; a thread
     # made by raw `clone` gets one laid out here, the way a static libc's
     # startup lays out its own: find PT_TLS by walking the program headers
     # from `__ehdr_start`, copy the initialised image, leave the rest zero,
@@ -282,6 +322,9 @@
       # in the zeroed remainder: a thread that reads 7 here read its copy.
       @[ThreadLocal]
       @@seed : UInt64 = 7_u64
+      # The thread's own line, which is how its stop handler finds it.
+      @[ThreadLocal]
+      @@line : UInt64 = 0_u64
 
       # The segment, read once: biased image address, filesz, memsz, align.
       @@image : UInt64 = 0_u64
@@ -303,6 +346,14 @@
 
       def self.seed=(value : UInt64) : Nil
         @@seed = value
+      end
+
+      def self.line : UInt64
+        @@line
+      end
+
+      def self.line=(value : UInt64) : Nil
+        @@line = value
       end
 
       def self.memsz : UInt64
@@ -373,6 +424,7 @@
 
     fun __tf_thread_main(line : UInt64) : Nil
       tid = __iyi_conc_syscall3(TF_SYS_GETTID, 0_i64, 0_i64, 0_i64)
+      Tls.line = line
       Threads.body(line, tid.to_u64)
     end
 
@@ -398,6 +450,7 @@
     def start_thread(index : Int64) : Nil
       line = Threads.line(index)
       stack = __iyi_mmap(TF_STACK_BYTES).address
+      __tf_store(line + 48_u64, stack)
       result = __tf_clone(stack + TF_STACK_BYTES, __tf_thread_main_address, line, line, Tls.make)
       fail("clone failed: #{result}") if result < 0
     end
@@ -430,8 +483,18 @@
     # the two counts is read the thread's registers from the ucontext the
     # kernel passes as the third argument, and scan its stack from the
     # saved stack pointer up.
+    # The stack is the mapping `start_thread` made, and its base is on the
+    # line.
+    def stack_holds(line : UInt64, sp : UInt64) : Bool
+      base = __tf_load(line + 48_u64)
+      sp >= base && sp < base + TF_STACK_BYTES
+    end
+
     fun __tf_stop_handler(signal : Int32, info : Void*, context : Void*) : Nil
       __tf_add(Threads.suspended, 1_u64)
+      here = uninitialized UInt64
+      Threads.held(Pointer(UInt64).new(context.address + TF_UC_SP).value,
+        Pointer(UInt64).new(context.address + TF_UC_PC).value, pointerof(here).address)
       while __tf_load(Threads.resume) == 0_u64
         __iyi_conc_syscall6(TF_SYS_FUTEX, Threads.resume.to_i64, TF_FUTEX_WAIT, 0_i64, 0_i64, 0_i64, 0_i64)
       end
@@ -540,6 +603,10 @@
       "every thread exited and its tid word was cleared by the kernel"
     end
 
+    def describe_context : String
+      "the kernel's ucontext"
+    end
+
     def describe_thread_local : String
       "#{Tls.memsz.to_i64}-byte PT_TLS laid out per thread; every slot stayed its owner's"
     end
@@ -596,6 +663,13 @@
     # The thread's park word, an `os_unfair_lock` (OS_UNFAIR_LOCK_INIT is
     # zero), on its own line at this offset.
     TF_PARK = 40_u64
+    # libSystem's ucontext: uc_onstack and a 32-bit sigmask, a 24-byte
+    # uc_stack, uc_link, uc_mcsize, then at 48 a pointer to the mcontext,
+    # whose 16-byte exception state precedes the thread state — x0..x28,
+    # fp, lr, sp at 264, pc at 272.
+    TF_UC_MCONTEXT = 48_u64
+    TF_MC_SP = 264_u64
+    TF_MC_PC = 272_u64
 
     # ── Thread-local storage, dyld's ────────────────────────────────────────
     #
@@ -660,6 +734,10 @@
       id = uninitialized UInt64
       LibC.pthread_threadid_np(Pointer(Void).new(0_u64), pointerof(id))
       Tls.line = argument.address
+      # Where this thread's stack is, without asking libSystem for its
+      # bounds: the address of this frame's local, below which the spin
+      # loop's frames sit.
+      __tf_store(argument.address + 48_u64, pointerof(id).address)
       Threads.body(argument.address, id)
       Pointer(Void).new(0_u64)
     end
@@ -823,8 +901,20 @@
         Pointer(Void).new(line + TF_PARK)
       end
 
+      # The interrupted sp is at most a few frames below the first frame's
+      # local, and 64 KiB is well inside the 512 KiB a pthread's stack is,
+      # so a neighbour's stack cannot pass.
+      def stack_holds(line : UInt64, sp : UInt64) : Bool
+        reference = __tf_load(line + 48_u64)
+        sp <= reference && reference &- sp < 65536_u64
+      end
+
       fun __tf_stop_handler(signal : Int32, info : Void*, context : Void*) : Nil
         __tf_add(Threads.suspended, 1_u64)
+        here = uninitialized UInt64
+        mcontext = Pointer(UInt64).new(context.address + TF_UC_MCONTEXT).value
+        Threads.held(Pointer(UInt64).new(mcontext + TF_MC_SP).value,
+          Pointer(UInt64).new(mcontext + TF_MC_PC).value, pointerof(here).address)
         LibC.os_unfair_lock_lock(park_word(Tls.line))
         LibC.os_unfair_lock_unlock(park_word(Tls.line))
         __tf_add(Threads.resumed, 1_u64)
@@ -895,6 +985,10 @@
 
     def describe_join : String
       "every thread exited and was joined by pthread_join"
+    end
+
+    def describe_context : String
+      "libSystem's ucontext"
     end
 
     def describe_thread_local : String
@@ -1000,6 +1094,22 @@
     index = index + 1_i64
   end
   puts "joined: #{describe_join}"
+  {% if !flag?(:tf_mach) %}
+    # Every handler read a context whose sp was its own thread's stack, and
+    # the deepest any handler ran below the interrupted sp is the budget a
+    # fiber stack must keep spare for a signal, or the case for a
+    # `sigaltstack`.
+    fail("#{__tf_load(Threads.astray).to_i64} handlers read a context whose sp was not their thread's stack") if __tf_load(Threads.astray) != 0_u64
+    deepest = 0_u64
+    index = 0_i64
+    while index < count
+      depth = __tf_load(Threads.line(index) + 56_u64)
+      deepest = depth if depth > deepest
+      index = index + 1_i64
+    end
+    fail("no handler recorded its depth") if deepest == 0_u64
+    puts "held: every handler read its thread's sp and pc from #{describe_context}, sp on that thread's stack; a handler runs #{deepest.to_i64} bytes below the interrupted sp"
+  {% end %}
   fail("the main thread's thread-local slot was overwritten") if Tls.slot != own_tid.to_u64
   puts "thread-local: #{describe_thread_local}"
 

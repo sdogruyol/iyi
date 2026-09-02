@@ -6,15 +6,16 @@
 #
 #     bash bench/thread_floor.sh
 #
-# Five steps, and the last two are failure proofs, because a gate that
+# Six steps, and the last three are failure proofs, because a gate that
 # cannot fail is not a gate:
 #
 #   1. The program holds every property, plain and --release (and on darwin
 #      the -Dtf_mach stop, release): N threads,
 #      each with a tid of its own and a thread-local block of its own;
-#      every one stopped where it ran by a signal and a handler, released
-#      by one wake; every one joined; every `@[ThreadLocal]` slot still its
-#      owner's at the end.
+#      every one stopped where it ran by a signal and a handler that read
+#      the thread's sp and pc out of the context and found the sp on that
+#      thread's stack, released by one wake; every one joined; every
+#      `@[ThreadLocal]` slot still its owner's at the end.
 #   2. The binary keeps the floor. This is the measurement the file exists
 #      for, and it is asserted, not printed. On Linux: the runtime's five
 #      C-template names and nothing else — a thread by raw `clone` adds no
@@ -35,6 +36,9 @@
 #      `@[ThreadLocal]` annotation itself is dropped instead: the slots
 #      become one thread's class variables and clash. Either way the
 #      program exits 1 naming the thread-local that was not.
+#   6. The held-context assertion is reachable: the context's sp read at
+#      the pc's offset is not on any thread's stack, and the program exits
+#      1 counting the handlers that read it.
 #
 # Linux x86_64 and aarch64, darwin aarch64.
 set -u
@@ -221,6 +225,21 @@ fi
 timeout 60 ./shared 2 10 > shared.txt 2>&1
 if [ $? -ne 1 ] || ! grep -q "thread-local" shared.txt; then
   echo "the thread-local check did not fire:"; cat shared.txt; exit 1
+fi
+
+# ── 6. Failure proof: the held-context assertion is reachable ─────────────
+# One offset moved by a word, so the handler reads pc where it expects sp:
+# a code address is on no thread's stack, and every handler says so.
+step "failure proof: a handler reading the wrong register is refused"
+sed -e 's/TF_UC_SP = 160_u64/TF_UC_SP = 168_u64/' -e 's/TF_UC_SP = 432_u64/TF_UC_SP = 440_u64/' \
+    -e 's/TF_MC_SP = 264_u64/TF_MC_SP = 272_u64/' "$REPO/bench/thread_floor.iyi" > astray.iyi
+cmp -s astray.iyi "$REPO/bench/thread_floor.iyi" && { echo "the sed found nothing to change"; exit 1; }
+if ! "$IYI" build astray.iyi -o astray > build-astray.log 2>&1; then
+  cat build-astray.log; exit 1
+fi
+timeout 60 ./astray 2 10 > astray.txt 2>&1
+if [ $? -ne 1 ] || ! grep -q "was not their thread's stack" astray.txt; then
+  echo "the held-context check did not fire:"; cat astray.txt; exit 1
 fi
 
 echo "workdir $WORK"

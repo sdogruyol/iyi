@@ -118,8 +118,10 @@
   scheduler, the poller and the arena are one thread's class variables.
   The second run answers it. A `@[ThreadLocal]` class variable is now
   emitted local-exec outright — one `%fs:`-relative or
-  `tpidr_el0`-relative load at a link-time offset — because a program
-  iyi links is always an executable, never a shared object. The
+  `tpidr_el0`-relative load at a link-time offset, inside the
+  `noinline` accessor the compiler keeps for every thread-local (so a
+  fiber that changes threads never reads a cached address) — because a
+  program iyi links is always an executable, never a shared object. The
   general-dynamic default was relaxed to the same instructions by the
   linker but left `__tls_get_addr@GLIBC_2.3` undefined in the dynamic
   symbol table: a name on the link line the dependency floor counts,
@@ -143,6 +145,28 @@
   `spec/compiler/codegen/thread_local_spec.cr` and `class_var_spec.cr`
   pass, and the wasm32 cross-compile of a sample and of `--crystal`'s
   stdlib sample still compile to their objects.
+
+- **The stop handler reads the held thread's registers, and measures
+  its own depth.** The probe's handler used to count itself in and park;
+  the part between, which is the collector's, is in it now: the
+  interrupted thread's sp and pc read out of the `ucontext` — the
+  kernel's on Linux (160/168 on x86_64; 432/440 on aarch64, past the
+  128-byte sigmask), libSystem's on darwin (the mcontext pointer at 48,
+  sp at 264, pc at 272) — with the assertion that the sp is on that
+  thread's own stack, the Linux mapping's bounds or a first-frame local
+  on darwin, because a context that is not the thread's would scan the
+  wrong stack and root nothing. The driver's third failure proof moves
+  one offset by a word, so the handler reads pc as sp, and every handler
+  says so. Proven on all three arms, the Linux two on real kernels in
+  containers on Apple silicon (arm64 natively, x86_64 under Rosetta).
+  The handler also records how far below the interrupted sp it ran —
+  the kernel's frame, the trampoline and its own — and the number is
+  Stage 4's next design input: 5.7 KB on x86_64 Linux, 4.7 KB on
+  aarch64 Linux, 1.2 KB on darwin. A signal lands on whatever stack the
+  thread is on, and a scheduler thread is on a fiber's 256 KiB mapping
+  most of the time, so Stage 4 keeps that much spare above every fiber
+  stack's guard page or gives each scheduler thread a `sigaltstack`;
+  GC_DESIGN.md carries the reading.
 
 - **darwin's thread is measured, and its floor is the pthreads price by
   name.** III.9's rule on darwin is the reverse of Linux's — raw
@@ -212,10 +236,16 @@
   thread's. The price of the spelling is measured too: ten million
   read-modify-writes of a `@[ThreadLocal]` against a plain class
   variable, release build, each in its own `@[NoInline]` frame, cost
-  3.2 ns to 2.0 on darwin — two thunk calls at some 0.6 ns each, since
-  dyld's fast path is a `tpidrro_el0` read and a table lookup — so the
-  cutover's thread-local scheduler state is a call on darwin but not a
-  cost; the driver prints the line beside the pauses. The other darwin
+  3.2 ns to 2.0 on darwin and 4.7 to 3.0 on aarch64 Linux in a
+  container — two accessor calls, one for the load and one for the
+  store: the IR of both targets shows the compiler wrapping every
+  thread-local's address in a `noinline` function so a fiber that
+  changes threads never reads a cached address, and on darwin the
+  thunk call sits inside it, dyld's fast path being a `tpidrro_el0`
+  read and a table lookup — so the price is the accessor, not the
+  platform, and the cutover's thread-local scheduler state is a call
+  everywhere but not a cost; the driver prints the line beside the
+  pauses. The other darwin
   stop was measured and refused: Mach's `thread_suspend` on the port
   `pthread_mach_thread_np` answers, which returns held, and
   `thread_get_state` for the registers — Boehm's darwin mechanism, no
