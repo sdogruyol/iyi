@@ -292,6 +292,22 @@
 
 ### Fixed
 
+- **The thread floor's x86_64 store clobbered its own value, and the
+  release build handed `clone` a stack of 0.** `__tf_store` was the
+  `xchg` idiom for a sequentially consistent store with its value
+  register declared an input; `xchg` writes that register back with what
+  the memory held. The plain build reloaded every value from the stack
+  and never noticed; the release build kept the thread's stack base live
+  in the register across the store of it into the table, got 0 back, and
+  the child's first instruction faulted at 0x3fff0 — a segfault with no
+  line, in the samples job, on the commit that added the held-context
+  read and happened to be the first to reuse a stored value. Found by
+  building the release for x86_64-linux-gnu and running it under Rosetta
+  in a container with a SIGSEGV handler that prints rip, rsp and the
+  faulting address out of the same ucontext offsets the probe measures.
+  The store is `mov` and `mfence` now. `__tf_add`'s `lock xadd` was
+  already right: its register is tied to the output.
+
 - **A darwin binary clears its own memory: `bzero` is the prelude's.**
   Every darwin `--release` binary — `hello` included — and any plain one
   with a large constant `Pointer.malloc` asked libSystem for `bzero`,

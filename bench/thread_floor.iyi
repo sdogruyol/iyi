@@ -57,9 +57,17 @@
     value
   end
 
+  # A sequentially consistent store. x86_64 spells it as a plain store and
+  # a fence, not the `xchg` idiom it had: `xchg` writes the value register
+  # back with what the memory held, and the asm declared that register an
+  # input, so the optimiser was entitled to keep the value live in it — and
+  # in the release build it did, with the thread's stack base, which came
+  # back as 0 and was handed to `clone`. The plain build reloaded the value
+  # from the stack and never noticed.
   fun __tf_store(address : UInt64, value : UInt64) : Nil
     {% if flag?(:x86_64) %}
-      asm("xchgq $0, ($1)" :: "r"(value), "r"(address) : "memory" : "volatile")
+      asm("movq $0, ($1)
+           mfence" :: "r"(value), "r"(address) : "memory" : "volatile")
     {% else %}
       asm("stlr $0, [$1]" :: "r"(value), "r"(address) : "memory" : "volatile")
     {% end %}
