@@ -408,6 +408,68 @@
   still one class variable every `take` adds to; it becomes a
   per-cache count when the thread that would race it exists.
 
+- **The runtime has a kernel thread, and the collector stops it: Stage 4,
+  built.** `IyiThread.start { }` (`src/iyi/thread.iyi`, SPEC.md III.4.11)
+  is the thread floor's mechanism moved into the prelude — raw `clone`
+  onto a guarded mapping with a TLS block laid out from PT_TLS on Linux,
+  `pthread_create` on darwin, the futex on the tid word or `pthread_join`
+  to join — and it costs the Linux floor no name. A thread gets a
+  scheduler state and a heap cache on first touch, spawns fibers and
+  allocates without a lock, and is not a task: nothing owns or cancels
+  it, no channel crosses it, `Atomic(T)` does, and `Share` — whose
+  reason for waiting was that no second thread existed — is the next
+  piece owed. A collection takes the runtime's one lock, signals every
+  other thread, and the handler copies the interrupted registers from
+  the ucontext onto the thread's line and parks (futex; a pipe per
+  thread on darwin); the collector scans each stopped thread's spill
+  and its stack from the recorded sp to the top of the mapping holding
+  it, the thread's own or a fiber's. A thread inside `IyiHeap.take` or
+  spinning for the lock is asked rather than parked and parks itself
+  where it holds nothing, which is Go's "no preemption inside mallocgc"
+  reached from the deadlock it prevents; `SA_RESTART` restarts what a
+  stop interrupts. A thread's last act returns its cache to the centre.
+
+  Three things the first eight threads found, and their fixes. The
+  trigger's count is the centre's atomic now, folded per cache every 64
+  KiB, and the decision to collect is made again under the lock so the
+  second of two threads crossing the budget together does not sweep the
+  heap the first just swept. A refill that took the centre's whole list
+  let one thread hoard every freed chunk while seven carved, and the
+  heap and every sweep grew with it: the centre keeps a class's chunks
+  as the sweep's own per-arena batches and a refill takes one. And a
+  budget floored at a MiB met eight allocating threads as 4,000
+  collections a second, each a stop of eight and a sweep of eleven
+  arenas, 300 µs where one thread's was 15 — the budget is floored at
+  half of what the sweep walked, which bounds a collection's cost per
+  byte allocated whatever the threads carved; the single-thread gates
+  keep their arithmetic exactly, and eight threads went from 634 ns an
+  allocation to 239. Two entry points that were `fun`s put 12 KB of
+  thread runtime into every binary, `hello` included, because a `fun`
+  is emitted whether or not it is called; they are closure-free procs
+  whose first word is the function, and `hello` is back to its size.
+
+  `bench/thread_exercise.sh` is the gate, in the samples job, the
+  darwin job and the aarch64 cross-run: eight threads allocating from
+  their own caches while collections run from whichever crosses the
+  budget, a live list in each thread's frames alone surviving them by
+  checksum and by the sweep's free flag — after one explicit collection
+  with every worker spinning on its list, and after twenty bursts of
+  churn — fibers on threads with a parked one holding an object's only
+  reference, 32 threads past the core count, the floor's five names,
+  and the failure proof: the thread-root walk removed from a copy of
+  the prelude, and the spinning threads' lists are swept out from under
+  them, exit 1 by name. Forty runs at eight threads, plain and release,
+  none hung and none failed. The price, release, 20 cores: 76 ns an
+  allocation with one thread, 162 with four, 268 with eight — wall time
+  per allocation per thread with every pause included, and the pause is
+  every thread standing still for a sweep one thread runs, which is what
+  Stages 7 and 8 exist to change. The stop half is the floor's number:
+  22 µs for seven threads, 7% of a pause. The signal frame runs on
+  whatever stack the thread is on, a fiber's included; the probe's 5.7
+  KB is what a fiber must have spare above its guard, and a `sigaltstack`
+  per thread is the answer built when a program's fiber is ever that
+  deep. Every existing gate holds over the threaded runtime.
+
 ### Fixed
 
 - **The thread floor's x86_64 store clobbered its own value, and the
@@ -3224,7 +3286,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 6,031-line library and nothing else. Every other
+  written against iyi's own 7,078-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

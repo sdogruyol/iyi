@@ -121,7 +121,7 @@ prove_fails() {
 # The pressure report removed from the hot path: nothing ever triggers, and
 # the churn's check names the leak.
 prove_fails "nothing triggers" notrigger "trigger:" \
-  '{ sub(/IyiMark\.pressure\(size\)/, "# removed"); print }'
+  '{ sub(/IyiMark\.pressure\(slice\)/, "# removed"); print }'
 
 # The budget pinned at the floor: the live set stops mattering, and the same
 # churn buys the same collections either way.

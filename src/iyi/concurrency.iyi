@@ -567,13 +567,16 @@ class IyiScheduler
   EVENTS = 16_i64
 
   # This thread's state, made on first touch and linked for the roots
-  # before the thread-local names it.
+  # before the thread-local names it. The push is under the runtime lock:
+  # two threads' first touches would otherwise race for the list's head.
   def self.state : IyiSchedulerState
     state = @@state
     return state if state.is_a?(IyiSchedulerState)
     state = IyiSchedulerState.new
+    IyiRuntimeLock.lock
     state.next_state = @@states_head
     @@states_head = state
+    IyiRuntimeLock.unlock
     @@state = state
     state
   end
@@ -582,11 +585,18 @@ class IyiScheduler
     @@states_head
   end
 
+  # The running fiber, made on first touch on every thread: the thread's
+  # own stack, wearing the thread's top where the main thread's wears 0
+  # (the base `IyiRoots` found), so a walk from a parked main fiber's
+  # saved sp stops at the right mapping's end.
   def self.current : IyiFiber
     state = self.state
     fiber = state.current
     return fiber if fiber.is_a?(IyiFiber)
     main = IyiFiber.main
+    {% if !flag?(:gc_none) && !flag?(:gc_boehm) %}
+      main.stack_top = IyiThread.current_stack_top
+    {% end %}
     state.current = main
     register(main)
     main
@@ -598,16 +608,32 @@ class IyiScheduler
   # scheduler cannot see, and a joiner hangs off the fiber it waits on.
   # One list that only grows is exact by construction, and a done fiber
   # is skipped by state rather than unlinked — its stack is never reused
-  # anyway (state 6's own rule above).
+  # anyway (state 6's own rule above). Under the runtime lock, for the
+  # reason the states are.
   @@all_head : IyiFiber?
 
   def self.register(fiber : IyiFiber) : Nil
+    IyiRuntimeLock.lock
     fiber.next_fiber = @@all_head
     @@all_head = fiber
+    IyiRuntimeLock.unlock
   end
 
   def self.first_fiber : IyiFiber?
     @@all_head
+  end
+
+  # The top of the fiber stack holding `address`, 0 when no fiber's
+  # does: how a stopped thread's stack is bounded when the stop landed
+  # on one of its fibers.
+  def self.fiber_top_holding(address : UInt64) : UInt64
+    fiber = @@all_head
+    while fiber.is_a?(IyiFiber)
+      top = fiber.stack_top
+      return top if top != 0 && address < top && address >= top - IyiFiber::STACK_BYTES
+      fiber = fiber.next_fiber
+    end
+    0_u64
   end
 
   # The running fiber's stack top, 0 when it is the main fiber (or no

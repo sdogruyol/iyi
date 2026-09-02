@@ -41,7 +41,37 @@ require "./atomic"
 # raw syscalls.
 {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
   require "./concurrency"
+  # A kernel thread, and the stop-the-world over them (GC_DESIGN.md Stage
+  # 4); the file itself says which builds get one.
+  require "./thread"
 {% end %}
+
+# The runtime's one lock: what the allocator's centre, the scheduler's
+# registries and the thread list are behind, and what a collection takes
+# before it stops anything, so no stopped thread can be holding it. A spin
+# on one `compare_and_set` — uncontended it is one instruction, and one
+# thread never contends. A spinner holds nothing, so where threads exist
+# the spin is also where a thread asked to stop for a collection parks.
+class IyiRuntimeLock
+  @@word : UInt64 = 0_u64
+
+  def self.word : Pointer(Atomic(UInt64))
+    Pointer(Atomic(UInt64)).new(pointerof(@@word).address)
+  end
+
+  def self.lock : Nil
+    word = self.word
+    while !word.value.compare_and_set(0_u64, 1_u64)[1]
+      {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+        IyiThread.park_if_requested
+      {% end %}
+    end
+  end
+
+  def self.unlock : Nil
+    word.value.set(0_u64)
+  end
+end
 
 {% if flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
   # iyi: On Linux, libc is not bound at all. The dependency floor (SPEC.md
@@ -783,8 +813,18 @@ require "./file"
       # check, and a held lock defers the park to the release, which is
       # Go's "no preemption inside mallocgc". One thread never contends,
       # and the lock is one uncontended `compare_and_set` per refill.
-      CACHE_NEXT = 272_u64
-      CENTRAL_LOCK = 272_u64
+      # The cache page past its two tables: the link, the pressure slice
+      # (bytes this cache allocated since it last told the trigger), and
+      # the two words the stop reads and writes — set while the thread is
+      # inside `take`, and the request a handler leaves when it finds it
+      # there. The centre's page past its table: the allocated-since count
+      # every cache folds its slice into, an atomic, and the trigger's.
+      CACHE_NEXT    = 272_u64
+      CACHE_SLICE   = 280_u64
+      CACHE_INSIDE  = 288_u64
+      CACHE_REQUEST = 296_u64
+      SLICE         = 65536_u64
+      CENTRAL_ALLOCATED = 272_u64
 
       @[ThreadLocal]
       @@cache : UInt64 = 0_u64
@@ -824,6 +864,71 @@ require "./file"
         read64(page + CACHE_NEXT)
       end
 
+      # A thread's last act with the heap: its cache's lists go to the
+      # centre as batches, its fill arenas are let go (they stay on the
+      # heap's list and are the scavenge's from now on, no longer anyone's
+      # warm cushion), the page leaves the caches list, and the thread
+      # allocates nothing after. A cache left behind pinned an arena per
+      # class forever and cost every later sweep a walk of it.
+      def self.retire_cache : Nil
+        page = @@cache
+        return if page == 0
+        table = Pointer(UInt64).new(page)
+        lock
+        index = 0
+        while index < FILL
+          head = table[index]
+          if head != 0
+            tail = head
+            while read64(tail) != 0
+              tail = read64(tail)
+            end
+            free_batch(index, head, tail)
+            table[index] = 0_u64
+          end
+          table[FILL + index] = 0_u64
+          index = index + 1
+        end
+        previous = 0_u64
+        cursor = @@caches
+        while cursor != 0
+          following = read64(cursor + CACHE_NEXT)
+          if cursor == page
+            if previous == 0
+              @@caches = following
+            else
+              write64(previous + CACHE_NEXT, following)
+            end
+            break
+          end
+          previous = cursor
+          cursor = following
+        end
+        unlock
+        @@cache = 0_u64
+        __iyi_munmap(page, DIR_LEN)
+      end
+
+      # The stop's view of this thread, read from a signal handler: a
+      # thread with no cache yet has never been inside the allocator.
+      def self.in_allocator? : Bool
+        page = @@cache
+        page != 0 && read64(page + CACHE_INSIDE) != 0
+      end
+
+      def self.request_stop : Nil
+        write64(@@cache + CACHE_REQUEST, 1_u64)
+      end
+
+      def self.stop_requested? : Bool
+        page = @@cache
+        page != 0 && read64(page + CACHE_REQUEST) != 0
+      end
+
+      def self.clear_request : Nil
+        write64(@@cache + CACHE_REQUEST, 0_u64)
+      end
+
       def self.central : Pointer(UInt64)
         if @@central == 0
           @@central = __iyi_mmap(DIR_LEN).address
@@ -831,18 +936,16 @@ require "./file"
         Pointer(UInt64).new(@@central)
       end
 
-      def self.lock_word : Pointer(Atomic(UInt64))
-        Pointer(Atomic(UInt64)).new(central.address + CENTRAL_LOCK)
+      def self.allocated_word : Pointer(Atomic(UInt64))
+        Pointer(Atomic(UInt64)).new(central.address + CENTRAL_ALLOCATED)
       end
 
       def self.lock : Nil
-        word = lock_word
-        while !word.value.compare_and_set(0_u64, 1_u64)[1]
-        end
+        IyiRuntimeLock.lock
       end
 
       def self.unlock : Nil
-        lock_word.value.set(0_u64)
+        IyiRuntimeLock.unlock
       end
 
       def self.class_index(size : UInt64) : Int32
@@ -871,14 +974,37 @@ require "./file"
         Pointer(Void).new(take(size, false) + HEADER)
       end
 
+      # The one funnel. The cache page's INSIDE word is set for the whole
+      # of it, so a stop that lands in here is deferred to the exit rather
+      # than taken between reading a list's head and popping it, and the
+      # exit is where a deferred stop is paid. The pressure report is a
+      # slice: this cache's bytes since it last told the trigger, folded
+      # into the centre's atomic count every SLICE bytes, so a thread's
+      # allocations cost no shared write until then.
       def self.take(size : UInt64, clear : Bool) : UInt64
-        # The pressure report, before the carve: a collection triggered here
-        # cannot sweep the object about to be born, because it does not
-        # exist yet, and everything already born is reachable or fair game.
-        IyiMark.pressure(size)
+        table = cache
+        write64(table.address + CACHE_INSIDE, 1_u64)
+        slice = read64(table.address + CACHE_SLICE) + size
+        if slice >= SLICE
+          write64(table.address + CACHE_SLICE, 0_u64)
+          # Before the carve: a collection triggered here cannot sweep the
+          # object about to be born, because it does not exist yet, and
+          # everything already born is reachable or fair game.
+          IyiMark.pressure(slice)
+        else
+          write64(table.address + CACHE_SLICE, slice)
+        end
+        head = take_inside(table, size, clear)
+        write64(table.address + CACHE_INSIDE, 0_u64)
+        {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+          IyiThread.park_if_requested if read64(table.address + CACHE_REQUEST) != 0
+        {% end %}
+        head
+      end
+
+      def self.take_inside(table : Pointer(UInt64), size : UInt64, clear : Bool) : UInt64
         return take_large(size, clear) if size > TOP
         index = class_index(size)
-        table = cache
         head = table[index]
         head = refill(table, index) if head == 0
         if head != 0
@@ -899,15 +1025,15 @@ require "./file"
         head
       end
 
-      # The cache's list for this class is empty: take the centre's whole
-      # list for it, under the lock. Answers the new head, 0 if the centre
-      # had nothing either.
+      # The cache's list for this class is empty: take the centre's top
+      # batch for it, under the lock — one arena's sweep, `free_batch`
+      # says why one. Answers the new head, 0 if the centre had nothing.
       def self.refill(table : Pointer(UInt64), index : Int32) : UInt64
         centre = central
         return 0_u64 if centre[index] == 0
         lock
         head = centre[index]
-        centre[index] = 0_u64
+        centre[index] = read64(head + BATCH_NEXT) if head != 0
         unlock
         table[index] = head
         head
@@ -970,25 +1096,38 @@ require "./file"
           write64(head, table[index])
           table[index] = head
         else
+          lock
           free_large(head)
+          unlock
         end
       end
 
       # An arena's worth of swept chunks, already flagged and linked head to
-      # tail by the sweep, spliced onto the centre's list for the class
-      # under one take of the lock.
+      # tail by the sweep, pushed onto the centre as one batch: the centre
+      # keeps a class's chunks as a stack of batches, each one arena's
+      # sweep, chained through the first payload words of each batch's head
+      # (a free chunk's payload is nobody's; the cache overwrites them when
+      # it hands the head out). A refill takes one batch, which is how the
+      # centre is shared rather than hoarded — the whole-list refill let
+      # one of eight threads take every chunk and the other seven carve,
+      # and the heap and every sweep grew with it. The sweep runs under
+      # the collector's own take of the lock, with every other thread
+      # stopped, so nothing here takes it again.
+      BATCH_NEXT = 24_u64
+      BATCH_TAIL = 32_u64
+
       def self.free_batch(index : Int32, head : UInt64, tail : UInt64) : Nil
         centre = central
-        lock
-        write64(tail, centre[index])
+        write64(head + BATCH_NEXT, centre[index])
+        write64(head + BATCH_TAIL, tail)
         centre[index] = head
-        unlock
       end
 
+      # Under the lock, whoever holds it: `free` takes it for a mutator's
+      # large chunk, the sweep already has it.
       def self.free_large(head : UInt64) : Nil
         base = head - 16
         previous = 0_u64
-        lock
         node = @@large
         while node != 0
           if node == base
@@ -1002,13 +1141,12 @@ require "./file"
           previous = node
           node = read64(node)
         end
-        unlock
         __iyi_munmap(base, read64(base + 8))
       end
 
       # Every chunk of `[low, high)` off one free list, whose head is at
-      # `slot`.
-      def self.strip_list(slot : Pointer(UInt64), low : UInt64, high : UInt64) : Nil
+      # `slot`. Answers the list's last node, 0 when nothing is left.
+      def self.strip_list(slot : Pointer(UInt64), low : UInt64, high : UInt64) : UInt64
         node = slot.value
         leader = 0_u64
         while node != 0
@@ -1024,6 +1162,31 @@ require "./file"
           end
           node = upcoming
         end
+        leader
+      end
+
+      # The same over the centre's stack of batches for one class: every
+      # batch stripped as a list, an emptied one dropped, and a batch whose
+      # head went re-headed, because its chain and tail words rode on the
+      # head that is about to be unmapped.
+      def self.strip_centre(index : Int32, low : UInt64, high : UInt64) : Nil
+        centre = central
+        batch = centre[index]
+        rebuilt = 0_u64
+        while batch != 0
+          following = read64(batch + BATCH_NEXT)
+          slot = uninitialized UInt64
+          slot = batch
+          tail = strip_list(pointerof(slot), low, high)
+          head = slot
+          if head != 0
+            write64(head + BATCH_NEXT, rebuilt)
+            write64(head + BATCH_TAIL, tail)
+            rebuilt = head
+          end
+          batch = following
+        end
+        centre[index] = rebuilt
       end
 
       # Hand one empty arena's mapping back to the kernel — the sweep's
@@ -1047,7 +1210,7 @@ require "./file"
         end
         low = arena
         high = arena + read64(arena + OFF_MAP)
-        strip_list(central + index.to_i64, low, high)
+        strip_centre(index, low, high)
         page = @@caches
         while page != 0
           strip_list(Pointer(UInt64).new(page) + index.to_i64, low, high)
@@ -1699,17 +1862,28 @@ require "./file"
         end
       end
 
-      # The running stack. Its high end is the thread's own base unless a
-      # spawned fiber is executing, in which case it is that fiber's mmap'd
-      # top — scanning up to the thread base from a fiber stack would walk
-      # the unmapped gap between the two mappings and fault.
+      # The running stack. Its high end is the thread's own top — the main
+      # thread's base, or a started thread's own mapping — unless a spawned
+      # fiber is executing, in which case it is that fiber's mmap'd top:
+      # scanning up to the thread base from a fiber stack would walk the
+      # unmapped gap between the two mappings and fault.
       def self.each_stack_root(visit : Proc(UInt64, Nil)) : Nil
-        top = stack_base
+        top = 0_u64
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
-          fiber_top = IyiScheduler.current_stack_top
-          top = fiber_top if fiber_top != 0
+          top = IyiScheduler.current_stack_top
+          top = IyiThread.current_stack_top if top == 0
         {% end %}
+        top = stack_base if top == 0
         scan_range(stack_pointer, top, visit)
+      end
+
+      # Every other thread's registers and stack, each stopped where it
+      # was by the collection that asks (thread.iyi); on one thread, an
+      # empty walk.
+      def self.each_thread_root(visit : Proc(UInt64, Nil)) : Nil
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          IyiThread.each_stopped_root(visit)
+        {% end %}
       end
 
       # Every suspended fiber's stack, from its saved stack pointer to its
@@ -1757,6 +1931,7 @@ require "./file"
         spill_registers
         each_register_root(visit)
         each_stack_root(visit)
+        each_thread_root(visit)
         each_fiber_root(visit)
         each_global_root(visit)
       end
@@ -1826,6 +2001,9 @@ require "./file"
       @@kept : UInt64 = 0_u64
       @@bytes_freed : UInt64 = 0_u64
       @@bytes_kept : UInt64 = 0_u64
+      # What the sweep walked: every carved byte of every arena, live or
+      # not, which is what a sweep costs and what the budget is floored by.
+      @@bytes_walked : UInt64 = 0_u64
       @@collections : UInt64 = 0_u64
       @@arenas_released : UInt64 = 0_u64
       @@pause_last : UInt64 = 0_u64
@@ -2057,6 +2235,7 @@ require "./file"
         @@kept = 0_u64
         @@bytes_freed = 0_u64
         @@bytes_kept = 0_u64
+        @@bytes_walked = 0_u64
 
         # The arena walk keeps a trailing pointer, because a sweep that
         # finds an arena with no live chunk hands the whole mapping back to
@@ -2078,6 +2257,7 @@ require "./file"
           batch_tail = 0_u64
           cursor = arena + IyiHeap::HEAD
           stop = IyiHeap.arena_cursor(arena)
+          @@bytes_walked = @@bytes_walked + (stop - cursor)
           while cursor < stop
             base = cursor + IyiHeap::HEADER
             unless IyiRoots.free_listed?(cursor, chunk)
@@ -2113,7 +2293,7 @@ require "./file"
           if colour(base) == WHITE
             @@bytes_freed = @@bytes_freed + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
             @@swept = @@swept + 1_u64
-            IyiHeap.free(Pointer(Void).new(base))
+            IyiHeap.free_large(node + 16_u64)
           else
             @@bytes_kept = @@bytes_kept + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
             recolour(base, WHITE)
@@ -2145,7 +2325,6 @@ require "./file"
       # its own memory until it turns it back on.
       MIN_BUDGET = 1048576_u64
 
-      @@allocated_since : UInt64 = 0_u64
       @@budget : UInt64 = 0_u64
       @@collecting : Bool = false
       @@auto : Bool = true
@@ -2154,28 +2333,68 @@ require "./file"
         @@auto = value
       end
 
+      # Bytes allocated since the last collection: the centre's atomic
+      # word, which every cache folds a slice into (`IyiHeap.take`).
+      def self.allocated_since : UInt64
+        IyiHeap.allocated_word.value.get
+      end
+
+      # A slice of one cache's allocation arrives; the collection it may
+      # trigger is decided twice — here on the count as seen, and again
+      # under the lock, because two threads can cross the budget in the
+      # same instant and the second must not collect a heap the first just
+      # swept.
       def self.pressure(size : UInt64) : Nil
+        total = IyiHeap.allocated_word.value.add(size) + size
         return if @@collecting
-        @@allocated_since = @@allocated_since + size
         return unless @@auto
-        budget = @@budget
-        budget = MIN_BUDGET if budget == 0
-        return if @@allocated_since < budget
+        return if total < budget
+        collect_if_due
+      end
+
+      def self.collect_if_due : Nil
+        IyiRuntimeLock.lock
+        if allocated_since < budget
+          IyiRuntimeLock.unlock
+          return
+        end
         @@collecting = true
-        collect
+        collect_locked
         @@collecting = false
+        IyiRuntimeLock.unlock
       end
 
       # One collection: decide, reclaim, and set the next budget. Explicit
       # calls reset the pressure clock too — a collection is a collection,
-      # whoever asked for it.
+      # whoever asked for it. The lock is taken before anything stops, so
+      # no stopped thread holds it (thread.iyi says why that matters), and
+      # released after every stopped thread has counted itself out.
       def self.collect : Nil
+        IyiRuntimeLock.lock
+        collect_locked
+        IyiRuntimeLock.unlock
+      end
+
+      def self.collect_locked : Nil
         started = now_ns
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          others = IyiThread.stop_others
+        {% end %}
         mark
         sweep
-        @@allocated_since = 0_u64
+        IyiHeap.allocated_word.value.set(0_u64)
+        # The next budget: twice what survived, and never less than half
+        # of what the sweep walked, so a collection costs a bounded amount
+        # per byte allocated however many arenas the threads carved —
+        # eight threads' caches took the heap to eleven arenas and the
+        # sweep to 300 µs at a budget of a MiB, twenty times one thread's.
         doubled = @@bytes_kept * 2_u64
+        half_walked = @@bytes_walked.unsafe_div(2_u64)
+        doubled = half_walked if half_walked > doubled
         @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          IyiThread.resume_others(others)
+        {% end %}
         pause = now_ns - started
         @@pause_last = pause
         @@pause_max = pause if pause > @@pause_max

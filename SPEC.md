@@ -63,7 +63,7 @@ own reference accepts.
 | warm full build, `hello` / 6,900-line pair | 0.07 s / 0.24 s, against `go build`'s 0.08 s / 0.09 s |
 | front end, `hello.iyi` | **0.036 s** against the 0.050 s target: MET |
 | starting the compiler and doing nothing | 0.018 s of that |
-| iyi's own prelude | 6,031 lines, ceiling 3,734 |
+| iyi's own prelude | 7,078 lines, ceiling 3,734 |
 | compiler | 84,068 lines, none of it written in iyi |
 | artifact format | `.iyimod` v19, checksum per section |
 | samples | 9, of which 5 rebuild from artifacts with their modules' source deleted |
@@ -88,7 +88,7 @@ shape.
 > is a library and the rules are the language, so a program can keep one and
 > change the other: `--crystal` builds against Crystal's standard library, and
 > there `require` reaches the ecosystem while every rule stays where it was.
-> "No standard library worth the name" is still true of iyi's own 6,031 lines
+> "No standard library worth the name" is still true of iyi's own 7,078 lines
 > and no longer true of what a program can have. Part V item 12a is the
 > measurement, nine shards wide.
 
@@ -270,7 +270,7 @@ of binary. It is not made the default on that trade, and the middle needs the
 initialisers to run *later* rather than not at all, which is the `dlsym` table
 above, and a larger piece of work than the number it wins.
 
-**3. A deliberately tiny prelude, written in iyi. Done: 6,031 lines,
+**3. A deliberately tiny prelude, written in iyi. Done: 7,078 lines,
 primitives included.** Not a standard library: integers, booleans, a string,
 one sequence, one dictionary, one range, `puts`. **Its scope is set by what the
 samples call and by nothing else**. A method enters the prelude because an
@@ -792,7 +792,7 @@ Checking it moved two things and left the shape alone.
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
 | Compiler | 24,984 lines, **written in Crystal** | 102,863 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 6,031-line own prelude + 777 in samples |
+| Library | 8,161 lines (3,551 of it core) | 7,078-line own prelude + 777 in samples |
 | Specs | 21,146 lines | 9,064 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
@@ -2158,7 +2158,7 @@ hook, and the prelude's own definition of it is untouched. Compile-time
 `responds_to?` works unchanged, which the error message is entitled to claim
 because it is tested.
 
-### III.4 Concurrency: **BUILT on Linux in III.4.8's order — scheduler, cancellable primitives, `group`, `Channel` (rendezvous), `select`, the typed group (III.4.9), `Atomic(T)` (III.4.10); `Share` still open**
+### III.4 Concurrency: **BUILT on Linux in III.4.8's order — scheduler, cancellable primitives, `group`, `Channel` (rendezvous), `select`, the typed group (III.4.9), `Atomic(T)` (III.4.10), a kernel thread the collector stops (III.4.11); `Share` is next**
 
 This is the section where the design either beats Go or does not, so it is worth
 being blunt about where Go actually loses. Not goroutines: they are cheap, the
@@ -2495,9 +2495,11 @@ same commit that caused them, which is that script's own rule for how a
 dependency is taken on.
 
 What is *not* built, said here rather than left to be found: `Share` gates
-nothing yet, and deliberately — one thread interleaves only at parks and
-cannot race, so the marker would refuse nothing testable until a second
-thread exists (the shape this document has refused three times now);
+nothing yet — deliberately, when this was written, because one thread
+interleaves only at parks and cannot race; III.4.11 ended that, a second
+thread exists, and `Share` is the next piece owed (the shape this
+document has refused three times now is a mechanism with no caller, and
+it has one);
 the rendezvous channel and `select` are both in — `Channel(T).new` parks a
 sender carrying its value in its queue node's box, an emptied box is the
 delivery receipt, a park is named by a nonce so a node a cancellation left
@@ -2677,11 +2679,66 @@ sit on a holder of their own, `IyiAtomic`, the way Crystal's sit on
 as its type's name — which the probe never noticed because it prints
 through `to_i64`; noted here rather than fixed, by the prelude's own rule.
 
-`Share` is still not built, and this section does not change III.4.8's
-reason: one thread interleaves only at parks. What it changes is the list
-of types `Share` will trust rather than check. `Atomic(T)` is the first
-synchronised type in the prelude, shareable by construction, and it joins
-`Mutex(T)` and `List(T)` on that list before either of those exists.
+`Share` was still not built when this was written, and the reason was
+III.4.8's: one thread interleaves only at parks. III.4.11 removed the
+reason. What this section changed is the list of types `Share` will
+trust rather than check: `Atomic(T)` is the first synchronised type in
+the prelude, shareable by construction, and it joins `Mutex(T)` and
+`List(T)` on that list before either of those exists.
+
+#### III.4.11 A kernel thread: **BUILT — `IyiThread`, not a task, and the collector stops it**
+
+The second thread exists. `IyiThread.start { }` is a kernel thread in
+the runtime (`src/iyi/thread.iyi`): raw `clone` onto a mapping of its own
+with a guard page and a TLS block laid out from the executable's PT_TLS
+on Linux, `pthread_create` on darwin, `join` the futex on the tid word
+the kernel clears or `pthread_join`. It costs the Linux floor no name and
+the darwin floor exactly the thread floor's list, which
+`bench/thread_exercise.sh` reads off the binary. A thread gets a
+scheduler state and a heap cache on first touch — III.4's scheduler and
+the collector's allocator were cut over to per-thread state in the two
+entries before this one — so it spawns fibers of its own and allocates
+without a lock.
+
+**It is not a task, and saying so is the design.** No group owns it,
+nothing cancels it, no channel crosses it: `Channel` is one thread's,
+the scheduler's queues are one thread's, and a value handed from one
+thread to another is a data race the type system does not yet refuse.
+What crosses threads today is `Atomic(T)` and memory the program keeps
+straight itself. This is exactly the condition III.4.4 and III.4.8 named
+for `Share`: the marker refused nothing testable until a second thread
+existed, and one does — `Share`'s obligation is due, and it is the next
+piece of III.4, gating `IyiThread.start`'s block and, when a thread-safe
+channel exists, its sends. A thread is not offered as a spelling for
+concurrency; `group` is. It is offered because the collector's parallel
+stages (GC_DESIGN.md 7 and 8) and a scheduler with M threads need one,
+and because a program that wants a core for itself has never had a way
+to ask.
+
+**The collector stops it, which is GC_DESIGN.md's Stage 4, built.** A
+collection takes the runtime's one lock before anything else, signals
+every other registered thread, and waits for each to count itself in;
+the handler copies the interrupted registers from the ucontext onto the
+thread's line, records sp and pc, parks, and the collector scans the
+spill and the stack from that sp to the top of whichever mapping holds
+it. A thread inside the allocator or spinning for the lock is not
+parked where it stands but asked, and parks itself where it holds
+nothing — the rule Go states as "no preemption inside mallocgc", reached
+here from the deadlock it prevents. GC_DESIGN.md carries what the build
+found: the trigger's count made atomic and decided twice, the centre's
+free chunks handed out in the sweep's own per-arena batches so one
+thread cannot hoard, and a budget floored at half of what the sweep
+walked so eight threads do not turn a MiB budget into four thousand
+stops a second. The gate holds eight threads with live lists in their
+frames alone through collections triggered from any of them — by
+checksum and by the sweep's own free flag, after an explicit collection
+with every worker spinning and after twenty bursts of churn — fibers on
+threads, 32 threads past the core count, the floor, and a failure proof
+that removes the thread-root walk and sweeps a spinning thread's list by
+name. The price, release, 20 cores: 76 ns an allocation with one thread,
+162 with four, 268 with eight, every pause included — every thread
+standing still for a sweep one thread runs, which is what Stages 7 and 8
+are for.
 
 ### III.5 Module initialisation: **PROPOSED; rules 1, 2 and 4 BUILT**
 
@@ -7833,7 +7890,7 @@ Named honestly, so nobody mistakes this draft for complete.
     shards exist and none of them is written to iyi's rules, so "run them
     directly" is not a compatibility problem, it is the four rules: `require`
     against R-1, inference against R-2, monkey patching against R-3, and
-    Crystal's 8,161-line standard library against iyi's own 6,031-line prelude.
+    Crystal's 8,161-line standard library against iyi's own 7,078-line prelude.
 
     What is measurable is narrower and better than that framing suggests, and
     it was measured on **Kemal 1.12.0**, which compiles under this compiler

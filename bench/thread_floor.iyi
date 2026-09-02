@@ -1,6 +1,8 @@
-# What a kernel thread costs the dependency floor, measured before any
-# design that needs one is written (GC_DESIGN.md: Stages 4, 7, 8 and 9
-# wait on threads; SPEC.md III.4.7: `Share` waits on a caller). The
+# What a kernel thread costs the dependency floor, measured before the
+# design that needed one was written — and it is written now:
+# `src/iyi/thread.iyi` is this mechanism in the runtime (GC_DESIGN.md
+# Stage 4; SPEC.md III.4.11), and this probe stays the floor's
+# measurement of it, arm by arm, cost by cost. The
 # question III.9 asks is exact — a scheduler that reached for pthreads
 # would put libc back on the link line — so on Linux this program reaches
 # for the kernel instead: `clone` onto a stack of its own mapping, `futex`

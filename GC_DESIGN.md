@@ -1,11 +1,12 @@
 # iyi Garbage Collector Design
 
-**Status:** Stages 1, 2, 3, 5 and 6 built, and **the collector is the
+**Status:** Stages 1, 2, 3, 4, 5 and 6 built, and **the collector is the
 default allocator on POSIX**: a plain build allocates from the arena,
 collects under its own allocation-pressure trigger, and hands memory back.
 The flip followed the measurement below. `-Dgc_none` opts out to the bump
-pointer, `-Dgc_boehm` to libgc. Stage 4 is mostly vacuous, Stages 7 to 9
-wait on threads, and Stage 10 is design.
+pointer, `-Dgc_boehm` to libgc. Stage 4 is the stop-the-world over kernel
+threads the runtime now has (`src/iyi/thread.iyi`, the section below);
+Stages 7 to 9 have threads to run on now, and Stage 10 is design.
 
 Stage 6: the sweep. One walk over every carved chunk, a white object's chunk
 goes back on its class's free list, a black one survives and is repainted white
@@ -137,15 +138,21 @@ What that does to the stages, restated against the tree as it is:
   it both ways: an address held only on a suspended fiber's stack is
   found, and a prelude with the fiber walk removed exits 1 at that
   check's own name.
-* **Stage 4's thread suspension** still has nothing to suspend: fibers yield
-  cooperatively at suspension points and never inside the marker, so a
-  single-threaded collection needs no stopping. Register capture, the part
-  that was real with one thread, moved into Stage 3 where it is tested.
+* **Stage 4's thread suspension is built**, because there are threads to
+  suspend: `IyiThread.start` is a kernel thread in the runtime, a
+  collection takes the runtime lock and stops every other thread by
+  signal, each stopped thread's registers and stack are roots, and
+  `bench/thread_exercise.sh` holds it — the section "Threads in the
+  runtime, and the stop" below is the account. Register capture, the
+  part that was real with one thread, had moved into Stage 3; the
+  stopped threads' capture is the same spill, written by the handler.
 * **Stages 7 and 8**, parallel marking and concurrent sweeping, are the
-  reason the owner chose to own a collector, and they still wait on threads,
-  not on fibers. The mark word is already CAS-safe and the header already
-  reserves its bits, so the wait costs a redesign of nothing.
-* **Stage 9** is conditional on measuring Stage 7, so it inherits the same wait.
+  reason the owner chose to own a collector, and they wait on nothing
+  now: the threads exist, the mark word is CAS-safe on the prelude's own
+  `Atomic`, and the header already reserves its bits. The thread
+  exercise's price table is their case — eight threads idle through
+  every pause a single thread sweeps.
+* **Stage 9** is conditional on measuring Stage 7.
 
 This is worth stating plainly rather than leaving the plan to read as ten
 achievable steps: the collector can reach a working single-fiber
@@ -290,6 +297,80 @@ compiler's `atomicrmw`/`cmpxchg` rather than asm, and no name on the
 floor. The mark word's CAS is `compare_and_set` on a `UInt64`, and every
 shared counter is an `add`; what Stage 7 measures decides whether a
 weaker verb is ever added.
+
+**Threads in the runtime, and the stop — Stage 4, built.** The probe's
+mechanism is `src/iyi/thread.iyi` now: `IyiThread.start { }` is a
+kernel thread — raw `clone` onto a mapping of its own with a guard
+page and a TLS block laid out from PT_TLS on Linux, `pthread_create`
+on darwin — and `join` is the futex on the tid word the kernel clears,
+or `pthread_join`. A thread gets a scheduler state and a heap cache on
+first touch, so it spawns fibers and allocates without a lock, and it
+is not a task: no group owns it, nothing cancels it, no channel
+crosses it, and what crosses threads today is `Atomic(T)` — which is
+`Share`'s obligation, now with a second thread to refuse things for.
+
+A collection takes the runtime lock first, so no thread it stops can
+be holding it; then signals every other registered thread and waits
+for each to count itself in. The handler copies the interrupted
+general registers out of the ucontext onto the thread's line, records
+sp and pc, and parks — futex on Linux, a pipe per thread on darwin —
+and the collector scans each stopped thread's spill and its stack from
+that sp to the top of whichever mapping holds it, the thread's own or
+a fiber's, found by asking every fiber. Two threads are not parked
+where they stand, and both are the Go rule this document reached from
+the allocator's side: one inside `IyiHeap.take` — between reading a
+cache list's head and popping it, a stop would leave a chunk claimed
+by nobody the sweep could then unmap — finds the handler leaving a
+request on its cache page and parks itself on the way out, spilling
+its own callee-saved registers; and one spinning for the runtime lock
+parks inside the spin, where it holds nothing. `SA_RESTART` restarts
+the syscalls a stop interrupts, and the poller already read EINTR as
+a wakeup with no news. A thread's last act returns its cache to the
+centre, lets its fill arenas go, and leaves the list a stop walks;
+the stop that began before it left waited for it.
+
+What the build found, and what it decided. The trigger's count moved
+off the class variable onto the centre's atomic, folded per cache
+every 64 KiB, and the decision to collect is made twice — on the count
+as seen, and again under the lock, because two threads cross the
+budget in the same instant and the second must not collect a heap the
+first just swept. A whole-list refill let one of eight threads take
+every chunk the sweep freed and the other seven carve, and the heap
+and every sweep grew with it; the centre keeps a class's chunks as a
+stack of the sweep's own per-arena batches now and a refill takes one.
+And a budget floored at a MiB met eight allocating threads as 4,000
+collections a second, each a stop of eight and a sweep of eleven
+arenas, 300 µs where one thread's was 15: **the budget is floored at
+half of what the sweep walked**, so a collection costs a bounded
+amount per byte allocated however many arenas the threads carved —
+the single-thread gates keep their arithmetic exactly (64 MiB of churn
+is 64 collections), and eight threads went from 634 ns an allocation
+to 239. The stop's own cost is the floor's table: 22 µs for seven
+threads, 7% of the pause. The frame question was answered by use
+rather than by a mechanism: the handler runs on whatever stack the
+thread is on, a 256 KiB fiber stack included, and the probe's 5.7 KB
+frame is what a fiber has to have spare above its guard page when a
+stop lands. The exercise's fibers take stops on their own stacks. A
+`sigaltstack` per thread — a syscall on Linux, one name on darwin —
+is the answer if a program's fiber is ever that deep, and it is not
+built ahead of one.
+
+`bench/thread_exercise.sh` holds it, plain and release, on Linux and
+darwin, with the aarch64 arm run under emulation: eight threads
+allocating from their own caches while collections run from whichever
+crosses the budget, each holding a live list in nothing but its own
+frames through those collections and finding it intact by checksum and
+by the sweep's own free flag — after one explicit collection with
+every worker spinning on its list, and after twenty bursts of churn —
+each running fibers of its own with a parked one holding an object's
+only reference, then 32 threads past the core count; the floor read
+off the binary, five names on Linux; and the failure proof removes the
+thread-root walk from a copy of the prelude and the spinning threads'
+lists are swept out from under them by name. The price, release, 20
+cores: 76 ns an allocation with one thread, 162 with four, 268 with
+eight — wall time per allocation per thread, every pause included,
+which is what Stages 7 and 8 exist to bring down: every thread stands
+still for a sweep one thread runs.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are

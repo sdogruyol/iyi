@@ -1,0 +1,242 @@
+# Threads under the collector, exercised: GC_DESIGN.md Stage 4, built.
+#
+#   ./bin/iyi run bench/thread_exercise.iyi [THREADS]
+#
+# Every claim thread.iyi makes, run rather than asserted: N threads
+# allocate freely from their own caches while the trigger runs
+# collections from whichever thread crosses the budget; each thread holds
+# a live list in nothing but its own frames and registers through those
+# collections and checks it afterwards, by checksum and by the sweep's
+# own free flag; a thread runs fibers of its own, one of which parks
+# holding the only reference to an object; and the program finishes,
+# which is the proof no stop deadlocked on the lock or on a thread inside
+# the allocator. Then the price: allocations per second per thread, at
+# 1, 4 and N threads, so the cache-per-thread split has a number.
+#
+# bench/thread_exercise.sh drives it, reads the floor off the binary, and
+# removes the thread-root walk from a copy of the prelude to prove the
+# live-list check fails by name.
+
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+  def fail(message : String) : Nil
+    puts "FAIL: #{message}"
+    __iyi_exit(1)
+  end
+
+  # A node with a payload the checksum covers, and a pointer the marker
+  # must follow: type_id in the header, so the walk is precise.
+  class Node
+    property next_node : Node?
+    property value : UInt64
+    property pad : UInt64
+
+    def initialize(@value : UInt64)
+      @next_node = nil
+      @pad = @value &* 3_u64
+    end
+  end
+
+  # Shared words, each an atomic on its own line of one mapping — a struct
+  # in a class variable would be copied on every read; a word at an
+  # address is what the threads all add to.
+  class Tally
+    @@page : UInt64 = 0_u64
+
+    def self.setup : Nil
+      @@page = __iyi_mmap(4096_u64).address
+    end
+
+    def self.verified : Pointer(Atomic(UInt64))
+      Pointer(Atomic(UInt64)).new(@@page)
+    end
+
+    def self.allocations : Pointer(Atomic(UInt64))
+      Pointer(Atomic(UInt64)).new(@@page + 64_u64)
+    end
+
+    # The rendezvous for the one explicit collection: threads count in
+    # when their lists are built, and spin on `go` until main has run it.
+    def self.ready : Pointer(Atomic(UInt64))
+      Pointer(Atomic(UInt64)).new(@@page + 128_u64)
+    end
+
+    def self.go : Pointer(Atomic(UInt64))
+      Pointer(Atomic(UInt64)).new(@@page + 192_u64)
+    end
+  end
+
+  def build_list(length : Int32, seed : UInt64) : Node
+    head = Node.new(seed)
+    index = 1
+    while index < length
+      node = Node.new(seed &+ index.to_u64)
+      node.next_node = head
+      head = node
+      index = index + 1
+    end
+    head
+  end
+
+  def checksum(head : Node) : UInt64
+    sum = 0_u64
+    node = head
+    while node.is_a?(Node)
+      sum = sum &+ node.value &+ node.pad
+      node = node.next_node
+    end
+    sum
+  end
+
+  # The sweep's own word on every node: a live node on a free list is a
+  # node the collector freed out from under the thread. Checked before
+  # the checksum and answered at the first freed node, whose links the
+  # centre may have written over — a walk past it would read garbage
+  # instead of naming the fault.
+  def freed?(head : Node) : Bool
+    node = head
+    while node.is_a?(Node)
+      return true if IyiHeap.read64(node.object_id - 8_u64) & IyiHeap::FREE_FLAG != 0
+      node = node.next_node
+    end
+    false
+  end
+
+  def churn(count : Int32) : UInt64
+    sink = 0_u64
+    index = 0
+    while index < count
+      block = Pointer(UInt64).malloc(48_u64)
+      block.value = index.to_u64
+      sink = sink &+ block.address
+      index = index + 1
+    end
+    Tally.allocations.value.add(count.to_u64)
+    sink
+  end
+
+  # One thread's body: a live list, churn that triggers collections here
+  # and lets other threads' collections stop this one, the list checked
+  # after each burst; then fibers of its own.
+  def thread_body(seed : UInt64) : Nil
+    list = build_list(1000, seed)
+    expected = checksum(list)
+    # First, one collection nobody here triggers: the list built, this
+    # thread counts in and spins allocating nothing while main collects
+    # with every worker stopped mid-spin, then reads the sweep's flag off
+    # its own list. Nothing allocated between the sweep and the read, so
+    # a freed node is still flagged — the deterministic form of the
+    # thread-root property, and what the driver's failure proof removes.
+    Tally.ready.value.add(1_u64)
+    while Tally.go.value.get == 0_u64
+    end
+    fail("thread #{seed.to_i64}: a live node is on a free list after the collection that stopped this thread, so its frames were not scanned") if freed?(list)
+    fail("thread #{seed.to_i64}: the live list's checksum changed under the collection that stopped this thread") if checksum(list) != expected
+    burst = 0
+    while burst < 20
+      churn(20000)
+      fail("thread #{seed.to_i64}: a live node is on a free list, collected out from under the thread") if freed?(list)
+      fail("thread #{seed.to_i64}: the live list's checksum changed under collection") if checksum(list) != expected
+      burst = burst + 1
+    end
+    # Fibers on a thread that is not the main one: a parked fiber holding
+    # the only reference to an object while the thread's main fiber
+    # churns, which is the fiber root walk on a thread whose main fiber
+    # has a top of its own.
+    ready = Channel(Int32).new
+    release = Channel(Int32).new
+    verdict = Channel(Int32).new
+    group do |g|
+      g.spawn do
+        keep = build_list(100, seed &+ 7000_u64)
+        sum = checksum(keep)
+        ready.send(1)
+        release.receive
+        bad = 0
+        bad = 1 if freed?(keep) || checksum(keep) != sum
+        verdict.send(bad)
+        0
+      end
+      ready.receive
+      churn(40000)
+      release.send(1)
+      fail("thread #{seed.to_i64}: a parked fiber's list did not survive the thread's churn") if verdict.receive != 0
+    end
+    fail("thread #{seed.to_i64}: the live list's checksum changed after the fibers") if checksum(list) != expected
+    Tally.verified.value.add(1_u64)
+  end
+
+  def start_threads(count : Int32) : Array(IyiThread)
+    threads = Array(IyiThread).new
+    index = 0
+    while index < count
+      seed = (index + 1).to_u64 * 100000_u64
+      threads << IyiThread.start { thread_body(seed) }
+      index = index + 1
+    end
+    threads
+  end
+
+  def join_all(threads : Array(IyiThread)) : Nil
+    index = 0
+    while index < threads.size
+      threads[index].join
+      index = index + 1
+    end
+  end
+
+  args = Program.args
+  count = args.size > 0 ? args[0].to_i : 8
+  fail("at least one thread") if count < 1
+  Tally.setup
+
+  # ── 1. Threads, collections, live lists ────────────────────────────────
+  before = IyiMark.collections
+  threads = start_threads(count)
+  # The main thread churns beside them and holds a list of its own.
+  main_list = build_list(1000, 1_u64)
+  main_sum = checksum(main_list)
+  # The one explicit collection, with every worker spinning on its list.
+  while Tally.ready.value.get < count.to_u64
+  end
+  IyiMark.collect
+  Tally.go.value.set(1_u64)
+  burst = 0
+  while burst < 20
+    churn(20000)
+    fail("main: a live node is on a free list, collected out from under the main thread") if freed?(main_list)
+    fail("main: the live list's checksum changed under collection") if checksum(main_list) != main_sum
+    burst = burst + 1
+  end
+  join_all(threads)
+  collections = IyiMark.collections - before
+  fail("no collection ran across #{count} threads' churn") if collections == 0_u64
+  fail("#{Tally.verified.value.get.to_i64} of #{count} threads verified their lists") if Tally.verified.value.get != count.to_u64
+  stops = IyiThread.stops
+  stopped = IyiThread.stopped
+  fail("collections ran but no thread was ever stopped by one") if stops == 0_u64 || stopped == 0_u64
+  puts "threads: #{count} threads, #{Tally.allocations.value.get.to_i64} allocations, #{collections.to_i64} collections; #{stops.to_i64} stops parked #{stopped.to_i64} threads; every live list intact, by checksum and by the sweep's flag"
+
+  # ── 2. The price: allocations per second per thread ────────────────────
+  # Each thread allocates a fixed count from its own cache with the
+  # trigger's collections running; the wall time is the number. Reported
+  # rather than budgeted.
+  ns_per = ->(threads_count : Int32) : Int64 {
+    per_thread = 500000
+    started = __iyi_monotonic_ns
+    pool = Array(IyiThread).new
+    index = 0
+    while index < threads_count
+      pool << IyiThread.start { churn(per_thread); nil }
+      index = index + 1
+    end
+    join_all(pool)
+    (__iyi_monotonic_ns - started) // per_thread.to_i64
+  }
+  one = ns_per.call(1)
+  four = ns_per.call(4)
+  many = ns_per.call(count)
+  puts "speed: #{one} ns per allocation with 1 thread, #{four} ns with 4, #{many} ns with #{count} — wall time per allocation per thread, collections included"
+  puts "thread exercise: every property held"
+{% else %}
+  puts "thread exercise: needs the collector and a concurrency target (linux x86_64/aarch64, darwin arm64); nothing to exercise here"
+{% end %}

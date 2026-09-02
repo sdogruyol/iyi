@@ -1,0 +1,802 @@
+# iyi: a kernel thread in the runtime, and the stop-the-world over them —
+# GC_DESIGN.md Stage 4, built on the thread floor's measured mechanism.
+#
+# `bench/thread_floor.iyi` priced every piece of this before it was
+# written: a thread by raw `clone` on Linux costs the floor no name, a
+# thread by `pthread_create` on darwin costs libSystem's exact list, a
+# `@[ThreadLocal]` is one load, and a stop is one signal per thread with a
+# handler that reads the held thread's registers out of the kernel's
+# ucontext and parks. This file is that probe moved into the prelude, with
+# the two things a runtime needs that a probe does not: a stopped thread's
+# registers and stack are roots the collector scans, and a thread inside
+# the allocator is not stopped where it stands.
+#
+#   t = IyiThread.start { work }   # a thread; its body allocates freely
+#   t.join                          # Nil; the thread has exited
+#
+# What a thread is not, said here rather than found: it is not a task. No
+# group owns it, nothing cancels it, no channel crosses it — `Channel` is
+# one thread's, and `Share` (SPEC.md III.4.4) is what will say so at
+# compile time. What crosses threads today is `Atomic(T)` and memory the
+# program keeps straight itself. A thread gets a scheduler state and a heap
+# cache of its own on first touch, so it may spawn fibers and it allocates
+# without a lock; the world it shares is the centre behind the runtime's
+# one lock, and the collector, which stops it.
+#
+# **The stop, and what is not stopped.** A collection takes the runtime
+# lock, signals every other registered thread, and waits for each to count
+# itself in; the handler copies the interrupted registers from the ucontext
+# onto the thread's line, records the stack pointer, parks, and counts out
+# when the collector releases it. Two threads are not parked where they
+# stand. One holding the runtime lock, or between reading a cache list's
+# head and popping it — inside `IyiHeap.take`, which sets a word on its
+# cache page for the duration — is asked to stop instead: the handler
+# leaves a request on the same page and returns, and `take` parks itself
+# on the way out, spilling its own callee-saved registers, which is Go's
+# "no preemption inside mallocgc" arrived at from the other end (the
+# collector holding the lock would otherwise wait on a thread waiting on
+# the lock). And one spinning for the lock parks inside the spin, where it
+# holds nothing. Everything else — running code, blocked in a syscall the
+# signal interrupts (the poller already treats EINTR as a wakeup with no
+# news, and SA_RESTART restarts the rest) — stops where it is.
+#
+# **Where a stopped thread's roots are.** Its registers are the spill on
+# its line — the ucontext's general registers, or the callee-saved set a
+# voluntary park wrote — and its stack runs from the recorded sp to the
+# top of whichever mapping holds it: the thread's own, or a fiber's, found
+# by asking every fiber. A thread's main fiber carries the thread's stack
+# top, where the main thread's carries 0 for the base `IyiRoots` found.
+#
+# **A thread's death.** Its body returns, it takes the lock, leaves the
+# list a stop walks, and exits; a stop that began before it left waited
+# for it, and one that begins after does not name it. On Linux the kernel
+# clears the tid word at exit and wakes its futex, which is the join.
+#
+# Linux x86_64 and aarch64 and darwin arm64, the concurrency targets, and
+# only with the collector: a thread under `-Dgc_none` would race the bump
+# pointer and one under `-Dgc_boehm` would be a thread Boehm never heard
+# of, so neither has one, and `IyiThread` is not a name there.
+
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+  # One line per thread, mapped, never heap: a signal handler and a
+  # collector both read it, and neither may find it moved or freed.
+  IYI_THREAD_LINE       = 512_u64
+  IYI_THREAD_STACK      = 1048576_u64
+  # +0   the parent's handle: the tid on Linux, written by the kernel at
+  #      start and cleared by it at exit; the pthread_t on darwin
+  # +8   the next line, from IyiThread.first_line
+  # +16  the thread's own stack: its low address, 0 when unknown (darwin)
+  # +24  its top: the mapping's end on Linux, a first-frame local's address
+  #      on darwin — everything above it is libSystem's, holding nothing
+  # +32  darwin: the park pipe, read end low, write end high
+  # +40  where the thread stopped: sp
+  # +48  pc
+  # +56  the thread's IyiThread object, raw, for the child to find its body
+  # +64  set while the thread is exiting: a stop no longer names it
+  # +128 the spill: 32 words for whatever registers the stop captured
+  IYI_TL_HANDLE  =   0_u64
+  IYI_TL_NEXT    =   8_u64
+  IYI_TL_LOW     =  16_u64
+  IYI_TL_TOP     =  24_u64
+  IYI_TL_PARK    =  32_u64
+  IYI_TL_SP      =  40_u64
+  IYI_TL_PC      =  48_u64
+  IYI_TL_OBJECT  =  56_u64
+  IYI_TL_SPILL   = 128_u64
+  IYI_TL_SPILL_END = 384_u64
+
+  # The stop's shared words, each on a line of its own on the control
+  # page: threads counted in, threads counted out, the release flag.
+  IYI_TC_SUSPENDED = 0_u64
+  IYI_TC_RESUMED   = 64_u64
+  IYI_TC_RESUME    = 128_u64
+  IYI_TC_PID       = 192_u64
+
+  {% if flag?(:linux) %}
+    {% if flag?(:x86_64) %}
+      IYI_SYS_CLONE        =  56_i64
+      IYI_SYS_EXIT         =  60_i64
+      IYI_SYS_FUTEX        = 202_i64
+      IYI_SYS_GETPID       =  39_i64
+      IYI_SYS_GETTID       = 186_i64
+      IYI_SYS_TGKILL       = 234_i64
+      IYI_SYS_RT_SIGACTION =  13_i64
+      IYI_SYS_SCHED_YIELD  =  24_i64
+      # SA_SIGINFO | SA_RESTORER | SA_RESTART: x86_64 has no vdso
+      # trampoline the kernel will pick for a handler's return, so the
+      # restorer is named; RESTART so a read a stop interrupts resumes
+      # rather than answering EINTR to a program that never asked.
+      IYI_SA_FLAGS = 0x14000004_u64
+      # The kernel's ucontext: uc_flags, uc_link, a 24-byte uc_stack, then
+      # sigcontext at 40 — r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp,
+      # rip: sixteen registers then the two the scan needs by name.
+      IYI_UC_REGS  =  40_u64
+      IYI_UC_COUNT =  16_u64
+      IYI_UC_SP    = 160_u64
+      IYI_UC_PC    = 168_u64
+    {% else %}
+      IYI_SYS_CLONE        = 220_i64
+      IYI_SYS_EXIT         =  93_i64
+      IYI_SYS_FUTEX        =  98_i64
+      IYI_SYS_GETPID       = 172_i64
+      IYI_SYS_GETTID       = 178_i64
+      IYI_SYS_TGKILL       = 131_i64
+      IYI_SYS_RT_SIGACTION = 134_i64
+      IYI_SYS_SCHED_YIELD  = 124_i64
+      # SA_SIGINFO | SA_RESTART; the vdso supplies the return.
+      IYI_SA_FLAGS = 0x10000004_u64
+      # uc_flags, uc_link, uc_stack, a sigmask padded to 128, sigcontext
+      # 16-aligned at 176: fault_address, then x0..x30 at 184, sp, pc.
+      IYI_UC_REGS  = 184_u64
+      IYI_UC_COUNT =  31_u64
+      IYI_UC_SP    = 432_u64
+      IYI_UC_PC    = 440_u64
+    {% end %}
+
+    # CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+    # CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID |
+    # CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID. PARENT_SETTID beside the
+    # probe's flags: the tid is in the line before `clone` returns to the
+    # parent, so a stop that begins the instant after can name the child.
+    IYI_CLONE_FLAGS = 0x013d0f00_i64
+    IYI_SIGSTOP_THE_WORLD = 10_i64
+    IYI_FUTEX_WAIT = 0_i64
+    IYI_FUTEX_WAKE = 1_i64
+
+    # `clone` returns twice, and the second return is on a stack the
+    # compiler has never heard of, so the child's whole life is inside the
+    # asm: it loads the function and argument the parent left at the top
+    # of its stack, calls, and exits with the thread-exit syscall. Verbatim
+    # from the probe, which found aarch64's argument order the hard way.
+    fun __iyi_thread_clone(stack_top : UInt64, entry : UInt64, argument : UInt64, tid_word : UInt64, thread_pointer : UInt64) : Int64
+      result = uninitialized Int64
+      {% if flag?(:x86_64) %}
+        asm("leaq -16(%r12), %rsi
+             movq %r13, 0(%rsi)
+             movq %r14, 8(%rsi)
+             movq $$0x013d0f00, %rdi
+             movq %r15, %rdx
+             movq %r15, %r10
+             movq %rbx, %r8
+             movq $$56, %rax
+             syscall
+             testq %rax, %rax
+             jnz 1f
+             movq 8(%rsp), %rdi
+             movq 0(%rsp), %rax
+             andq $$-16, %rsp
+             callq *%rax
+             movq $$60, %rax
+             xorq %rdi, %rdi
+             syscall
+             1:" : "={rax}"(result)
+                  : "{r12}"(stack_top), "{r13}"(entry), "{r14}"(argument), "{r15}"(tid_word), "{rbx}"(thread_pointer)
+                  : "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory", "cc"
+                  : "volatile")
+      {% else %}
+        asm("sub x1, x19, #16
+             stp x20, x21, [x1]
+             mov x0, #0x0f00
+             movk x0, #0x013d, lsl #16
+             mov x2, x22
+             mov x3, x23
+             mov x4, x22
+             mov x8, #220
+             svc #0
+             cbnz x0, 1f
+             ldp x9, x0, [sp], #16
+             blr x9
+             mov x8, #93
+             mov x0, #0
+             svc #0
+             1:" : "={x0}"(result)
+                  : "{x19}"(stack_top), "{x20}"(entry), "{x21}"(argument), "{x22}"(tid_word), "{x23}"(thread_pointer)
+                  : "x1", "x2", "x3", "x4", "x8", "x9", "x30", "memory", "cc"
+                  : "volatile")
+      {% end %}
+      result
+    end
+
+    @[NoInline]
+    @[Naked]
+    fun __iyi_ehdr_start : UInt64
+      {% if flag?(:x86_64) %}
+        asm("leaq __ehdr_start(%rip), %rax
+             retq" :::: "volatile")
+      {% else %}
+        asm("adrp x0, __ehdr_start
+             add x0, x0, :lo12:__ehdr_start
+             ret" :::: "volatile")
+      {% end %}
+      0_u64
+    end
+
+    # A thread's TLS block, from the executable's own PT_TLS, laid out the
+    # way a static libc's startup lays out its own: the segment found by
+    # walking the program headers from `__ehdr_start`, the initialised
+    # image copied, the rest zero, the thread pointer placed by the ABI's
+    # variant — below the block with a self-pointer at `%fs:0` on x86_64,
+    # above a 16-byte control block on aarch64.
+    class IyiTlsImage
+      @@image : UInt64 = 0_u64
+      @@filesz : UInt64 = 0_u64
+      @@memsz : UInt64 = 0_u64
+      @@align : UInt64 = 0_u64
+
+      def self.read_segment : Nil
+        return if @@align != 0_u64
+        header = __iyi_ehdr_start
+        phoff = Pointer(UInt64).new(header + 32_u64).value
+        phentsize = Pointer(UInt64).new(header + 48_u64).value.unsafe_shr(48_u64)
+        phnum = Pointer(UInt64).new(header + 56_u64).value & 0xFFFF_u64
+        bias = 0_u64
+        found_load = false
+        index = 0_u64
+        while index < phnum
+          entry = header + phoff + index * phentsize
+          type = Pointer(UInt64).new(entry).value & 0xFFFFFFFF_u64
+          if type == 1_u64 && !found_load
+            bias = header - Pointer(UInt64).new(entry + 16_u64).value
+            found_load = true
+          end
+          if type == 7_u64
+            @@image = Pointer(UInt64).new(entry + 16_u64).value
+            @@filesz = Pointer(UInt64).new(entry + 32_u64).value
+            @@memsz = Pointer(UInt64).new(entry + 40_u64).value
+            @@align = Pointer(UInt64).new(entry + 48_u64).value
+          end
+          index = index + 1_u64
+        end
+        raise "no PT_TLS in the executable" if @@align == 0_u64
+        @@image = @@image + bias
+      end
+
+      def self.round_up(value : UInt64, align : UInt64) : UInt64
+        (value + align - 1_u64) & (0_u64 &- align)
+      end
+
+      # A block for one thread; answers the thread pointer to hand `clone`.
+      def self.make : UInt64
+        read_segment
+        size = round_up(@@memsz, @@align)
+        mapping = __iyi_mmap(round_up(size + 64_u64, 4096_u64)).address
+        {% if flag?(:x86_64) %}
+          pointer = round_up(mapping + size, @@align)
+          pointer = round_up(pointer, 64_u64)
+          block = pointer - size
+          Pointer(UInt64).new(pointer).value = pointer
+        {% else %}
+          pointer = round_up(mapping, 64_u64)
+          block = pointer + round_up(16_u64, @@align)
+        {% end %}
+        index = 0_u64
+        while index < @@filesz
+          Pointer(UInt8).new(block + index).value = Pointer(UInt8).new(@@image + index).value
+          index = index + 1_u64
+        end
+        pointer
+      end
+    end
+
+    # The two-instruction sigreturn x86_64's handler returns through.
+    {% if flag?(:x86_64) %}
+      @[NoInline]
+      @[Naked]
+      fun __iyi_sigreturn : Nil
+        asm("movq $$15, %rax
+             syscall" :::: "volatile")
+      end
+
+      @[NoInline]
+      @[Naked]
+      fun __iyi_sigreturn_address : UInt64
+        asm("leaq __iyi_sigreturn(%rip), %rax
+             retq" :::: "volatile")
+        0_u64
+      end
+    {% end %}
+  {% else %}
+    # darwin: libSystem's thread, by name, the exact list the thread floor
+    # measured — `pthread_create`, `pthread_join`, `pthread_kill`,
+    # `sigaction`, and a pipe per thread to park on, because `read` is on
+    # POSIX's list of what a handler may call and `os_unfair_lock_lock`,
+    # which measured a little faster, is not.
+    lib LibC
+      fun pthread_create(thread : UInt64*, attributes : Void*, start : Void*, argument : Void*) : Int32
+      fun pthread_join(thread : Void*, value : Void*) : Int32
+      fun pthread_kill(thread : Void*, signal : Int32) : Int32
+      fun sigaction(signal : Int32, action : Void*, previous : Void*) : Int32
+      fun pipe(fds : Int32*) : Int32
+      fun read(fd : Int32, buffer : Void*, count : UInt64) : Int64
+      fun write(fd : Int32, buffer : Void*, count : UInt64) : Int64
+    end
+
+    IYI_SIGSTOP_THE_WORLD = 30_i32
+    # struct sigaction on darwin arm64 is sixteen bytes: the handler, then
+    # `sa_mask` and `sa_flags` packed into the second word. SA_SIGINFO
+    # (0x40) | SA_RESTART (0x02), in the high half.
+    IYI_SA_WORD = 0x0000004200000000_u64
+    # libSystem's ucontext: at 48 a pointer to the mcontext, whose 16-byte
+    # exception state precedes x0..x28, fp, lr (31 words at 16), sp at
+    # 264, pc at 272.
+    IYI_UC_MCONTEXT = 48_u64
+    IYI_MC_REGS  =  16_u64
+    IYI_MC_COUNT =  31_u64
+    IYI_MC_SP    = 264_u64
+    IYI_MC_PC    = 272_u64
+
+  {% end %}
+
+  class IyiThread
+    # This thread's line; 0 on a thread nobody registered, which is the
+    # main thread before the first `start`, and a child in the instant
+    # before its first instruction — both found by handle then.
+    @[ThreadLocal]
+    @@line : UInt64 = 0_u64
+    # Every line, from the newest; the control page; the count of threads
+    # a stop must hear from besides the stopper; the handler, once.
+    @@lines : UInt64 = 0_u64
+    @@control : UInt64 = 0_u64
+    @@count : Int64 = 0_i64
+    @@installed : Bool = false
+    # Every thread object ever started, so a body's closure is rooted from
+    # `start` until the thread that runs it holds it on its own stack.
+    @@head : IyiThread?
+
+    @line : UInt64
+    @proc : Proc(Nil)
+    property next_thread : IyiThread?
+
+    def initialize(@line : UInt64, @proc : Proc(Nil))
+    end
+
+    def line : UInt64
+      @line
+    end
+
+    def proc : Proc(Nil)
+      @proc
+    end
+
+    # ── Entry points, as procs ──────────────────────────────────────────
+    #
+    # The child's first frame and the stop handler are the addresses of
+    # two closure-free procs — a proc's first word is its function, called
+    # with its arguments in the platform's registers, which is the C
+    # convention `clone` and `sigaction` expect. Procs rather than `fun`s
+    # because a `fun` is emitted into every program whether or not it is
+    # ever called, and `hello` grew 12 KB of thread runtime the day these
+    # were `fun`s; a proc named here is codegen'd when `start` is.
+    def self.address_of(proc : Proc(UInt64, Nil)) : UInt64
+      Pointer(UInt64).new(pointerof(proc).address).value
+    end
+
+    def self.address_of_handler(proc : Proc(Int32, Void*, Void*, Nil)) : UInt64
+      Pointer(UInt64).new(pointerof(proc).address).value
+    end
+
+    def self.thread_entry : UInt64
+      {% if flag?(:linux) %}
+        address_of(->(line : UInt64) { IyiThread.run(line) })
+      {% else %}
+        address_of(->(line : UInt64) { IyiThread.run(line) })
+      {% end %}
+    end
+
+    def self.handler_entry : UInt64
+      address_of_handler(->(signal : Int32, info : Void*, context : Void*) { IyiThread.stopped_by_signal(context.address) })
+    end
+
+    # ── Lines and the control page ──────────────────────────────────────
+
+    def self.control : UInt64
+      @@control = __iyi_mmap(4096_u64).address if @@control == 0
+      @@control
+    end
+
+    def self.word(address : UInt64) : Pointer(Atomic(UInt64))
+      Pointer(Atomic(UInt64)).new(address)
+    end
+
+    def self.first_line : UInt64
+      @@lines
+    end
+
+    def self.line_next(line : UInt64) : UInt64
+      IyiHeap.read64(line + IYI_TL_NEXT)
+    end
+
+    def self.current_line : UInt64
+      @@line
+    end
+
+    @@stops : UInt64 = 0_u64
+    @@stopped : UInt64 = 0_u64
+    @@stop_ns : UInt64 = 0_u64
+
+    # The running thread's stack top, 0 for an unregistered thread, whose
+    # stack is the base `IyiRoots` discovered.
+    def self.current_stack_top : UInt64
+      line = @@line
+      return 0_u64 if line == 0
+      IyiHeap.read64(line + IYI_TL_TOP)
+    end
+
+    # What the stops did, for a program that asks: collections that
+    # stopped at least one other thread, and threads stopped in all.
+    # Written under the lock, read by whoever.
+    def self.stops : UInt64
+      @@stops
+    end
+
+    def self.stopped : UInt64
+      @@stopped
+    end
+
+    # Nanoseconds spent from the first signal to the last count-in, in
+    # all: the stop half of every pause, on the collector's clock.
+    def self.stop_ns : UInt64
+      @@stop_ns
+    end
+
+    def self.new_line : UInt64
+      __iyi_mmap(IYI_THREAD_LINE).address
+    end
+
+    # Link a line for the stops, under the lock: a stop takes the same
+    # lock before it walks.
+    def self.link(line : UInt64) : Nil
+      IyiRuntimeLock.lock
+      IyiHeap.write64(line + IYI_TL_NEXT, @@lines)
+      @@lines = line
+      @@count = @@count + 1_i64
+      IyiRuntimeLock.unlock
+    end
+
+    def self.unlink(line : UInt64) : Nil
+      IyiRuntimeLock.lock
+      previous = 0_u64
+      cursor = @@lines
+      while cursor != 0
+        following = IyiHeap.read64(cursor + IYI_TL_NEXT)
+        if cursor == line
+          if previous == 0
+            @@lines = following
+          else
+            IyiHeap.write64(previous + IYI_TL_NEXT, following)
+          end
+          @@count = @@count - 1_i64
+          break
+        end
+        previous = cursor
+        cursor = following
+      end
+      IyiRuntimeLock.unlock
+    end
+
+    # The main thread's line, made when the first thread is: its handle
+    # and its stack top, which `IyiRoots` found. `@@line` on the thread
+    # that calls `start` is then never 0.
+    def self.register_current : Nil
+      return if @@line != 0
+      line = new_line
+      {% if flag?(:linux) %}
+        IyiHeap.write64(line + IYI_TL_HANDLE, __iyi_conc_syscall3(IYI_SYS_GETTID, 0_i64, 0_i64, 0_i64).to_u64)
+      {% else %}
+        IyiHeap.write64(line + IYI_TL_HANDLE, LibC.pthread_self.address)
+        IyiThread.make_park(line)
+      {% end %}
+      IyiHeap.write64(line + IYI_TL_TOP, IyiRoots.stack_base)
+      @@line = line
+      link(line)
+    end
+
+    # ── Start, run, join ────────────────────────────────────────────────
+
+    def self.start(&block : -> Nil) : IyiThread
+      start(block)
+    end
+
+    def self.start(proc : Proc(Nil)) : IyiThread
+      register_current
+      install_handler
+      line = new_line
+      thread = IyiThread.new(line, proc)
+      IyiHeap.write64(line + IYI_TL_OBJECT, thread.object_id)
+      # Rooted before anything else can run: the list is a class variable.
+      IyiRuntimeLock.lock
+      thread.next_thread = @@head
+      @@head = thread
+      IyiRuntimeLock.unlock
+      {% if flag?(:linux) %}
+        stack = __iyi_mmap(IYI_THREAD_STACK).address
+        __iyi_conc_syscall3(IYI_SYS_MPROTECT, stack.to_i64, 4096_i64, 0_i64)
+        IyiHeap.write64(line + IYI_TL_LOW, stack)
+        IyiHeap.write64(line + IYI_TL_TOP, stack + IYI_THREAD_STACK)
+        # Linked before the clone, under the lock the clone is made under:
+        # a stop cannot begin between the two, and the tid is in the line
+        # before the lock is released.
+        IyiRuntimeLock.lock
+        IyiHeap.write64(line + IYI_TL_NEXT, @@lines)
+        @@lines = line
+        @@count = @@count + 1_i64
+        result = __iyi_thread_clone(stack + IYI_THREAD_STACK, thread_entry, line, line + IYI_TL_HANDLE, IyiTlsImage.make)
+        IyiRuntimeLock.unlock
+        raise "clone failed: #{result}" if result < 0
+      {% else %}
+        make_park(line)
+        IyiRuntimeLock.lock
+        IyiHeap.write64(line + IYI_TL_NEXT, @@lines)
+        @@lines = line
+        @@count = @@count + 1_i64
+        result = LibC.pthread_create(Pointer(UInt64).new(line + IYI_TL_HANDLE), Pointer(Void).new(0_u64),
+          Pointer(Void).new(thread_entry), Pointer(Void).new(line))
+        IyiRuntimeLock.unlock
+        raise "pthread_create failed: #{result}" if result != 0
+      {% end %}
+      thread
+    end
+
+    # The child's whole life: name its line, find its body on the rooted
+    # list, run it, leave the stop's list, and return into the exit the
+    # clone asm (or pthread) performs.
+    def self.run(line : UInt64) : Nil
+      @@line = line
+      {% if flag?(:darwin) %}
+        # Where this thread's stack is, without asking libSystem for its
+        # bounds: this frame's local, below which everything of the
+        # thread's sits.
+        here = uninitialized UInt64
+        IyiHeap.write64(line + IYI_TL_TOP, pointerof(here).address)
+      {% end %}
+      thread = @@head
+      while thread.is_a?(IyiThread)
+        break if thread.line == line
+        thread = thread.next_thread
+      end
+      raise "a thread started with no body" unless thread.is_a?(IyiThread)
+      thread.proc.call
+      IyiHeap.retire_cache
+      unlink(line)
+    end
+
+    def join : Nil
+      {% if flag?(:linux) %}
+        while (tid = IyiThread.word(@line + IYI_TL_HANDLE).value.get) != 0_u64
+          __iyi_conc_syscall6(IYI_SYS_FUTEX, (@line + IYI_TL_HANDLE).to_i64, IYI_FUTEX_WAIT, tid.to_i64, 0_i64, 0_i64, 0_i64)
+        end
+      {% else %}
+        handle = Pointer(Void).new(IyiHeap.read64(@line + IYI_TL_HANDLE))
+        result = LibC.pthread_join(handle, Pointer(Void).new(0_u64))
+        raise "pthread_join failed: #{result}" if result != 0
+      {% end %}
+    end
+
+    # The deferred stop, paid where a thread holds nothing: `take`'s exit,
+    # and the runtime lock's spin. The request is cleared before the park
+    # so the exit after a spin's park does not park twice.
+    def self.park_if_requested : Nil
+      return unless IyiHeap.stop_requested?
+      IyiHeap.clear_request
+      stop_here
+    end
+
+    # ── The stop ────────────────────────────────────────────────────────
+
+    def self.install_handler : Nil
+      return if @@installed
+      @@installed = true
+      {% if flag?(:linux) %}
+        IyiHeap.write64(control + IYI_TC_PID, __iyi_conc_syscall3(IYI_SYS_GETPID, 0_i64, 0_i64, 0_i64).to_u64)
+        action = Pointer(UInt64).malloc(4_u64)
+        action[0] = handler_entry
+        action[1] = IYI_SA_FLAGS
+        {% if flag?(:x86_64) %}
+          action[2] = __iyi_sigreturn_address
+        {% else %}
+          action[2] = 0_u64
+        {% end %}
+        action[3] = 0_u64
+        result = __iyi_conc_syscall6(IYI_SYS_RT_SIGACTION, IYI_SIGSTOP_THE_WORLD, action.address.to_i64, 0_i64, 8_i64, 0_i64, 0_i64)
+        raise "rt_sigaction failed: #{result}" if result < 0
+      {% else %}
+        action = Pointer(UInt64).malloc(2_u64)
+        action[0] = handler_entry
+        action[1] = IYI_SA_WORD
+        result = LibC.sigaction(IYI_SIGSTOP_THE_WORLD, action.as(Void*), Pointer(Void).new(0_u64))
+        raise "sigaction failed: #{result}" if result != 0
+      {% end %}
+    end
+
+    {% if flag?(:darwin) %}
+      def self.make_park(line : UInt64) : Nil
+        fds = Pointer(Int32).malloc(2_u64)
+        raise "pipe failed" if LibC.pipe(fds) != 0
+        IyiHeap.write64(line + IYI_TL_PARK, fds[1].to_i64.to_u64.unsafe_shl(32_u64) | fds[0].to_i64.to_u64)
+      end
+    {% end %}
+
+    # The thread that runs this holds the runtime lock. Every other
+    # registered thread is signalled and waited for; when this returns,
+    # each has its registers and sp on its line and is parked. Answers
+    # how many stopped, which is how many `resume_others` releases.
+    def self.stop_others : Int64
+      line = @@line
+      return 0_i64 if line == 0 || @@count <= 1_i64
+      started = IyiMark.now_ns
+      page = control
+      word(page + IYI_TC_SUSPENDED).value.set(0_u64)
+      word(page + IYI_TC_RESUMED).value.set(0_u64)
+      word(page + IYI_TC_RESUME).value.set(0_u64)
+      others = 0_i64
+      cursor = @@lines
+      while cursor != 0
+        if cursor != line
+          {% if flag?(:linux) %}
+            tid = IyiHeap.read64(cursor + IYI_TL_HANDLE).to_i64
+            result = __iyi_conc_syscall3(IYI_SYS_TGKILL, IyiHeap.read64(page + IYI_TC_PID).to_i64, tid, IYI_SIGSTOP_THE_WORLD)
+            raise "tgkill failed: #{result}" if result < 0
+          {% else %}
+            handle = Pointer(Void).new(IyiHeap.read64(cursor + IYI_TL_HANDLE))
+            result = LibC.pthread_kill(handle, IYI_SIGSTOP_THE_WORLD)
+            raise "pthread_kill failed: #{result}" if result != 0
+          {% end %}
+          others = others + 1_i64
+        end
+        cursor = IyiHeap.read64(cursor + IYI_TL_NEXT)
+      end
+      while word(page + IYI_TC_SUSPENDED).value.get < others.to_u64
+        yield_cpu
+      end
+      @@stops = @@stops + 1_u64
+      @@stopped = @@stopped + others.to_u64
+      @@stop_ns = @@stop_ns + (IyiMark.now_ns - started).to_u64
+      others
+    end
+
+    def self.resume_others(others : Int64) : Nil
+      return if others == 0_i64
+      page = control
+      word(page + IYI_TC_RESUME).value.set(1_u64)
+      {% if flag?(:linux) %}
+        __iyi_conc_syscall6(IYI_SYS_FUTEX, (page + IYI_TC_RESUME).to_i64, IYI_FUTEX_WAKE, 1000000_i64, 0_i64, 0_i64, 0_i64)
+      {% else %}
+        byte = 1_u8
+        cursor = @@lines
+        while cursor != 0
+          if cursor != @@line
+            fd = IyiHeap.read64(cursor + IYI_TL_PARK).unsafe_shr(32_u64).to_i32
+            LibC.write(fd, pointerof(byte).as(Void*), 1_u64)
+          end
+          cursor = IyiHeap.read64(cursor + IYI_TL_NEXT)
+        end
+      {% end %}
+      while word(page + IYI_TC_RESUMED).value.get < others.to_u64
+        yield_cpu
+      end
+    end
+
+    def self.yield_cpu : Nil
+      {% if flag?(:linux) %}
+        __iyi_conc_syscall3(IYI_SYS_SCHED_YIELD, 0_i64, 0_i64, 0_i64)
+      {% else %}
+        asm("yield" :::: "volatile")
+      {% end %}
+    end
+
+    # This thread's line, from the thread-local or, in the instant before
+    # a child names its own, by its handle.
+    def self.own_line : UInt64
+      line = @@line
+      return line if line != 0
+      {% if flag?(:linux) %}
+        handle = __iyi_conc_syscall3(IYI_SYS_GETTID, 0_i64, 0_i64, 0_i64).to_u64
+      {% else %}
+        handle = LibC.pthread_self.address
+      {% end %}
+      cursor = @@lines
+      while cursor != 0
+        return cursor if IyiHeap.read64(cursor + IYI_TL_HANDLE) == handle
+        cursor = IyiHeap.read64(cursor + IYI_TL_NEXT)
+      end
+      0_u64
+    end
+
+    # The handler. Inside the allocator, leave the request and return:
+    # `take` parks on its way out. Otherwise copy the registers the kernel
+    # saved, record where the thread stopped, and park.
+    def self.stopped_by_signal(context : UInt64) : Nil
+      line = own_line
+      return if line == 0
+      if IyiHeap.in_allocator?
+        IyiHeap.request_stop
+        return
+      end
+      {% if flag?(:linux) %}
+        regs = context + IYI_UC_REGS
+        count = IYI_UC_COUNT
+        sp = IyiHeap.read64(context + IYI_UC_SP)
+        pc = IyiHeap.read64(context + IYI_UC_PC)
+      {% else %}
+        mcontext = IyiHeap.read64(context + IYI_UC_MCONTEXT)
+        regs = mcontext + IYI_MC_REGS
+        count = IYI_MC_COUNT
+        sp = IyiHeap.read64(mcontext + IYI_MC_SP)
+        pc = IyiHeap.read64(mcontext + IYI_MC_PC)
+      {% end %}
+      index = 0_u64
+      while index < count
+        IyiHeap.write64(line + IYI_TL_SPILL + index * 8_u64, IyiHeap.read64(regs + index * 8_u64))
+        index = index + 1_u64
+      end
+      IyiHeap.write64(line + IYI_TL_SP, sp)
+      IyiHeap.write64(line + IYI_TL_PC, pc)
+      park(line)
+    end
+
+    # A voluntary stop, from `take`'s exit or the lock's spin: the
+    # callee-saved registers are the ones that may hold a value across
+    # this call, spilled onto the line the way `IyiRoots` spills the
+    # collector's; the caller-saved ones are on the stack by convention.
+    def self.stop_here : Nil
+      line = @@line
+      return if line == 0
+      spill = line + IYI_TL_SPILL
+      {% if flag?(:x86_64) %}
+        asm("movq %rbx, 0($0)
+             movq %rbp, 8($0)
+             movq %r12, 16($0)
+             movq %r13, 24($0)
+             movq %r14, 32($0)
+             movq %r15, 40($0)" :: "{rdi}"(spill) : "memory" : "volatile")
+      {% else %}
+        asm("stp x19, x20, [$0, #0]
+             stp x21, x22, [$0, #16]
+             stp x23, x24, [$0, #32]
+             stp x25, x26, [$0, #48]
+             stp x27, x28, [$0, #64]
+             stp x29, x30, [$0, #80]" :: "{x0}"(spill) : "memory" : "volatile")
+      {% end %}
+      here = uninitialized UInt64
+      IyiHeap.write64(line + IYI_TL_SP, pointerof(here).address)
+      IyiHeap.write64(line + IYI_TL_PC, 0_u64)
+      park(line)
+    end
+
+    def self.park(line : UInt64) : Nil
+      page = control
+      word(page + IYI_TC_SUSPENDED).value.add(1_u64)
+      {% if flag?(:linux) %}
+        while word(page + IYI_TC_RESUME).value.get == 0_u64
+          __iyi_conc_syscall6(IYI_SYS_FUTEX, (page + IYI_TC_RESUME).to_i64, IYI_FUTEX_WAIT, 0_i64, 0_i64, 0_i64, 0_i64)
+        end
+      {% else %}
+        byte = uninitialized UInt8
+        fd = (IyiHeap.read64(line + IYI_TL_PARK) & 0xFFFFFFFF_u64).to_i32
+        while LibC.read(fd, pointerof(byte).as(Void*), 1_u64) != 1_i64
+        end
+      {% end %}
+      word(page + IYI_TC_RESUMED).value.add(1_u64)
+    end
+
+    # ── Roots ───────────────────────────────────────────────────────────
+
+    # Every stopped thread's registers and stack, for the collector. The
+    # stack's top is the mapping's the sp is in: a fiber's, asked of every
+    # fiber, or the thread's own.
+    def self.each_stopped_root(visit : Proc(UInt64, Nil)) : Nil
+      own = @@line
+      cursor = @@lines
+      while cursor != 0
+        if cursor != own
+          IyiRoots.scan_range(cursor + IYI_TL_SPILL, cursor + IYI_TL_SPILL_END, visit)
+          sp = IyiHeap.read64(cursor + IYI_TL_SP)
+          top = IyiScheduler.fiber_top_holding(sp)
+          top = IyiHeap.read64(cursor + IYI_TL_TOP) if top == 0
+          IyiRoots.scan_range(sp, top, visit)
+        end
+        cursor = IyiHeap.read64(cursor + IYI_TL_NEXT)
+      end
+    end
+  end
+{% end %}

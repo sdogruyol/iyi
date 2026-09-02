@@ -457,6 +457,16 @@ jobs:
       - name: The thread floor
         run: bash bench/thread_floor.sh
 
+      # Threads under the collector (GC_DESIGN.md Stage 4, src/iyi/thread.iyi):
+      # the probe's mechanism in the runtime — eight threads allocating from
+      # their own caches, collections stopping them where they run, every
+      # stopped thread's frames scanned as roots, a live list in each
+      # surviving by checksum and by the sweep's flag, and 32 threads past
+      # the core count. The floor: five names, nothing added. The failure
+      # proof removes the thread-root walk and the list is swept by name.
+      - name: Threads under the collector
+        run: bash bench/thread_exercise.sh
+
       # iyi is a permanent fork, so Crystal's name standing in for iyi's is a
       # defect and not a detail. Both layers: a tree that should have been
       # renamed, and a name left inside a file that was otherwise cut over.
@@ -631,6 +641,11 @@ jobs:
           # the samples job.
           ./bin/iyi build --cross-compile --target aarch64-linux-gnu \
             -o cross/floor-aarch64 bench/thread_floor.iyi
+          # Threads under the collector, the aarch64 arm: the runtime's own
+          # `clone`, the stop, the roots of a stopped thread, on a real
+          # arm64 kernel under emulation in cross-run.
+          ./bin/iyi build --cross-compile --target aarch64-linux-gnu \
+            -o cross/threads-aarch64 bench/thread_exercise.iyi
 
           # The Windows probe: the two shapes whose output has been seen wrong,
           # a case conversion and a number rendered into a string — then the
@@ -725,9 +740,11 @@ jobs:
               gcc conc-aarch64.o -o conc-aarch64 &&
               timeout 120 ./conc-aarch64 > conc.txt 2>&1 &&
               gcc floor-aarch64.o -o floor-aarch64 &&
-              timeout 120 ./floor-aarch64 2 20 > floor.txt 2>&1
+              timeout 120 ./floor-aarch64 2 20 > floor.txt 2>&1 &&
+              gcc threads-aarch64.o -o threads-aarch64 &&
+              timeout 300 ./threads-aarch64 4 > threads.txt 2>&1
             ' || status=$?
-          for out in got conc floor; do
+          for out in got conc floor threads; do
             echo "== $out.txt"; cat "cross/$out.txt" 2>/dev/null || echo "(not written)"
           done
           [ "${status:-0}" -eq 0 ]
@@ -736,6 +753,7 @@ jobs:
           # Under emulation the numbers are qemu's; the properties are the
           # kernel's ABI and the asm, which is what this arm is for.
           grep -q "every property held" cross/floor.txt && echo "aarch64: the thread floor held"
+          grep -q "every property held" cross/threads.txt && echo "aarch64: threads under the collector held"
 
   # darwin arm64 is a run target now (SPEC.md III.4.8): the concurrency
   # runtime's kqueue arm, the panic registry and every sample run natively on
@@ -824,6 +842,14 @@ jobs:
       # is cross-run's.
       - name: The thread floor (III.9, GC_DESIGN.md Stage 4)
         run: bash bench/thread_floor.sh
+
+      # Threads under the collector on darwin: libSystem's pthreads, the
+      # signal stop and the pipe park in the runtime rather than the probe,
+      # held to the thread floor's exact list, with a live list in every
+      # stopped thread's frames surviving the collections. The Linux arm
+      # is the samples job's, the aarch64 arm is cross-run's.
+      - name: Threads under the collector (GC_DESIGN.md Stage 4)
+        run: bash bench/thread_exercise.sh
 
       # The collector's gates, which the collector's own darwin arm (the
       # default allocator there since the flip) had never been held to in
