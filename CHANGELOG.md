@@ -31,6 +31,21 @@
   LLVM bump, not per push. darwin's tarball keeps brew's shared LLVM for
   now, stated rather than implied: its diet is its own piece of work.
 
+### Fixed
+
+- **`make -B iyi-tarball` packaged an unoptimised compiler past the guard
+  that exists to refuse one.** `release := 1` is the goal's own variable
+  and does not travel into the `$(MAKE) install_iyi` the recipe runs; `-B`
+  does travel, through `MAKEFLAGS`, so the sub-make rebuilt `iyi` again
+  *after* `check_iyi_is_release` had passed, without `--release`, and
+  installed that. Nothing about the tarball looked wrong: `bin/iyi
+  version` inside it said "not built in release mode". Found by running
+  the tarball that way once while proving the recipe above. The sub-make
+  is now handed `release=1` explicitly; the same `-B` run builds release
+  twice and packages release, and the plain `make iyi-tarball` against a
+  stale unoptimised binary still refuses by name.
+
+
 ## 0.8.0 — 2026-09-01
 
 **The collector is the default.** 0.7.0 built it; this release seats it: a

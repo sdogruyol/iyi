@@ -384,7 +384,12 @@ iyi-tarball: release := 1
 iyi-tarball: $(O)/iyi$(EXE) $(O)/$(IYI_DAEMON_BIN) check_iyi_is_release
 # bake-format on
 	rm -rf "$(O)/iyi-package"
-	$(MAKE) install_iyi DESTDIR="$(CURDIR)/$(O)/iyi-package" PREFIX=""
+# `release=1` again, for the sub-make: `release := 1` above is this goal's
+# and does not travel. Under `make -B iyi-tarball` the sub-make inherits
+# `-B`, rebuilds `iyi` for `install_iyi` *after* the guard above passed, and
+# without the word rebuilt it unoptimised — the exact package the guard
+# exists to refuse, found by running the tarball this way once.
+	$(MAKE) install_iyi release=1 DESTDIR="$(CURDIR)/$(O)/iyi-package" PREFIX=""
 	$(INSTALL) -m 644 README.md "$(O)/iyi-package/share/iyi/README.md"
 	$(INSTALL) -m 644 SPEC.md "$(O)/iyi-package/share/iyi/SPEC.md"
 	cp -R -p samples/iyi "$(O)/iyi-package/share/iyi/samples"
