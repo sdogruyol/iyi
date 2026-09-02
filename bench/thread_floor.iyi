@@ -219,13 +219,19 @@
                   : "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory", "cc"
                   : "volatile")
       {% else %}
+        # aarch64's `clone` takes (flags, stack, parent_tid, tls, child_tid):
+        # tls in x3 and the child-tid word in x4, the reverse of x86_64's
+        # (…, child_tid in r10, tls in r8). They were swapped here through
+        # the first three commits — every thread's pointer was its line and
+        # the kernel wrote the tid into the TLS block's control word — and
+        # the cross-run job, the one place this arm runs, was red on each.
         asm("sub x1, x19, #16
              stp x20, x21, [x1]
              mov x0, #0x0f00
              movk x0, #0x012d, lsl #16
              mov x2, #0
-             mov x3, x22
-             mov x4, x23
+             mov x3, x23
+             mov x4, x22
              mov x8, #220
              svc #0
              cbnz x0, 1f

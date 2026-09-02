@@ -246,6 +246,23 @@
   it, and the thread floor's own darwin clock, written to get around the
   rounding, is gone.
 
+- **The thread floor's aarch64 Linux arm never ran to the end in CI, and
+  now does.** `clone`'s argument order differs by architecture: x86_64
+  takes (flags, stack, parent_tid, child_tid, tls), aarch64 takes (flags,
+  stack, parent_tid, tls, child_tid), and `__tf_clone`'s aarch64 asm
+  loaded them in x86_64's order. Every raw thread's pointer was therefore
+  its table line and the kernel wrote its tid into the TLS block's
+  control word, and the first check — the tid the thread read against
+  the tid word the kernel wrote — failed with a 0 on every thread. The
+  cross-run job, the one place that arm runs, was red on all three
+  thread-floor commits, and the entries above that say "aarch64 under
+  emulation in CI" described the job that was meant to prove it, not a
+  pass. Two registers swapped; proven this time on a real arm64 Linux
+  kernel (a debian container on Apple silicon, no emulation): two and
+  eight threads, every property, the clone-flag failure proof naming
+  the clash, and the same `every property held` line the job greps
+  for.
+
 - **The collector's five gates and the defer cost now run in the darwin
   job, and running them found what nobody had.** The owned collector
   has been darwin's default allocator since the flip, and the darwin
