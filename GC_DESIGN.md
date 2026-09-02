@@ -458,13 +458,24 @@ same chain marked stopped is 1.9 ms; beside the program the longest
 first stop is 0.6 ms (the trigger's second collection, its helpers'
 first spawn) and the longest second 0.2 ms, with about twenty of
 forty-eight second stops retreating once. On `bench/gc_race.py` against
-Go: binary trees' longest pause 0.10 ms to Go's 0.19, total paused 2.6
-ms to 2.1; live churn 0.47 to 0.10 and 1.1 to 0.3; churn 0.03 to 0.48
-and 0.3 to 3.6. Resident memory is where Go still wins — 62 MB to 18
-on binary trees, 316 to 134 on live churn — the price of no assists: a
-mutator allocating faster than the helpers mark is never slowed, and
-the budget grows from the marked bytes. That, and Stage 8, are the
-next measured targets.
+Go, the table `python3 bench/gc_race.py` prints — release builds, best
+wall of five, worst resident of five, longest and total pause — read on
+this machine (20 cores) the day Stage 9 landed:
+
+| program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| binary trees | 0.276 s | 62 MB | 0.10 ms | 2.6 ms | 0.170 s | 18 MB | 63 ms | 0.149 s | 18 MB | 0.19 ms | 2.1 ms |
+| live churn | 0.160 s | 316 MB | 0.47 ms | 1.1 ms | 0.149 s | 91 MB | 92 ms | 0.225 s | 134 MB | 0.10 ms | 0.3 ms |
+| churn | 0.047 s | 38 MB | 0.03 ms | 0.3 ms | 0.078 s | 15 MB | 40 ms | 0.069 s | 15 MB | 0.48 ms | 3.6 ms |
+
+The pauses are Go's now or under them, on every program (binary trees'
+longest was 2.3 ms with the parallel marker alone, 2.7 before it).
+Wall time is Boehm's column on two of three: the write barrier's
+test is on every pointer store, and the helpers share the cores the
+program runs on. Resident memory is Go's column — the price of no
+assists: a mutator allocating faster than the helpers mark is never
+slowed, and the budget grows from the marked bytes. That, and Stage 8,
+are the next measured targets.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are
