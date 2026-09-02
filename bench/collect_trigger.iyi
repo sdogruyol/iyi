@@ -148,6 +148,23 @@
   # driver's proof unlinks the list and reads exactly that.
   {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
     marks = scheduler_marks(0x5A5A5A5A5A5A5A5A_u64)
+    # One collection, then the sweep's own word before anything allocates:
+    # a chunk it reclaimed carries FREE_FLAG until the allocator hands it
+    # out again, and nothing between the sweep and this read can — so the
+    # flag, not the contents, says whether the state was collected out
+    # from under its thread-local, on every platform's allocation pattern
+    # alike (read after a churn, the chunk was somebody else's on darwin
+    # and the read was a fault instead of a name).
+    IyiMark.collect
+    state_word = IyiHeap.read64((marks[0] ^ 0x5A5A5A5A5A5A5A5A_u64) - 8_u64)
+    if state_word & IyiHeap::FREE_FLAG != 0
+      # Named and left by the exit syscall, not raised: a panic's own path
+      # reaches for the scheduler's state, which is the object just found
+      # freed, and would fault before or after the name depending on the
+      # platform's allocation pattern.
+      puts "iyi: panic: scheduler state: after a collection the object the thread-local names is on a free list, collected out from under it"
+      __iyi_exit(1)
+    end
     before_state = IyiMark.collections
     churn(67108864_u64)
     state_wave = IyiMark.collections - before_state
@@ -155,13 +172,7 @@
     raise "scheduler state: the churn beside it triggered nothing" if state_wave == 0
     raise "scheduler state: the thread-local names a different object after #{count(state_wave)} collections" if after[0] != marks[0]
     raise "scheduler state: the running fiber it names is not the main fiber it held before the churn" if after[1] != marks[1]
-    # The sweep's own word: a chunk it reclaimed carries FREE_FLAG until the
-    # allocator hands it out again, which the churn's free-list order may
-    # not have done yet — so the flag, not the contents, is what says
-    # whether the state was collected out from under its thread-local.
-    state_word = IyiHeap.read64((marks[0] ^ 0x5A5A5A5A5A5A5A5A_u64) - 8_u64)
-    raise "scheduler state: after #{count(state_wave)} collections the object the thread-local names is on a free list, collected out from under it" if state_word & IyiHeap::FREE_FLAG != 0
-    puts "    scheduler's state: the object its thread-local names lived through #{count(state_wave)} collections, rooted by the global list"
+    puts "    scheduler's state: the object its thread-local names lived through #{count(state_wave + 1_u64)} collections, rooted by the global list"
   {% end %}
 
   # 4. Pressure on a program that spawns. A fiber holds the only reference
