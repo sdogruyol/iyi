@@ -105,11 +105,11 @@ prove_fails() {
 # The walk still counts, repaints and links, it just never hands the batch
 # to the centre.
 prove_fails "sweep frees nothing" nofree "sweep:" \
-  '{ if ($0 ~ /^            IyiHeap\.free_batch\(/) { print "            # removed"; next } print }'
+  '{ if ($0 ~ /IyiHeap\.free_batch\(IyiHeap\.class_index/) { print "        # removed"; next } print }'
 
 # The colour test stops mattering, so a live object goes on the free list.
 prove_fails "sweep frees the live" reckless "sweep:" \
-  '{ if ($0 ~ /^              if colour\(base\) == WHITE$/) { print "              if colour(base) == WHITE || true"; next } print }'
+  '{ if ($0 ~ /^            if word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag$/) { print "            if true"; next } print }'
 
 echo
 if [ "$status" -eq 0 ]; then

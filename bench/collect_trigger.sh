@@ -131,7 +131,13 @@ prove_fails "budget never grows" nogrow "budget:" \
 # The scavenge disabled: sweeps keep reclaiming chunks, mappings never go
 # back, and the heap is high-water — the check names it.
 prove_fails "mappings never return" noscavenge "scavenge:" \
-  '{ sub(/live == 0 && IyiHeap\.release_arena\(previous, arena\)/, "false"); print }'
+  '{ sub(/IyiHeap\.arena_live\(arena\) == 0 && IyiHeap\.release_arena\(previous, arena\)/, "false"); print }'
+
+# The allocator's sweep removed: every arena is debt until a pause pays
+# it, which is the eager sweep back inside the pause, and the lazy check
+# names it.
+prove_fails "sweep never lazy" nolazy "lazy:" \
+  '{ sub(/while centre\[index\] == 0 && IyiMark\.sweep_one/, "while false"); print }'
 
 # The scheduler's state left off the global list: the thread-local still
 # names it, nothing the walk scans does, the churn's own size class takes

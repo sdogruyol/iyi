@@ -503,6 +503,49 @@
   does not, by name. A channel's `T : Share` waits for the channel that
   crosses threads.
 
+- **The sweep is lazy: a collection marks and returns, and the allocator
+  sweeps what it needs.** The pause was the mark plus a walk of every
+  carved chunk, and on `bench/gc_race.py`'s binary trees the walk was most
+  of a 12.8 ms pause. A collection now marks, stamps a new epoch and
+  returns; every arena behind the epoch is sweep debt, and
+  `IyiHeap.refill` pays it one arena at a time when a class's chunks run
+  out — the sweep's cost lands on the allocations that need its memory,
+  in proportion to them, never in the pause. Sound because every chunk
+  wears the parity of the epoch it was handed out in (mark-word bit 4):
+  a white chunk of the current parity was allocated after the mark and
+  is alive by construction, one of the last parity was unmarked and is
+  dead, and a survivor is restamped when the sweep repaints it. The
+  budget comes from the mark itself, which adds each object's size as it
+  blackens it — twice what is live, Go's GOGC=100, floored at 4 MiB —
+  and the budget floored at the sweep's walk is gone, with the feedback
+  it had: on binary trees it took the heap to 160 MiB for 3 MiB live.
+  Arenas are 16 MiB-aligned now, and a byte per slot of the address
+  space says which slots are arenas, so `base_of` is an AND, a shift and
+  a load where it walked the arena list per pointer the marker met. The
+  scavenge is the pause's: the mark counts what it blackened per arena,
+  and an arena with nothing alive goes back with every thread stopped —
+  a sweeper on one thread cannot strip a running thread's cache. The
+  numbers, `bench/gc_race.py`, release, 20 cores: binary trees 12.8 ms
+  longest pause to 2.7 ms, 182 MiB peak to 46; live churn 28 ms to 8.8;
+  churn 0.15 ms to 0.04 and 9 ms paused in all to 0.3 — and binary
+  trees' wall time rose from 0.163 s to 0.266, because 54 marks of the
+  live tree replaced 11, each on one core while nineteen idle, which is
+  the next entry's job. Three things the first threaded run found: a
+  thread that read the epoch before parking in `map_arena`'s lock spin
+  linked an arena that looked like debt and was not counted as any, the
+  next pause swept it in place of a real one, the real one kept the last
+  mark's black, the mark never re-counted those objects, and the scavenge
+  handed a mapping of live objects to the kernel — the epoch is read
+  under the lock and the pause sweeps every arena behind the epoch, not a
+  counted number; the deferred park at `take`'s exit was inlined and the
+  chunk `take` was returning sat in a scratch register nothing scanned,
+  so `park_if_requested` and `stop_here` are `@[NoInline]`; and the carve
+  stamps a chunk's parity before it publishes the cursor, with an ordered
+  store, so a sweeper on another thread cannot read a fresh chunk as last
+  epoch's dead. `bench/collect_trigger.sh` holds the sweep to being lazy
+  — the allocator must sweep at least an arena per collection, and the
+  proof that removes its sweep is named — and every collector gate holds.
+
 ### Fixed
 
 - **The thread floor's x86_64 store clobbered its own value, and the
@@ -3319,7 +3362,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 7,081-line library and nothing else. Every other
+  written against iyi's own 7,328-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

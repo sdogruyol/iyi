@@ -249,7 +249,10 @@ puts "realloc: same-class, cross-class and null all hold their bytes"
   if Pointer(UInt64).new(words.address - 16_u64).value != 0_u64
     raise "clearing: reused chunk carried a stale type id"
   end
-  if Pointer(UInt64).new(words.address - 8_u64).value != 0_u64
+  # Bit 4 is the allocator's own stamp, the epoch parity the lazy sweep
+  # reads (GC_DESIGN.md); everything else — colour, the free flag, the
+  # atomic flag — must be zero.
+  if Pointer(UInt64).new(words.address - 8_u64).value & (0_u64 &- 1_u64 - IyiHeap::EPOCH_FLAG) != 0_u64
     raise "clearing: reused chunk carried a stale mark word"
   end
   puts "clearing: a freed chunk of 0xAA bytes comes back zeroed, directly, through __crystal_malloc64, and in its header"

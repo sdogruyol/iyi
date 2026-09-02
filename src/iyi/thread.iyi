@@ -577,6 +577,13 @@
     # The deferred stop, paid where a thread holds nothing: `take`'s exit,
     # and the runtime lock's spin. The request is cleared before the park
     # so the exit after a spin's park does not park twice.
+    # `@[NoInline]`, and load-bearing: the spill below captures the
+    # callee-saved registers, and the call boundary is what puts every
+    # live value the caller held in a caller-saved register onto its
+    # stack first. Inlined into `take`'s exit, the chunk `take` was about
+    # to return sat in a scratch register nothing scanned, and the mark
+    # that stopped the thread there freed it.
+    @[NoInline]
     def self.park_if_requested : Nil
       return unless IyiHeap.stop_requested?
       IyiHeap.clear_request
@@ -740,6 +747,7 @@
     # callee-saved registers are the ones that may hold a value across
     # this call, spilled onto the line the way `IyiRoots` spills the
     # collector's; the caller-saved ones are on the stack by convention.
+    @[NoInline]
     def self.stop_here : Nil
       line = @@line
       return if line == 0

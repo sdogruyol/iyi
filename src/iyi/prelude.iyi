@@ -769,6 +769,13 @@ require "./file"
       # `Array(Int32)` buffer turned every triggered collection into 20 ms
       # of `base_of` on integers.
       ATOMIC_FLAG = 8_u64
+      # Bit 4: the parity of the epoch this chunk was handed out in. What
+      # makes the lazy sweep sound: a white chunk stamped with the current
+      # epoch's parity was allocated after the mark that this sweep is for,
+      # and is alive by construction; one stamped with the last epoch's was
+      # unmarked by it and is dead. A surviving object is restamped when the
+      # sweep repaints it, so it is the current epoch's from then on.
+      EPOCH_FLAG = 16_u64
       LARGE_USER = 40_u64
 
       OFF_NEXT = 0_u64
@@ -776,6 +783,14 @@ require "./file"
       OFF_CHUNK = 16_u64
       OFF_CURSOR = 24_u64
       OFF_LEFT = 32_u64
+      # The collection this arena was last swept for (`IyiMark.epoch`): an
+      # arena behind the current epoch still holds the last mark's colours
+      # and is sweep debt, paid by the allocator that needs its chunks.
+      OFF_EPOCH = 40_u64
+      # Objects the last mark blackened in this arena: zero means nothing
+      # in it is reachable, and the pause that marked can hand the mapping
+      # back with every thread stopped.
+      OFF_LIVE = 48_u64
 
       # ── Whose state is whose ──────────────────────────────────────────
       #
@@ -848,6 +863,11 @@ require "./file"
         if page == 0
           page = __iyi_mmap(DIR_LEN).address
           lock
+          # The shared pages, made under the same lock the first time any
+          # thread reaches the heap: two threads' first allocations would
+          # otherwise each map a centre of their own.
+          @@central = __iyi_mmap(DIR_LEN).address if @@central == 0
+          @@arena_dir = __iyi_mmap(DIR_SLOTS).address if @@arena_dir == 0
           write64(page + CACHE_NEXT, @@caches)
           @@caches = page
           unlock
@@ -1015,13 +1035,13 @@ require "./file"
           # question worn the other way: the path that does not clear is
           # exactly the path whose caller promised no pointers.
           write64(head + OFF_TYPE, 0_u64)
-          write64(head + OFF_MARK, clear ? 0_u64 : ATOMIC_FLAG)
+          write64(head + OFF_MARK, (clear ? 0_u64 : ATOMIC_FLAG) | IyiMark.epoch_flag)
           clear_block(head + HEADER, payload(index)) if clear
           write64(head + OFF_SIZE, size)
           return head
         end
         head = carve(table, size, index)
-        write64(head + OFF_MARK, ATOMIC_FLAG) unless clear
+        write64(head + OFF_MARK, ATOMIC_FLAG | IyiMark.epoch_flag) unless clear
         head
       end
 
@@ -1030,7 +1050,15 @@ require "./file"
       # says why one. Answers the new head, 0 if the centre had nothing.
       def self.refill(table : Pointer(UInt64), index : Int32) : UInt64
         centre = central
-        return 0_u64 if centre[index] == 0
+        if centre[index] == 0
+          # Nothing swept for this class yet: pay sweep debt, one arena at
+          # a time, until a batch of this class appears or the debt is
+          # gone — the sweep's cost lands on the allocations that need
+          # its chunks rather than inside the pause (GC_DESIGN.md).
+          while centre[index] == 0 && IyiMark.sweep_one
+          end
+          return 0_u64 if centre[index] == 0
+        end
         lock
         head = centre[index]
         centre[index] = read64(head + BATCH_NEXT) if head != 0
@@ -1046,22 +1074,77 @@ require "./file"
           table[FILL + index] = arena
         end
         cursor = read64(arena + OFF_CURSOR)
-        write64(arena + OFF_CURSOR, cursor + read64(arena + OFF_CHUNK))
-        write64(arena + OFF_LEFT, read64(arena + OFF_LEFT) - 1)
+        # The chunk's stamp before the cursor moves past it, and the cursor
+        # as an ordered store: a lazy sweeper on another thread reads the
+        # cursor and then the chunks below it, and a chunk it can see must
+        # already wear this epoch's parity or it would read as last
+        # epoch's dead — freed under the thread about to hand it out.
+        write64(cursor + OFF_MARK, IyiMark.epoch_flag)
         write64(cursor + OFF_SIZE, size)
+        Pointer(Atomic(UInt64)).new(arena + OFF_CURSOR).value.set(cursor + read64(arena + OFF_CHUNK))
+        write64(arena + OFF_LEFT, read64(arena + OFF_LEFT) - 1)
         cursor
       end
 
+      # Every arena is MAP-aligned, and a byte per MAP-sized slot of the
+      # address space says whether the slot is an arena: `arena_of` is an
+      # AND, a shift and a load, where it was a walk of the arena list per
+      # pointer the marker met — the walk was most of a mark. The
+      # directory is a mapping of 2^24 bytes for a 48-bit space, reserved
+      # once and committed a page at a time as arenas land in it; the
+      # kernel charges nothing for the untouched rest.
+      DIR_SLOTS = 16777216_u64
+
+      @@arena_dir : UInt64 = 0_u64
+
+      def self.arena_dir : UInt64
+        @@arena_dir = __iyi_mmap(DIR_SLOTS).address if @@arena_dir == 0
+        @@arena_dir
+      end
+
+      # The arena holding `address`, or 0. One load past the arithmetic; a
+      # pointer into an arena's header or past its fill cursor is the
+      # caller's to refuse.
+      def self.arena_of(address : UInt64) : UInt64
+        slot = address.unsafe_shr(24_u64)
+        return 0_u64 if slot >= DIR_SLOTS
+        return 0_u64 if Pointer(UInt8).new(arena_dir + slot).value == 0_u8
+        address & (0_u64 &- MAP)
+      end
+
+      # A MAP-aligned mapping of MAP bytes: ask for twice, keep the aligned
+      # middle, give the ends back.
+      def self.map_aligned : UInt64
+        raw = __iyi_mmap(MAP * 2_u64).address
+        base = (raw + MAP - 1_u64) & (0_u64 &- MAP)
+        __iyi_munmap(raw, base - raw) if base > raw
+        tail = raw + MAP * 2_u64 - (base + MAP)
+        __iyi_munmap(base + MAP, tail) if tail > 0
+        base
+      end
+
       def self.map_arena(index : Int32) : UInt64
-        base = __iyi_mmap(MAP).address
+        base = map_aligned
         chunk = payload(index) + HEADER
         write64(base + OFF_MAP, MAP)
         write64(base + OFF_CHUNK, chunk)
         write64(base + OFF_CURSOR, base + HEAD)
         write64(base + OFF_LEFT, (MAP - HEAD).unsafe_div(chunk))
         lock
+        # Fresh chunks are white and nobody's: swept for the current epoch
+        # by construction — the epoch read under the lock, because a thread
+        # that read it before parking in this very spin, through a pause
+        # that turned it, would link an arena that looked like debt and was
+        # not counted as any: the next pause's debt loop swept it in place
+        # of a real one, a real one kept the last mark's black, and the mark
+        # that followed counted nothing alive in it. The scavenge then
+        # handed a mapping full of live objects back to the kernel.
+        write64(base + OFF_EPOCH, IyiMark.epoch)
         write64(base + OFF_NEXT, @@arenas)
         @@arenas = base
+        # The directory byte last, after the header and the link: a reader
+        # that finds the byte finds an arena that is whole.
+        Pointer(UInt8).new(arena_dir + base.unsafe_shr(24_u64)).value = 1_u8
         unlock
         base
       end
@@ -1071,7 +1154,7 @@ require "./file"
         base = __iyi_mmap(mapped).address
         write64(base + OFF_MAP, mapped)
         write64(base + 16 + OFF_SIZE, size)
-        write64(base + 16 + OFF_MARK, ATOMIC_FLAG) unless clear
+        write64(base + 16 + OFF_MARK, (clear ? 0_u64 : ATOMIC_FLAG) | IyiMark.epoch_flag)
         lock
         write64(base + OFF_NEXT, @@large)
         @@large = base
@@ -1221,8 +1304,23 @@ require "./file"
         else
           write64(previous + OFF_NEXT, read64(arena + OFF_NEXT))
         end
+        Pointer(UInt8).new(arena_dir + arena.unsafe_shr(24_u64)).value = 0_u8
         __iyi_munmap(arena, read64(arena + OFF_MAP))
         true
+      end
+
+      def self.arena_live(arena : UInt64) : UInt64
+        read64(arena + OFF_LIVE)
+      end
+
+      def self.arena_live_reset(arena : UInt64) : Nil
+        write64(arena + OFF_LIVE, 0_u64)
+      end
+
+      # One more object in this arena survived the mark.
+      def self.count_live(base : UInt64) : Nil
+        arena = arena_of(base)
+        write64(arena + OFF_LIVE, read64(arena + OFF_LIVE) + 1_u64) if arena != 0
       end
 
       # Same-chunk growth within a class, allocate-and-copy across one,
@@ -1274,14 +1372,10 @@ require "./file"
 
       def self.containing(pointer : Void*) : UInt64
         address = pointer.address
-        arena = @@arenas
-        while arena != 0
-          if address >= arena + HEAD && address < arena + read64(arena + OFF_MAP)
-            return arena
-          end
-          arena = read64(arena + OFF_NEXT)
-        end
-        0_u64
+        arena = arena_of(address)
+        return 0_u64 if arena == 0
+        return 0_u64 if address < arena + HEAD
+        arena
       end
 
       def self.containing_large(pointer : Void*) : UInt64
@@ -1318,7 +1412,15 @@ require "./file"
       # every arena, so it is an accessor beside the others rather than a
       # thing either stage reaches into the header for.
       def self.arena_cursor(arena : UInt64) : UInt64
-        read64(arena + OFF_CURSOR)
+        Pointer(Atomic(UInt64)).new(arena + OFF_CURSOR).value.get
+      end
+
+      def self.arena_epoch(arena : UInt64) : UInt64
+        read64(arena + OFF_EPOCH)
+      end
+
+      def self.arena_epoch_set(arena : UInt64, epoch : UInt64) : Nil
+        write64(arena + OFF_EPOCH, epoch)
       end
 
       def self.first_large : UInt64
@@ -2164,6 +2266,7 @@ require "./file"
           end
         end
         recolour(base, BLACK)
+        IyiHeap.count_live(base)
       end
 
       # One mark phase. Returns how many objects came out black, which is the
@@ -2171,12 +2274,19 @@ require "./file"
       # against.
       def self.mark : UInt64
         @@queue_len = 0_u64
+        @@bytes_marked = 0_u64
+        arena = IyiHeap.first_arena
+        while arena != 0
+          IyiHeap.arena_live_reset(arena)
+          arena = IyiHeap.arena_next(arena)
+        end
         IyiRoots.each_root(->(base : UInt64) { shade(base) })
         black = 0_u64
         while @@queue_len > 0_u64
           @@queue_len = @@queue_len - 1_u64
           base = IyiHeap.read64(@@queue + @@queue_len * 8_u64)
           scan(base)
+          @@bytes_marked = @@bytes_marked + IyiHeap.read64(base - IyiHeap::HEADER)
           black = black + 1_u64
         end
         black
@@ -2230,79 +2340,193 @@ require "./file"
       # based and the standard library's `WeakRef` lives on the `--crystal`
       # side, so there is no table here to walk and null out. Both wait on the
       # language having the feature rather than on the collector.
+      # The sweep is lazy since the thread cutover, the way Go's is: a
+      # collection marks, stamps a new epoch, and returns; every arena behind
+      # the epoch is sweep debt, and the debt is paid one arena at a time by
+      # the allocator that runs out of swept chunks (`IyiHeap.refill`) — so
+      # the sweep's cost lands on the allocations that need its memory, in
+      # proportion to them, and never inside the pause. What a pause is now
+      # is the mark, and the mark alone. The next collection pays whatever
+      # debt is left before it marks, because an unswept arena still wears
+      # the last mark's colours; under steady allocation that is little or
+      # nothing, and the exercise reports it. `sweep` here is the eager verb:
+      # every arena and the large list at once, what `IyiMark.collect` runs
+      # for a program that asked for its memory back now.
       def self.sweep : Nil
+        while sweep_one
+        end
+        sweep_large
+      end
+
+      # One arena behind the epoch swept, its white chunks batched to the
+      # centre or its mapping handed back. Answers whether there was one.
+      # Under the runtime lock for the list edits; the walk itself reads
+      # colours no mutator writes.
+      def self.sweep_one : Bool
+        IyiRuntimeLock.lock
+        arena = IyiHeap.first_arena
+        while arena != 0 && IyiHeap.arena_epoch(arena) == @@epoch
+          arena = IyiHeap.arena_next(arena)
+        end
+        if arena == 0
+          IyiRuntimeLock.unlock
+          return false
+        end
+        IyiHeap.arena_epoch_set(arena, @@epoch)
+        sweep_arena(arena)
+        @@debt = @@debt - 1_u64 if @@debt > 0_u64
+        @@swept_by_allocator = @@swept_by_allocator + 1_u64
+        IyiRuntimeLock.unlock
+        true
+      end
+
+      # `sweep_one` with the lock already held: the collection's own use.
+      def self.sweep_one_held : Bool
+        arena = IyiHeap.first_arena
+        while arena != 0 && IyiHeap.arena_epoch(arena) == @@epoch
+          arena = IyiHeap.arena_next(arena)
+        end
+        return false if arena == 0
+        IyiHeap.arena_epoch_set(arena, @@epoch)
+        sweep_arena(arena)
+        @@debt = @@debt - 1_u64 if @@debt > 0_u64
+        true
+      end
+
+      def self.sweep_arena(arena : UInt64) : Nil
+        chunk = IyiHeap.arena_chunk(arena)
+        batch_head = 0_u64
+        batch_tail = 0_u64
+        cursor = arena + IyiHeap::HEAD
+        stop = IyiHeap.arena_cursor(arena)
+        @@bytes_walked = @@bytes_walked + (stop - cursor)
+        while cursor < stop
+          base = cursor + IyiHeap::HEADER
+          unless IyiRoots.free_listed?(cursor, chunk)
+            word = IyiHeap.read64(cursor + IyiHeap::OFF_MARK)
+            if word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag
+              # Unmarked, and allocated before the mark: dead.
+              @@bytes_freed = @@bytes_freed + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
+              @@swept = @@swept + 1_u64
+              IyiHeap.write64(cursor + IyiHeap::OFF_MARK, word | IyiHeap::FREE_FLAG)
+              IyiHeap.write64(cursor, batch_head)
+              batch_tail = cursor if batch_head == 0
+              batch_head = cursor
+            elsif word & COLOUR != WHITE
+              # Marked: survives, white again and this epoch's. A white
+              # chunk of this epoch's parity was allocated after the mark,
+              # alive by construction, and is left as it is.
+              @@bytes_kept = @@bytes_kept + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
+              IyiHeap.write64(cursor + IyiHeap::OFF_MARK, (word - (word & COLOUR) - (word & IyiHeap::EPOCH_FLAG)) | @@epoch_flag)
+              @@kept = @@kept + 1_u64
+            end
+          end
+          cursor = cursor + chunk
+        end
+        IyiHeap.free_batch(IyiHeap.class_index(chunk - IyiHeap::HEADER), batch_head, batch_tail) if batch_head != 0
+      end
+
+      # The scavenge, in the pause with every thread stopped: an arena the
+      # mark found nothing alive in goes back to the kernel (a collector
+      # that reclaims chunks but never mappings has a high-water heap, not
+      # a heap) — every free list, the centre's and each stopped thread's
+      # cache's, stripped of its chunks first, which is why this is the
+      # pause's and not the lazy sweeper's: a sweeper on one thread cannot
+      # edit another running thread's cache. Some cache's warm fill arena
+      # is exempt, the cushion that keeps spike-then-idle from paying an
+      # mmap on its next allocation. Runs after the mark and before the
+      # epoch turns, so a released arena is never debt.
+      def self.scavenge : Nil
+        previous = 0_u64
+        arena = IyiHeap.first_arena
+        while arena != 0
+          following = IyiHeap.arena_next(arena)
+          if IyiHeap.arena_live(arena) == 0 && IyiHeap.release_arena(previous, arena)
+            @@arenas_released = @@arenas_released + 1_u64
+          else
+            previous = arena
+          end
+          arena = following
+        end
+      end
+
+      # The large list is short and its sweep is a walk of nodes, not of
+      # memory: eager, under the collection's own lock.
+      def self.sweep_large : Nil
+        node = IyiHeap.first_large
+        while node != 0
+          following = IyiHeap.large_next(node)
+          base = node + IyiHeap::LARGE_USER
+          word = IyiHeap.read64(base - 8_u64)
+          if word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag
+            @@bytes_freed = @@bytes_freed + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
+            @@swept = @@swept + 1_u64
+            IyiHeap.free_large(node + 16_u64)
+          elsif word & COLOUR != WHITE
+            @@bytes_kept = @@bytes_kept + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
+            IyiHeap.write64(base - 8_u64, (word - (word & COLOUR) - (word & IyiHeap::EPOCH_FLAG)) | @@epoch_flag)
+            @@kept = @@kept + 1_u64
+          end
+          node = following
+        end
+      end
+
+      # A new epoch: every arena is debt, the counters this epoch's sweep
+      # fills start again. Called with the lock held, after a mark.
+      def self.begin_sweep : Nil
+        @@epoch = @@epoch + 1_u64
+        @@epoch_flag = (@@epoch & 1_u64) * IyiHeap::EPOCH_FLAG
         @@swept = 0_u64
         @@kept = 0_u64
         @@bytes_freed = 0_u64
         @@bytes_kept = 0_u64
         @@bytes_walked = 0_u64
-
-        # The arena walk keeps a trailing pointer, because a sweep that
-        # finds an arena with no live chunk hands the whole mapping back to
-        # the kernel (GC_DESIGN.md's scavenge: a collector that reclaims
-        # chunks but never mappings has a high-water heap, not a heap). The
-        # class's current fill arena is exempt even when empty — one warm
-        # arena per class is the cushion that keeps a spike-then-idle
-        # program from paying an mmap on its next allocation.
-        # Each arena's white chunks are linked as they are found and go to
-        # the centre as one batch under one take of the heap lock — or not
-        # at all, when the arena goes back to the kernel with them in it.
-        previous = 0_u64
+        debt = 0_u64
         arena = IyiHeap.first_arena
         while arena != 0
-          following = IyiHeap.arena_next(arena)
-          chunk = IyiHeap.arena_chunk(arena)
-          live = 0_u64
-          batch_head = 0_u64
-          batch_tail = 0_u64
-          cursor = arena + IyiHeap::HEAD
-          stop = IyiHeap.arena_cursor(arena)
-          @@bytes_walked = @@bytes_walked + (stop - cursor)
-          while cursor < stop
-            base = cursor + IyiHeap::HEADER
-            unless IyiRoots.free_listed?(cursor, chunk)
-              if colour(base) == WHITE
-                @@bytes_freed = @@bytes_freed + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
-                @@swept = @@swept + 1_u64
-                IyiHeap.write64(cursor + IyiHeap::OFF_MARK, IyiHeap.read64(cursor + IyiHeap::OFF_MARK) | IyiHeap::FREE_FLAG)
-                IyiHeap.write64(cursor, batch_head)
-                batch_tail = cursor if batch_head == 0
-                batch_head = cursor
-              else
-                @@bytes_kept = @@bytes_kept + IyiHeap.read64(cursor + IyiHeap::OFF_SIZE)
-                recolour(base, WHITE)
-                @@kept = @@kept + 1_u64
-                live = live + 1_u64
-              end
-            end
-            cursor = cursor + chunk
-          end
-          if live == 0 && IyiHeap.release_arena(previous, arena)
-            @@arenas_released = @@arenas_released + 1_u64
-          else
-            IyiHeap.free_batch(IyiHeap.class_index(chunk - IyiHeap::HEADER), batch_head, batch_tail) if batch_head != 0
-            previous = arena
-          end
-          arena = following
+          debt = debt + 1_u64
+          arena = IyiHeap.arena_next(arena)
         end
-
-        node = IyiHeap.first_large
-        while node != 0
-          following = IyiHeap.large_next(node)
-          base = node + IyiHeap::LARGE_USER
-          if colour(base) == WHITE
-            @@bytes_freed = @@bytes_freed + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
-            @@swept = @@swept + 1_u64
-            IyiHeap.free_large(node + 16_u64)
-          else
-            @@bytes_kept = @@bytes_kept + IyiHeap.read64(node + 16_u64 + IyiHeap::OFF_SIZE)
-            recolour(base, WHITE)
-            @@kept = @@kept + 1_u64
-          end
-          node = following
-        end
-
+        @@debt = debt
         @@collections = @@collections + 1_u64
+      end
+
+      @@epoch : UInt64 = 1_u64
+      # `EPOCH_FLAG` or 0: the parity the allocator stamps on a chunk it
+      # hands out, and the sweep compares against.
+      @@epoch_flag : UInt64 = 16_u64
+      @@debt : UInt64 = 0_u64
+      @@debt_paid_in_pause : UInt64 = 0_u64
+      @@swept_by_allocator : UInt64 = 0_u64
+      @@bytes_marked : UInt64 = 0_u64
+
+      def self.epoch : UInt64
+        @@epoch
+      end
+
+      def self.epoch_flag : UInt64
+        @@epoch_flag
+      end
+
+      # Arenas still wearing the last mark's colours: what the next pause
+      # would have to sweep first.
+      def self.debt : UInt64
+        @@debt
+      end
+
+      # Arenas the pauses swept before marking, in all — the lazy sweep's
+      # honest failure count, printed by the exercise.
+      def self.debt_paid_in_pause : UInt64
+        @@debt_paid_in_pause
+      end
+
+      # Arenas the allocator swept on its own time, outside any pause.
+      def self.swept_by_allocator : UInt64
+        @@swept_by_allocator
+      end
+
+      def self.bytes_marked : UInt64
+        @@bytes_marked
       end
 
       # The allocation-pressure trigger — what makes this a collector rather
@@ -2323,7 +2547,7 @@ require "./file"
       # interpolation's allocation running one in the middle. It is the same
       # switch Boehm spells GC_disable, and a program that turns it off owns
       # its own memory until it turns it back on.
-      MIN_BUDGET = 1048576_u64
+      MIN_BUDGET = 4194304_u64
 
       @@budget : UInt64 = 0_u64
       @@collecting : Bool = false
@@ -2359,7 +2583,7 @@ require "./file"
           return
         end
         @@collecting = true
-        collect_locked
+        collect_locked(false)
         @@collecting = false
         IyiRuntimeLock.unlock
       end
@@ -2369,28 +2593,43 @@ require "./file"
       # whoever asked for it. The lock is taken before anything stops, so
       # no stopped thread holds it (thread.iyi says why that matters), and
       # released after every stopped thread has counted itself out.
+      # The verb: a program that calls this wants its memory back now, so
+      # the sweep is eager here — every arena, the large list — where the
+      # trigger's collections leave the sweep to the allocator.
       def self.collect : Nil
         IyiRuntimeLock.lock
-        collect_locked
+        collect_locked(true)
         IyiRuntimeLock.unlock
       end
 
-      def self.collect_locked : Nil
+      def self.collect_locked(eager : Bool) : Nil
         started = now_ns
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
           others = IyiThread.stop_others
         {% end %}
+        # Debt left from the last epoch: an unswept arena wears the last
+        # mark's colours, and a mark over them would call last cycle's
+        # black this cycle's live — and, worse, never re-count it, so an
+        # arena of live objects would read as empty to the scavenge. Paid
+        # here, every arena behind the epoch and not a counted number of
+        # them, and counted, because a pause that sweeps is the thing the
+        # lazy sweep exists to end.
+        while sweep_one_held
+          @@debt_paid_in_pause = @@debt_paid_in_pause + 1_u64
+        end
         mark
-        sweep
+        scavenge
+        begin_sweep
+        sweep_large
+        while eager && sweep_one_held
+        end
         IyiHeap.allocated_word.value.set(0_u64)
-        # The next budget: twice what survived, and never less than half
-        # of what the sweep walked, so a collection costs a bounded amount
-        # per byte allocated however many arenas the threads carved —
-        # eight threads' caches took the heap to eleven arenas and the
-        # sweep to 300 µs at a budget of a MiB, twenty times one thread's.
-        doubled = @@bytes_kept * 2_u64
-        half_walked = @@bytes_walked.unsafe_div(2_u64)
-        doubled = half_walked if half_walked > doubled
+        # The next budget: twice what the mark found live (Go's GOGC=100),
+        # floored at MIN_BUDGET so a small program pays nothing. The mark
+        # knows the live bytes — it added each object's size as it
+        # blackened it — which is what lets the sweep be lazy: the budget
+        # no longer waits on a sweep to count.
+        doubled = @@bytes_marked * 2_u64
         @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
           IyiThread.resume_others(others)
