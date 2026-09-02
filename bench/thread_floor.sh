@@ -143,8 +143,13 @@ case "$(uname -s)" in
     # defines `bzero` now, the way it defines `memset`, so the name resolves
     # to the program's own and the release list is the plain list.
     step "dependency floor: what a thread costs darwin, by name"
-    runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pthread_get_stackaddr_np _pthread_self _write'
-    thread='__tlv_bootstrap _pipe _pthread_create _pthread_join _pthread_kill _pthread_threadid_np _read _sigaction'
+    # `_read` is the runtime's now, not only this probe's: since thread.iyi
+    # every darwin program can park for a collection's stop, and the park
+    # is a read on a pipe, reachable from the runtime lock's spin in every
+    # build the optimiser cannot fold — including the refused variants,
+    # which park their own threads differently but carry the runtime's.
+    runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pthread_get_stackaddr_np _pthread_self _read _write'
+    thread='__tlv_bootstrap _pipe _pthread_create _pthread_join _pthread_kill _pthread_threadid_np _sigaction'
     # The refused parks: the lock's two calls in place of `pipe` and `read`,
     # and `sigsuspend` alone in their place. The Mach stop swaps the stop
     # and park names for four of its own:
@@ -173,7 +178,7 @@ case "$(uname -s)" in
         exit 1
       fi
     done
-    echo "  the runtime's twelve names, the thread's eight, libSystem alone, plain and release; each refused variant to its own list"
+    echo "  the runtime's thirteen names, the thread's seven, libSystem alone, plain and release; each refused variant to its own list"
     ;;
 esac
 
