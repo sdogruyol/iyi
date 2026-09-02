@@ -2710,6 +2710,105 @@ describe Iyi::IyiMod do
     end
   end
 
+  # SPEC.md III.4.4: the `Share` marker travels with the declaration. A
+  # producer writes `@[Share]` above every type it found shareable, and a
+  # consumer reads that — never recomputing, because the bodies that said
+  # no method assigns a field are not in the artifact — and gates the block
+  # `IyiThread.start` runs on another thread by it (III.4.11).
+  it "carries a type's Share marker, and a consumer's thread reads it" do
+    with_tempdir("iyimod_share") do
+      Dir.mkdir_p "std"
+      File.write "std/pair.iyi", <<-IYI
+        module std/pair
+
+        pub struct Pair
+          @left : Int32
+          @right : Int32
+
+          def initialize(@left : Int32, @right : Int32)
+          end
+
+          def left : Int32
+            @left
+          end
+        end
+
+        pub class Counter
+          @count : Int32
+
+          def initialize
+            @count = 0
+          end
+
+          def bump : Nil
+            @count = 1
+          end
+
+          def count : Int32
+            @count
+          end
+        end
+        IYI
+      File.write "main.iyi", <<-IYI
+        module main
+
+        import std/pair
+
+        pair = Std::Pair::Pair.new(1, 2)
+        t = IyiThread.start do
+          pair.left
+          nil
+        end
+        t.join
+        puts pair.left
+        IYI
+
+      source = Iyi::Compiler::Source.new(File.expand_path("main.iyi"), File.read("main.iyi"))
+
+      producer = create_spec_compiler
+      producer.prelude = "iyi/prelude"
+      producer.emit_iyimod = "mods"
+      producer.no_codegen = true
+      producer.compile source, File.expand_path("unused")
+
+      types = Iyi::IyiMod.read(File.join("mods", "std", "pair.iyimod")).exports.types
+      types.find! { |candidate| candidate.name == "Pair" }.annotations.should eq ["@[Share]"]
+      types.find! { |candidate| candidate.name == "Counter" }.annotations.should eq [] of String
+
+      File.delete "std/pair.iyi"
+
+      # The shareable one crosses a thread from the artifact alone.
+      consumer = create_spec_compiler
+      consumer.prelude = "iyi/prelude"
+      consumer.use_iyimod = "mods"
+      consumer.no_codegen = true
+      consumer.compile source, File.expand_path("unused")
+
+      # The other is refused with the artifact as the reason: the consumer
+      # cannot see `bump`, and does not pretend to.
+      File.write "main.iyi", <<-IYI
+        module main
+
+        import std/pair
+
+        counter = Std::Pair::Counter.new
+        t = IyiThread.start do
+          counter.count
+          nil
+        end
+        t.join
+        IYI
+      source = Iyi::Compiler::Source.new(File.expand_path("main.iyi"), File.read("main.iyi"))
+      refusing = create_spec_compiler
+      refusing.prelude = "iyi/prelude"
+      refusing.use_iyimod = "mods"
+      refusing.no_codegen = true
+      expect_raises(Iyi::TypeException, /captures `counter : Std::Pair::Counter`, which is not Share: Std::Pair::Counter came from an artifact whose producer did not find it shareable/) do
+        refusing.compile source, File.expand_path("unused")
+      end
+    end
+  end
+
   it "renders a type's fields into the declarations a consumer reads" do
     declaration = type_declaration("List", "generic struct",
       type_parameters: ["T"],

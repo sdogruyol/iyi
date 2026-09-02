@@ -1294,6 +1294,18 @@ module Iyi
         assoc_types = [] of String
       end
 
+      # iyi: the `Share` marker travels with the declaration (SPEC.md
+      # III.4.4): a type this build found shareable is exported wearing
+      # `@[Share]`, and a consumer trusts that rather than recomputing
+      # something it cannot — the bodies that said no field is assigned
+      # outside `initialize` are not in the artifact. Only a struct or a
+      # class has fields to be shareable over; a trait, alias or lib does
+      # not carry the marker.
+      annotations = [] of String
+      if type.is_a?(ClassType) && Iyi::Share.shareable?(type)
+        annotations << "@[Share]"
+      end
+
       IyiMod::TypeDecl.new(
         name: name,
         kind: type.type_desc,
@@ -1306,6 +1318,7 @@ module Iyi
         visibility: "pub",
         types: iyi_carried_types(program, filename, type),
         macros: iyi_macros_on(type),
+        annotations: annotations,
         doc: type.doc || "",
       )
     end

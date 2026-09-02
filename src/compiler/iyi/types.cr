@@ -24,6 +24,13 @@ module Iyi
     # duplicate symbol.
     property? iyi_from_artifact = false
 
+    # iyi: `@[Share]` was on the declaration (SPEC.md III.4.4). Trusted to be
+    # shareable whenever its type arguments are, whatever its fields do; an
+    # imported type carries this from its artifact, which is the only way a
+    # consumer learns a type's shareability — `Iyi::Share` never recomputes
+    # for a type whose bodies it cannot see.
+    property? iyi_share_trusted = false
+
     def initialize(@program : Program)
     end
 

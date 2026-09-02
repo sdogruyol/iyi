@@ -470,6 +470,39 @@
   per thread is the answer built when a program's fiber is ever that
   deep. Every existing gate holds over the threaded runtime.
 
+- **`Share` is built, and a thread's block may capture only what it
+  marks.** SPEC.md III.4.4's marker, refused three times as a mechanism
+  with no caller, has one: the block `IyiThread.start` runs on another
+  thread. `Iyi::Share` (`src/compiler/iyi/semantic/share.cr`) decides a
+  type structurally on the compiler's own AST, the way
+  `bench/share_count.cr` counted it — a field is mutable if any method
+  other than `initialize` assigns it, by `=`, `+=` or a multiple
+  assignment, or a setter `field=` exists; every field's type must be
+  shareable in turn; integers, floats, `Bool`, `Char`, `Nil`, `Symbol`
+  and enums are, `Pointer` is raw memory and is not, nor are
+  `StaticArray` and a `Proc`, and a tuple, union or base-typed class is
+  when every member or subclass is. `@[Share]` on a declaration is the
+  trust half — shareable whenever the type arguments are, whatever the
+  fields do — and `Atomic(T)` and `samples/iyi/std/list.iyi`'s `List(T)`
+  carry it, the list the spec said should stay short. The marker
+  travels: a producer writes `@[Share]` into the artifact declaration
+  of every type it found shareable, in the annotations slot the
+  declaration already had, and a consumer reads that and never
+  recomputes, because the bodies that said no field is assigned are not
+  in the artifact — an imported type without the marker is refused with
+  the artifact as the reason. The gate is in the cleanup pass beside
+  the one that refuses a closure to a C function: every variable the
+  block captures, and `self` when the block reaches an instance
+  variable, is asked, and the refusal names the variable, its type and
+  the field that failed one level at a time —
+  `captures \`items : Array(Int32)\`, which is not Share: Array(Int32)'s
+  field @size is assigned in \`unsafe_set_size\``. Eight shapes in
+  `spec/compiler/semantic/iyi_spec.cr`, the artifact round trip in
+  `spec/compiler/iyimod_spec.cr`, and `bench/thread_exercise.sh`'s new
+  last step: a program capturing an `Array` that must not compile, and
+  does not, by name. A channel's `T : Share` waits for the channel that
+  crosses threads.
+
 ### Fixed
 
 - **The thread floor's x86_64 store clobbered its own value, and the
@@ -3286,7 +3319,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 7,080-line library and nothing else. Every other
+  written against iyi's own 7,081-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

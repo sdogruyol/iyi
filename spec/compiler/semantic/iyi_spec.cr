@@ -3077,4 +3077,200 @@ describe "Semantic: iyi" do
         CODE
     end
   end
+
+  # SPEC.md III.4.4: `Share`, gating the block `IyiThread.start` runs on
+  # another thread (III.4.11). The stub stands in for the prelude's thread:
+  # the compiler knows the call by its owner's name and the block's shape.
+  describe "Share" do
+    stub = <<-STUB
+      class IyiThread
+        def self.start(&block : -> Nil) : Nil
+          keep = block
+          nil
+        end
+      end
+
+      STUB
+
+    it "lets a block capture integers, strings and immutable structs" do
+      assert_type(stub + <<-CODE, filename: "x.iyi") { nil_type }
+        struct Point
+          def initialize(@x : Int32, @y : Int32)
+          end
+
+          def x : Int32
+            @x
+          end
+        end
+
+        n = 3
+        name = "seven"
+        point = Point.new(1, 2)
+        IyiThread.start do
+          n
+          point.x
+          name
+          nil
+        end
+        CODE
+    end
+
+    it "refuses a captured value whose type has a setter" do
+      assert_error(stub + <<-CODE, "the block IyiThread.start runs on another thread captures `counter : Counter`, which is not Share: Counter's field @count is given a setter `count=` (SPEC.md III.4.4)", filename: "x.iyi")
+        class Counter
+          def initialize
+            @count = 0
+          end
+
+          def count=(value : Int32)
+            @count = value
+          end
+        end
+
+        counter = Counter.new
+        IyiThread.start do
+          counter.count = 1
+          nil
+        end
+        CODE
+    end
+
+    it "refuses a captured value whose type assigns a field outside initialize" do
+      assert_error(stub + <<-CODE, "which is not Share: Tally's field @total is assigned in `bump` (SPEC.md III.4.4)", filename: "x.iyi")
+        class Tally
+          def initialize
+            @total = 0
+          end
+
+          def bump : Nil
+            @total = 1
+          end
+
+          def total : Int32
+            @total
+          end
+        end
+
+        tally = Tally.new
+        IyiThread.start do
+          tally.total
+          nil
+        end
+        CODE
+    end
+
+    it "refuses a captured value through a field that is not shareable" do
+      assert_error(stub + <<-CODE, "captures `bag : Bag`, which is not Share: Bag's field @items : Pointer(Int32) is not shareable: Pointer(Int32) is raw memory", filename: "x.iyi")
+        class Bag
+          def initialize(@items : Pointer(Int32))
+          end
+
+          def items : Pointer(Int32)
+            @items
+          end
+        end
+
+        memory = uninitialized Pointer(Int32)
+        bag = Bag.new(memory)
+        IyiThread.start do
+          bag.items
+          nil
+        end
+        CODE
+    end
+
+    it "refuses a captured value through a field two levels down" do
+      assert_error(stub + <<-CODE, "captures `shelf : Shelf`, which is not Share: Shelf's field @bag : Bag is not shareable: Bag's field @items : Pointer(Int32) is not shareable", filename: "x.iyi")
+        class Bag
+          def initialize(@items : Pointer(Int32))
+          end
+        end
+
+        class Shelf
+          def initialize(@bag : Bag)
+          end
+
+          def bag : Bag
+            @bag
+          end
+        end
+
+        memory = uninitialized Pointer(Int32)
+        shelf = Shelf.new(Bag.new(memory))
+        IyiThread.start do
+          shelf.bag
+          nil
+        end
+        CODE
+    end
+
+    it "trusts a type marked @[Share] whatever its fields do" do
+      assert_type(stub + <<-CODE, filename: "x.iyi") { nil_type }
+        @[Share]
+        class Box
+          def initialize
+            @value = 0
+          end
+
+          def value=(value : Int32)
+            @value = value
+          end
+        end
+
+        box = Box.new
+        IyiThread.start do
+          box.value = 1
+          nil
+        end
+        CODE
+    end
+
+    it "trusts a generic marked @[Share] only when its arguments are" do
+      assert_error(stub + <<-CODE, "captures `cell : Cell(Pointer(Int32))`, which is not Share: Cell(Pointer(Int32))'s T is Pointer(Int32): Pointer(Int32) is raw memory", filename: "x.iyi")
+        @[Share]
+        class Cell(T)
+          def initialize(@value : T)
+          end
+
+          def value : T
+            @value
+          end
+
+          def value=(value : T)
+            @value = value
+          end
+        end
+
+        memory = uninitialized Pointer(Int32)
+        cell = Cell.new(memory)
+        IyiThread.start do
+          cell.value
+          nil
+        end
+        CODE
+    end
+
+    it "refuses a captured self whose type is not shareable" do
+      assert_error(stub + <<-CODE, "captures `self : Worker`, which is not Share: Worker's field @done is assigned in `finish` (SPEC.md III.4.4)", filename: "x.iyi")
+        class Worker
+          def initialize
+            @done = false
+          end
+
+          def finish : Nil
+            @done = true
+          end
+
+          def go : Nil
+            IyiThread.start do
+              @done
+              nil
+            end
+          end
+        end
+
+        Worker.new.go
+        CODE
+    end
+  end
 end

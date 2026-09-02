@@ -27,6 +27,7 @@ using std/enumerable::{Enumerable}
 # what it passed in could mutate the list from underneath a task holding it.
 # Rust says this with ownership and pays nothing; here it costs one copy at the
 # boundary, once, and it is the honest price of not having that machinery.
+@[Share]
 pub struct List(T)
   @items : Array(T)
 

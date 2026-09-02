@@ -849,6 +849,15 @@ module Iyi
       types["Deprecated"] = @deprecated_annotation = AnnotationType.new self, self, "Deprecated"
       types["Experimental"] = @experimental_annotation = AnnotationType.new self, self, "Experimental"
       types["TargetFeature"] = @target_feature_annotation = AnnotationType.new self, self, "TargetFeature"
+      # iyi: `@[Share]` on a struct or class is the trust half of SPEC.md
+      # III.4.4's marker — the type is shareable whenever its type arguments
+      # are, whatever its fields do — for the short list that owns what it
+      # holds: `Atomic(T)` in the prelude, `List(T)` in the samples. The
+      # structural half needs no annotation; `Iyi::Share` computes it. A
+      # producer writes `@[Share]` into an artifact's type declaration for
+      # every type it found shareable, and a consumer reads that and never
+      # recomputes: the bodies that would tell it are not in the artifact.
+      types["Share"] = @share_annotation = AnnotationType.new self, self, "Share"
 
       # iyi: the marker that makes a union member an error member (SPEC.md
       # III.1.1). Created here rather than declared in the prelude because the
@@ -1185,7 +1194,7 @@ module Iyi
                      always_inline_annotation naked_annotation returns_twice_annotation
                      raises_annotation primitive_annotation call_convention_annotation
                      flags_annotation link_annotation extern_annotation deprecated_annotation experimental_annotation
-                     error_trait) %}
+                     share_annotation error_trait) %}
       def {{name.id}}
         @{{name.id}}.not_nil!
       end

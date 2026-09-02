@@ -206,6 +206,13 @@ class Iyi::TopLevelVisitor < Iyi::SemanticVisitor
     node.resolved_type = type
 
     process_annotations(annotations) do |annotation_type, ann|
+      if annotation_type == @program.share_annotation
+        # iyi: trust, not a check (SPEC.md III.4.4). Any struct or class,
+        # generic or not; the generic's instances inherit the trust and are
+        # then shareable when their arguments are.
+        type.iyi_share_trusted = true
+      end
+
       if node.struct? && type.is_a?(NonGenericClassType)
         case annotation_type
         when @program.extern_annotation

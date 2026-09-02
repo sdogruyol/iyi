@@ -589,6 +589,7 @@ module Iyi
           elsif obj_type && obj_type.extern? && node.name.ends_with?('=')
             check_args_are_not_closure node, "can't set closure as C #{obj_type.type_desc} member"
           end
+          check_thread_captures_share(node, target_defs[0])
         end
 
         current_def = @current_def
@@ -638,6 +639,58 @@ module Iyi
       end
 
       node
+    end
+
+    # iyi: `IyiThread.start { }`'s block runs on another thread, so every
+    # value it captures must be `Share` (SPEC.md III.4.4, III.4.11). The
+    # block became a proc when the call was typed, and the proc's def knows
+    # which of the enclosing variables it closed over; each one's type is
+    # asked, and `self` too when the block reached an instance variable.
+    def check_thread_captures_share(node : Call, target_def : Def)
+      return unless target_def.name == "start"
+      owner = target_def.owner
+      return unless owner.metaclass? && owner.instance_type.to_s == "IyiThread"
+      block = node.block
+      return unless block
+      fun_literal = block.fun_literal
+      return unless fun_literal.is_a?(ProcLiteral)
+      a_def = fun_literal.def
+      return unless a_def.closure?
+
+      vars = a_def.vars
+      seen = Set(String).new
+      captures_self = false
+      ClosuredVarsCollector.collect(a_def).each do |captured|
+        case captured
+        when InstanceVar
+          # An instance variable read inside the block is `self`, captured.
+          captures_self = true
+        when Var
+          if captured.name == "self"
+            captures_self = true
+            next
+          end
+          next unless seen.add?(captured.name)
+          meta = vars.try &.[captured.name]?
+          next unless meta
+          next if meta.belongs_to?(a_def)
+          type = meta.type?
+          next unless type
+          if why = Iyi::Share.reason(type)
+            captured.raise "the block IyiThread.start runs on another thread captures `#{captured.name} : #{type}`, which is not Share: #{why} (SPEC.md III.4.4)"
+          end
+        end
+      end
+
+      if captures_self
+        if self_type = @current_def.try(&.owner)
+          unless self_type.is_a?(Program) || self_type.metaclass?
+            if why = Iyi::Share.reason(self_type)
+              block.raise "the block IyiThread.start runs on another thread captures `self : #{self_type}`, which is not Share: #{why} (SPEC.md III.4.4)"
+            end
+          end
+        end
+      end
     end
 
     class ClosuredVarsCollector < Visitor

@@ -63,7 +63,7 @@ own reference accepts.
 | warm full build, `hello` / 6,900-line pair | 0.07 s / 0.24 s, against `go build`'s 0.08 s / 0.09 s |
 | front end, `hello.iyi` | **0.036 s** against the 0.050 s target: MET |
 | starting the compiler and doing nothing | 0.018 s of that |
-| iyi's own prelude | 7,080 lines, ceiling 3,734 |
+| iyi's own prelude | 7,081 lines, ceiling 3,734 |
 | compiler | 84,068 lines, none of it written in iyi |
 | artifact format | `.iyimod` v19, checksum per section |
 | samples | 9, of which 5 rebuild from artifacts with their modules' source deleted |
@@ -88,7 +88,7 @@ shape.
 > is a library and the rules are the language, so a program can keep one and
 > change the other: `--crystal` builds against Crystal's standard library, and
 > there `require` reaches the ecosystem while every rule stays where it was.
-> "No standard library worth the name" is still true of iyi's own 7,080 lines
+> "No standard library worth the name" is still true of iyi's own 7,081 lines
 > and no longer true of what a program can have. Part V item 12a is the
 > measurement, nine shards wide.
 
@@ -270,7 +270,7 @@ of binary. It is not made the default on that trade, and the middle needs the
 initialisers to run *later* rather than not at all, which is the `dlsym` table
 above, and a larger piece of work than the number it wins.
 
-**3. A deliberately tiny prelude, written in iyi. Done: 7,080 lines,
+**3. A deliberately tiny prelude, written in iyi. Done: 7,081 lines,
 primitives included.** Not a standard library: integers, booleans, a string,
 one sequence, one dictionary, one range, `puts`. **Its scope is set by what the
 samples call and by nothing else**. A method enters the prelude because an
@@ -791,9 +791,9 @@ Checking it moved two things and left the shape alone.
 
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
-| Compiler | 24,984 lines, **written in Crystal** | 102,863 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 7,080-line own prelude + 777 in samples |
-| Specs | 21,146 lines | 9,064 for iyi |
+| Compiler | 24,984 lines, **written in Crystal** | 103,198 lines, Crystal, forked |
+| Library | 8,161 lines (3,551 of it core) | 7,081-line own prelude + 778 in samples |
+| Specs | 21,146 lines | 9,359 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
 | Own status line | *"pre-alpha: we are still designing the language"* | design largely settled, 0.2.0 released, a language written in it |
@@ -2158,7 +2158,7 @@ hook, and the prelude's own definition of it is untouched. Compile-time
 `responds_to?` works unchanged, which the error message is entitled to claim
 because it is tested.
 
-### III.4 Concurrency: **BUILT on Linux in III.4.8's order — scheduler, cancellable primitives, `group`, `Channel` (rendezvous), `select`, the typed group (III.4.9), `Atomic(T)` (III.4.10), a kernel thread the collector stops (III.4.11); `Share` is next**
+### III.4 Concurrency: **BUILT on Linux in III.4.8's order — scheduler, cancellable primitives, `group`, `Channel` (rendezvous), `select`, the typed group (III.4.9), `Atomic(T)` (III.4.10), a kernel thread the collector stops (III.4.11), `Share` gating its block (III.4.4)**
 
 This is the section where the design either beats Go or does not, so it is worth
 being blunt about where Go actually loses. Not goroutines: they are cheap, the
@@ -2231,12 +2231,43 @@ signature could have stated.
 Default policy: the first failing task cancels its siblings and the error leaves
 the group. That is `errgroup`'s behaviour, typed and built in.
 
-#### III.4.4 Data races are a compile error, and R-3 is why that is affordable
+#### III.4.4 Data races are a compile error, and R-3 is why that is affordable: **BUILT, gating the block a thread runs**
 
 A marker trait, `Share`, decided structurally: a type is shareable if every
 field is shareable and none is mutable, or if it is a synchronised type that
 owns its contents: `Mutex(T)` is shareable when `T` is. A value that is not
 shareable cannot be captured by a spawned block or sent over a channel.
+
+**Built, as written, with the obligations below met.** `Iyi::Share`
+(`src/compiler/iyi/semantic/share.cr`) decides a type structurally: a
+field is mutable if any method other than `initialize` assigns it, by any
+spelling, or a setter `field=` is defined for it — III.4.7's mechanical
+rule, on the compiler's own AST rather than the count's — and every
+field's type must be shareable in turn: integers, floats, `Bool`, `Char`,
+`Nil`, `Symbol` and enums are; `Pointer` is raw memory and is not;
+`StaticArray` and a `Proc` are not; a tuple, named tuple or union is when
+every member is; a class typed as its base is when every subclass is. The
+trust half is `@[Share]` on a declaration, meaning shareable whenever the
+type arguments are, whatever the fields do: `Atomic(T)` carries it, and
+`samples/iyi/std/list.iyi`'s `List(T)` carries it, the list this section
+said should stay short. The marker travels: a producer writes `@[Share]`
+into the artifact declaration of every type it found shareable, and a
+consumer reads that and never recomputes — the bodies that said no field
+is assigned are not in the artifact, so an imported type without the
+marker is refused with the artifact as the reason. What it gates is the
+block `IyiThread.start` runs on another thread (III.4.11): every variable
+the block captures, and `self` when the block reaches an instance
+variable, must be `Share`, and the error names the variable, its type and
+the field that failed, one level at a time — `captures \`items :
+Array(Int32)\`, which is not Share: Array(Int32)'s field @size is assigned
+in \`unsafe_set_size\``. The channel's `T : Share` (III.4.6) waits for the
+channel that crosses threads. Held by `spec/compiler/semantic/iyi_spec.cr`
+(eight shapes: immutable captures pass, a setter, an assignment outside
+`initialize`, a field one and two levels down, `@[Share]` trusted, a
+trusted generic refused by its argument, `self`), by
+`spec/compiler/iyimod_spec.cr` (the marker written, read and refused
+across an artifact) and by `bench/thread_exercise.sh`'s last step, a
+program that must not compile.
 
 This is Rust's `Send`/`Sync` **without** ownership or borrowing, and it is worth
 being exact about what that buys and what it does not. It rules out data races,
@@ -2494,12 +2525,12 @@ recorded in `bench/dependency_floor.sh` in the
 same commit that caused them, which is that script's own rule for how a
 dependency is taken on.
 
-What is *not* built, said here rather than left to be found: `Share` gates
-nothing yet — deliberately, when this was written, because one thread
-interleaves only at parks and cannot race; III.4.11 ended that, a second
-thread exists, and `Share` is the next piece owed (the shape this
-document has refused three times now is a mechanism with no caller, and
-it has one);
+What is *not* built, said here rather than left to be found: `Share`
+gated nothing when this was written — deliberately, because one thread
+interleaves only at parks and cannot race; III.4.11 ended that, and
+III.4.4 is built now, gating the block a thread runs (the shape this
+document has refused three times is a mechanism with no caller, and it
+got one first);
 the rendezvous channel and `select` are both in — `Channel(T).new` parks a
 sender carrying its value in its queue node's box, an emptied box is the
 delivery receipt, a park is named by a nonce so a node a cancellation left
@@ -2679,12 +2710,12 @@ sit on a holder of their own, `IyiAtomic`, the way Crystal's sit on
 as its type's name — which the probe never noticed because it prints
 through `to_i64`; noted here rather than fixed, by the prelude's own rule.
 
-`Share` was still not built when this was written, and the reason was
+`Share` was not built when this was written, and the reason was
 III.4.8's: one thread interleaves only at parks. III.4.11 removed the
-reason. What this section changed is the list of types `Share` will
-trust rather than check: `Atomic(T)` is the first synchronised type in
-the prelude, shareable by construction, and it joins `Mutex(T)` and
-`List(T)` on that list before either of those exists.
+reason, and III.4.4 has it built. What this section changed is the list
+of types `Share` trusts rather than checks: `Atomic(T)` is the first
+synchronised type in the prelude, shareable by construction, `@[Share]`
+on its declaration, and it joins `List(T)` there before `Mutex(T)` exists.
 
 #### III.4.11 A kernel thread: **BUILT — `IyiThread`, not a task, and the collector stops it**
 
@@ -2703,13 +2734,12 @@ without a lock.
 **It is not a task, and saying so is the design.** No group owns it,
 nothing cancels it, no channel crosses it: `Channel` is one thread's,
 the scheduler's queues are one thread's, and a value handed from one
-thread to another is a data race the type system does not yet refuse.
-What crosses threads today is `Atomic(T)` and memory the program keeps
-straight itself. This is exactly the condition III.4.4 and III.4.8 named
-for `Share`: the marker refused nothing testable until a second thread
-existed, and one does — `Share`'s obligation is due, and it is the next
-piece of III.4, gating `IyiThread.start`'s block and, when a thread-safe
-channel exists, its sends. A thread is not offered as a spelling for
+thread to another is a data race — which the type system now refuses at
+the door it has: the block `IyiThread.start` runs may capture only
+`Share` values (III.4.4, built below), so what crosses threads is
+`Atomic(T)`, immutable values, and memory a program reaches through
+`Pointer` and keeps straight itself, `Pointer` being what the marker
+refuses by name. A thread is not offered as a spelling for
 concurrency; `group` is. It is offered because the collector's parallel
 stages (GC_DESIGN.md 7 and 8) and a scheduler with M threads need one,
 and because a program that wants a core for itself has never had a way
@@ -7890,7 +7920,7 @@ Named honestly, so nobody mistakes this draft for complete.
     shards exist and none of them is written to iyi's rules, so "run them
     directly" is not a compatibility problem, it is the four rules: `require`
     against R-1, inference against R-2, monkey patching against R-3, and
-    Crystal's 8,161-line standard library against iyi's own 7,080-line prelude.
+    Crystal's 8,161-line standard library against iyi's own 7,081-line prelude.
 
     What is measurable is narrower and better than that framing suggests, and
     it was measured on **Kemal 1.12.0**, which compiles under this compiler

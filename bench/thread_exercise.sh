@@ -4,7 +4,7 @@
 #
 #     bash bench/thread_exercise.sh
 #
-# Five steps, and the last is a failure proof, because a gate that cannot
+# Six steps, and the last two are failure proofs, because a gate that cannot
 # fail is not a gate:
 #
 #   1. The program holds every property, plain and --release, with eight
@@ -32,6 +32,9 @@
 #      prelude, and a thread's list — reachable from its stopped frames
 #      alone — is swept out from under it; the program exits 1 naming the
 #      node on a free list.
+#   6. Failure proof: a block that captures a value whose type is not
+#      `Share` (SPEC.md III.4.4) does not compile, and the error names the
+#      variable, its type and the field that made it mutable.
 #
 # Linux x86_64 and aarch64, darwin aarch64.
 set -u
@@ -147,6 +150,30 @@ if [ "$code" -ne 1 ] || ! grep -q "on a free list" unrooted.txt; then
   echo "the live-list check did not fire (exit $code):"; tail -5 unrooted.txt; exit 1
 fi
 printf '  exits 1 at "%s"\n' "$(grep -m1 'on a free list' unrooted.txt)"
+
+# ── 6. Share: what a thread's block may capture is decided at compile time ─
+# SPEC.md III.4.4's marker, gating III.4.11's block: a value whose type has
+# a mutable field — here an `Array`, whose size is assigned by its own
+# methods — cannot be captured by a block another thread runs, and the
+# compiler names the variable, the type and the field that failed. The
+# exercise itself captures integers and passes; this program must not
+# compile.
+step "failure proof: a block capturing a mutable value does not compile"
+cat > unshared.iyi <<'IYI'
+items = [1, 2, 3]
+t = IyiThread.start do
+  items.size
+  nil
+end
+t.join
+IYI
+if "$IYI" build unshared.iyi -o unshared > build-unshared.log 2>&1; then
+  echo "a block capturing an Array compiled:"; cat build-unshared.log; exit 1
+fi
+if ! grep -q "captures \`items : Array(Int32)\`, which is not Share" build-unshared.log; then
+  echo "the refusal did not name the capture:"; cat build-unshared.log; exit 1
+fi
+printf '  refused: %s\n' "$(grep -m1 'is not Share' build-unshared.log | sed 's/^Error: //')"
 
 echo "workdir $WORK"
 echo "thread exercise: every step held"

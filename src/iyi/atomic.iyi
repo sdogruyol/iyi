@@ -43,6 +43,7 @@
 # declared — a class's field, a class variable, a mapping — and the
 # instructions address that word in place. Copying one copies a number,
 # not a synchronisation, which is the same contract Crystal's has.
+@[Share]
 struct Atomic(T)
   @value : T
 
