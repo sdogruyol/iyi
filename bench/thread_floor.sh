@@ -6,7 +6,7 @@
 #
 #     bash bench/thread_floor.sh
 #
-# Six steps, and the last three are failure proofs, because a gate that
+# Seven steps, and the last four are failure proofs, because a gate that
 # cannot fail is not a gate:
 #
 #   1. The program holds every property, plain and --release (and on darwin
@@ -15,14 +15,16 @@
 #      every one stopped where it ran by a signal and a handler that read
 #      the thread's sp and pc out of the context and found the sp on that
 #      thread's stack, released by one wake; every one joined; every
-#      `@[ThreadLocal]` slot still its owner's at the end.
+#      `@[ThreadLocal]` slot still its owner's at the end; the one word
+#      every thread added to holding exactly the sum of their own.
 #   2. The binary keeps the floor. This is the measurement the file exists
 #      for, and it is asserted, not printed. On Linux: the runtime's five
 #      C-template names and nothing else — a thread by raw `clone` adds no
-#      symbol, and a thread-local variable adds no `__tls_get_addr`. On
-#      darwin, where III.9's rule is that every call is libSystem's: the
-#      exact list below, which is the runtime's names plus what a thread
-#      costs there, spelled out one by one.
+#      symbol, a thread-local variable adds no `__tls_get_addr`, and the
+#      prelude's `Atomic(T)` adds no `__atomic_*`. On darwin, where
+#      III.9's rule is that every call is libSystem's: the exact list
+#      below, which is the runtime's names plus what a thread costs there,
+#      spelled out one by one.
 #   3. The pause, by thread count, printed from real runs, and what one
 #      touch of a `@[ThreadLocal]` costs against a plain class variable.
 #      Reported rather than budgeted: a budget would be a number this
@@ -39,6 +41,10 @@
 #   6. The held-context assertion is reachable: the context's sp read at
 #      the pc's offset is not on any thread's stack, and the program exits
 #      1 counting the handlers that read it.
+#   7. The atomic is doing the counting: with a load and a store in place
+#      of the prelude's `Atomic(UInt64).add` on the one word every thread
+#      adds to, the sum comes up short and the program exits 1 naming how
+#      many updates it lost.
 #
 # Linux x86_64 and aarch64, darwin aarch64.
 set -u
@@ -194,8 +200,9 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 # And what the cutover's spelling costs: one read-modify-write of a
 # `@[ThreadLocal]` against one of a plain class variable, in the release
-# build, printed for the same reason the pauses are.
-grep '^touch:' answers-release.txt | sed 's/^/  /'
+# build, printed for the same reason the pauses are; and the contended
+# `Atomic(UInt64).add` every thread ran on one word, none lost.
+grep -E '^(touch|atomic):' answers-release.txt | sed 's/^/  /'
 
 # ── 4. Failure proof: the ran-its-loop assertion is reachable ─────────────
 # A thread that counts into the wrong word looks alive to every earlier
@@ -259,6 +266,21 @@ fi
 timeout 60 ./astray 2 10 > astray.txt 2>&1
 if [ $? -ne 1 ] || ! grep -q "was not their thread's stack" astray.txt; then
   echo "the held-context check did not fire:"; cat astray.txt; exit 1
+fi
+
+# ── 7. Failure proof: the atomic is what keeps the shared count ──────────
+# The counters are the prelude's `Atomic(UInt64)` (step 2 is what proves
+# that costs no name). Under `-Dtf_plain_add` the shared word's add is a
+# load and a store instead, and with threads on more than one core the
+# sum comes up short: the program names the word and how many updates it
+# lost. The atomic contract, refused by its own removal.
+step "failure proof: a load-and-store in the atomic's place loses updates"
+if ! "$IYI" build --release -Dtf_plain_add "$REPO/bench/thread_floor.iyi" -o plain-add > build-plain-add.log 2>&1; then
+  cat build-plain-add.log; exit 1
+fi
+timeout 60 ./plain-add 4 20 > plain-add.txt 2>&1
+if [ $? -ne 1 ] || ! grep -q "updates were lost" plain-add.txt; then
+  echo "the shared-counter check did not fire:"; cat plain-add.txt; exit 1
 fi
 
 echo "workdir $WORK"

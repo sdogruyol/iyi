@@ -299,6 +299,47 @@
   which a microsecond clock can measure; it is the first round now.
   GC_DESIGN.md carries the reading.
 
+- **The prelude has an atomic, and the thread floor is its first caller
+  and its gate.** `Atomic(T)` (`src/iyi/atomic.iyi`, SPEC.md III.4.10) is
+  a struct holding one word, `T` one of the four integers `primitives.iyi`
+  gives arithmetic to, and six verbs with Crystal's names and answers:
+  `get`, `set`, `add`, `sub`, `swap`, `compare_and_set` — the
+  read-modify-writes answer what the word held before, the exchange
+  answers that and whether it happened. The instructions are the
+  compiler's, four `@[Primitive]`s in `primitives.iyi` (`atomicrmw`,
+  `cmpxchg`, an ordered load, an ordered store) on a holder of their own,
+  because a call on a generic instance's class passes the class as a
+  first argument and the atomic primitives take their operands from the
+  front — the same reason Crystal's sit on `Atomic::Ops`. One ordering,
+  sequentially consistent, and no parameter to weaken it: Go's rule, and
+  a decision rather than an omission, argued in the section — an
+  ordering parameter is the part of an atomic API people get wrong and
+  nothing can check, and on x86_64, where the floor was measured, a
+  sequentially consistent `add` and a relaxed one are the same `lock
+  xadd`. The aarch64 difference (`ldaddal` against `ldadd`) is not yet a
+  number, and the measurement that names it is what adds a weaker verb.
+  `fence` is not built, and a pointer `T` is refused by name; each
+  arrives with its caller.
+
+  The thread floor's three `fun`s of inline asm — the ones whose `xchg`
+  clobbered a register in the release build — are gone, and its counters
+  are `Atomic(UInt64)` over the same words: `lock xadd`, `xchg`, `mov`
+  and `lock cmpxchg` on x86_64, `ldaxr`/`stlxr`, `ldar` and `stlr` on
+  aarch64, read off the release binary and the cross-built object. The
+  floor holds by the gate's existing assertion — five C-template names
+  and nothing else, plain and release — which is now also the proof that
+  an atomic costs no `__atomic_*` name. The gate grew a seventh step,
+  the atomic's own failure proof: every thread adds to one shared word
+  on every turn of its loop beside a word of its own, the two totals
+  must agree at the end, and under `-Dtf_plain_add`, a load and a store
+  in the atomic's place, they do not — 4 threads, 23,689 adds, 12,477
+  landed, exit 1 naming the 11,212 lost. With the contended add in every
+  thread's loop the pauses kept their shape (release, 20 cores, 200
+  rounds: stop 1.7 / 4.0 / 19 / 78 µs best for 1, 4, 16, 64 threads,
+  resume 5.8 ms best at 64). On wasm32, which has one thread, LLVM
+  lowers the same instructions to plain loads and stores, so the type is
+  on every target and gated on none.
+
 ### Fixed
 
 - **The thread floor's x86_64 store clobbered its own value, and the
@@ -3115,7 +3156,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,718-line library and nothing else. Every other
+  written against iyi's own 5,843-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

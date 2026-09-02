@@ -25,6 +25,10 @@ require "./string"
 require "./array"
 require "./range"
 require "./hash"
+# `Atomic(T)`, on every target: the instructions are LLVM's and lower to
+# plain loads and stores where a target has one thread (wasm32), so the
+# type costs nothing where nothing can race and needs no gate here.
+require "./atomic"
 
 # iyi: the concurrency runtime — a cooperative scheduler, cancellable
 # blocking primitives, `group`/`spawn` and `Channel`, in exactly III.4.8's

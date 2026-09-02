@@ -63,7 +63,7 @@ own reference accepts.
 | warm full build, `hello` / 6,900-line pair | 0.07 s / 0.24 s, against `go build`'s 0.08 s / 0.09 s |
 | front end, `hello.iyi` | **0.036 s** against the 0.050 s target: MET |
 | starting the compiler and doing nothing | 0.018 s of that |
-| iyi's own prelude | 5,718 lines, ceiling 3,734 |
+| iyi's own prelude | 5,843 lines, ceiling 3,734 |
 | compiler | 84,068 lines, none of it written in iyi |
 | artifact format | `.iyimod` v19, checksum per section |
 | samples | 9, of which 5 rebuild from artifacts with their modules' source deleted |
@@ -88,7 +88,7 @@ shape.
 > is a library and the rules are the language, so a program can keep one and
 > change the other: `--crystal` builds against Crystal's standard library, and
 > there `require` reaches the ecosystem while every rule stays where it was.
-> "No standard library worth the name" is still true of iyi's own 5,718 lines
+> "No standard library worth the name" is still true of iyi's own 5,843 lines
 > and no longer true of what a program can have. Part V item 12a is the
 > measurement, nine shards wide.
 
@@ -270,7 +270,7 @@ of binary. It is not made the default on that trade, and the middle needs the
 initialisers to run *later* rather than not at all, which is the `dlsym` table
 above, and a larger piece of work than the number it wins.
 
-**3. A deliberately tiny prelude, written in iyi. Done: 5,718 lines,
+**3. A deliberately tiny prelude, written in iyi. Done: 5,843 lines,
 primitives included.** Not a standard library: integers, booleans, a string,
 one sequence, one dictionary, one range, `puts`. **Its scope is set by what the
 samples call and by nothing else**. A method enters the prelude because an
@@ -792,7 +792,7 @@ Checking it moved two things and left the shape alone.
 | | Crystal 0.1.0 (2014-06-18) | iyi today |
 |---|---|---|
 | Compiler | 24,984 lines, **written in Crystal** | 102,863 lines, Crystal, forked |
-| Library | 8,161 lines (3,551 of it core) | 5,718-line own prelude + 777 in samples |
+| Library | 8,161 lines (3,551 of it core) | 5,843-line own prelude + 777 in samples |
 | Specs | 21,146 lines | 9,064 for iyi |
 | Samples | 24 **programs** | 8 **explanations**, a first half hour, and `calc`, a language |
 | History | 3,165 commits over 21 months | 266 |
@@ -2158,7 +2158,7 @@ hook, and the prelude's own definition of it is untouched. Compile-time
 `responds_to?` works unchanged, which the error message is entitled to claim
 because it is tested.
 
-### III.4 Concurrency: **BUILT on Linux in III.4.8's order — scheduler, cancellable primitives, `group`, `Channel` (rendezvous), `select`, the typed group (III.4.9); `Share` still open**
+### III.4 Concurrency: **BUILT on Linux in III.4.8's order — scheduler, cancellable primitives, `group`, `Channel` (rendezvous), `select`, the typed group (III.4.9), `Atomic(T)` (III.4.10); `Share` still open**
 
 This is the section where the design either beats Go or does not, so it is worth
 being blunt about where Go actually loses. Not goroutines: they are cheap, the
@@ -2392,11 +2392,13 @@ not whether to build it but which piece first. Asked properly, the answer is
 that the obvious cheap slices are all dishonest, and it is worth writing down
 why so nobody reaches for them again.
 
-Iyi's own library has no concurrency surface of any kind: no fiber, no thread,
-no scheduler, no channel, no mutex, no atomic. A program built `--crystal` has
-all of Crystal's (`src/fiber.cr`, `src/concurrent.cr`, `src/channel.cr`,
-`src/atomic.cr`, `src/crystal/scheduler.cr`), which is III.4.6's point: those
-are the thing III.4 was written to replace, not an implementation of it.
+Iyi's own library had no concurrency surface of any kind when this was
+written: no fiber, no thread, no scheduler, no channel, no mutex, no atomic
+(the atomic is III.4.10 now, the rest is built below). A program built
+`--crystal` has all of Crystal's (`src/fiber.cr`, `src/concurrent.cr`,
+`src/channel.cr`, `src/atomic.cr`, `src/crystal/scheduler.cr`), which is
+III.4.6's point: those are the thing III.4 was written to replace, not an
+implementation of it.
 
 Three slices were ranked:
 
@@ -2607,6 +2609,79 @@ list some paths and no list on others, and the flag is the fact rather
 than the shape. Gated in `bench/concurrency_exercise.sh`: the tuple, the
 first-error union through `!`, and a loop-spawning group asserted to keep
 the general form.
+
+#### III.4.10 `Atomic(T)`: **BUILT — one ordering, six verbs, on the floor**
+
+The first piece of III.4 that assumes a second thread, and it arrived the
+way III.4.8 said every piece would: with a caller. `bench/thread_floor.iyi`
+counted its threads in and out through three `fun`s of inline asm because
+the prelude had nothing to count with, and the release build's `xchg`
+clobbered a register the asm had declared an input (the Fixed entry in
+CHANGELOG.md). The runtime's cutover to threads (GC_DESIGN.md) names what
+the prelude's atomic must carry — the mark word's CAS, every shared
+counter, the arena list — so the type was built for the probe and the
+probe became its gate.
+
+`Atomic(T)` is a struct holding one word, `T` one of the four integers
+`primitives.iyi` gives arithmetic to (`Int32`, `Int64`, `UInt8`,
+`UInt64`), and six verbs: `get`, `set`, `add`, `sub`, `swap`,
+`compare_and_set`. The names and their answers are Crystal's, so a program
+that reads the same under `--crystal` means the same: the three
+read-modify-writes answer what the word held before, and
+`compare_and_set` answers that value and whether the exchange happened,
+which is what a retry loop needs without a second load. The instructions
+are the compiler's — `atomicrmw`, `cmpxchg`, an ordered load and an
+ordered store, four `@[Primitive]`s in `primitives.iyi` — not asm, so the
+register allocation is LLVM's and the aarch64 arm is whatever the CPU
+offers (`ldaxr`/`stlxr` loops; LSE's `ldaddal` where the target has it).
+
+**One ordering, sequentially consistent, and no parameter to weaken it.
+This is the decision.** It is Go's rule — its memory model makes every
+`sync/atomic` operation sequentially consistent and the package has no
+ordering argument — rather than C++'s or Rust's, and the reasons are the
+ones this document has used before. An ordering parameter is the part of
+an atomic API people get wrong, the compiler cannot check, and a program
+cannot test for; the price of not having it is a fence on the
+architectures that distinguish the orderings; and on x86_64, the machine
+the floor was measured on, a sequentially consistent `add` and a relaxed
+one are the same `lock xadd`, so the price is zero where it was measured
+and not yet a number where it is not. On aarch64 the difference is
+`ldaddal` against `ldadd`. The day a profile of the marker or the
+scheduler names that difference, the measurement is what adds the weaker
+spelling, and it is added as its own verb rather than a parameter, so a
+call site says what it means. `fence` is not built: nothing calls one. A
+pointer or a reference as `T` is refused by name rather than admitted
+untested; the arena list that will want one brings it.
+
+What it costs the floor is nothing, and that is asserted rather than
+assumed: a 64-bit-or-narrower atomic is an instruction on every target
+iyi links for, never a `__atomic_*` libcall, and `bench/thread_floor.sh`
+reads the five C-template names off the binary that uses one, plain and
+release, on both Linux arms and on darwin. Where a target has one thread
+the instructions lower to plain loads and stores — wasm32 — so the type
+costs nothing where nothing can race and needs no gate. The gate's own
+failure proof is the contract: every thread adds to one shared word on
+every turn of its loop beside a word of its own, the two totals must
+agree, and with a load and a store in the atomic's place
+(`-Dtf_plain_add`) they do not — 4 threads, 23,689 adds, 12,477 landed,
+the program exits 1 naming the 11,212 it lost. The contended `add` is
+also what the probe's threads now run on every turn, and the pauses
+GC_DESIGN.md records held their shape with it in the loop.
+
+Two things the build found. A `@[Primitive]` cannot live on a generic
+instance's class: a call on one passes the class as a first argument
+(`Pointer(T).malloc` reads its size from `call_args[1]`) and the atomic
+instructions take their operands from the front, so the four primitives
+sit on a holder of their own, `IyiAtomic`, the way Crystal's sit on
+`Atomic::Ops`. And `UInt64` has no `to_s` in the prelude — a value prints
+as its type's name — which the probe never noticed because it prints
+through `to_i64`; noted here rather than fixed, by the prelude's own rule.
+
+`Share` is still not built, and this section does not change III.4.8's
+reason: one thread interleaves only at parks. What it changes is the list
+of types `Share` will trust rather than check. `Atomic(T)` is the first
+synchronised type in the prelude, shareable by construction, and it joins
+`Mutex(T)` and `List(T)` on that list before either of those exists.
 
 ### III.5 Module initialisation: **PROPOSED; rules 1, 2 and 4 BUILT**
 
@@ -7758,7 +7833,7 @@ Named honestly, so nobody mistakes this draft for complete.
     shards exist and none of them is written to iyi's rules, so "run them
     directly" is not a compatibility problem, it is the four rules: `require`
     against R-1, inference against R-2, monkey patching against R-3, and
-    Crystal's 8,161-line standard library against iyi's own 5,718-line prelude.
+    Crystal's 8,161-line standard library against iyi's own 5,843-line prelude.
 
     What is measurable is narrower and better than that framing suggests, and
     it was measured on **Kemal 1.12.0**, which compiles under this compiler

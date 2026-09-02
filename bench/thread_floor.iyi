@@ -26,50 +26,44 @@
     __iyi_exit(1)
   end
 
-  # ── Atomics, by hand ────────────────────────────────────────────────────
+  # ── Atomics, the prelude's ──────────────────────────────────────────────
   #
-  # The prelude has no atomic because nothing in it has had a second thread
-  # to race with. This program does, so its counters are `lock xadd` and an
-  # `ldaxr`/`stlxr` loop, sequentially consistent, which is what a mark
-  # word's CAS will be too. The aarch64 arm is the same instructions on
-  # both kernels.
-  fun __tf_add(address : UInt64, delta : UInt64) : UInt64
-    previous = uninitialized UInt64
-    {% if flag?(:x86_64) %}
-      asm("lock xaddq $1, ($2)" : "=r"(previous) : "0"(delta), "r"(address) : "memory", "cc" : "volatile")
-    {% else %}
-      asm("1:
-           ldaxr $0, [$2]
-           add x5, $0, $1
-           stlxr w4, x5, [$2]
-           cbnz w4, 1b" : "=&r"(previous) : "r"(delta), "r"(address) : "x4", "x5", "memory", "cc" : "volatile")
-    {% end %}
-    previous
+  # The counters were three `fun`s of inline asm for as long as the prelude
+  # had no atomic, and the release build's `xchg` clobbered a register the
+  # asm had declared an input (CHANGELOG.md, Fixed). They are `Atomic(T)`
+  # now — `src/iyi/atomic.iyi`, this program its first caller — over the
+  # same words at the same addresses: the instructions are the compiler's
+  # (`lock xadd`, `xchg`, `mov`; `ldaxr`/`stlxr`, `ldar`, `stlr`), the
+  # register allocation is LLVM's, and the floor read off this binary in
+  # step 2 is what proves an atomic costs no name.
+  def __tf_word(address : UInt64) : Pointer(Atomic(UInt64))
+    Pointer(Atomic(UInt64)).new(address)
   end
 
-  fun __tf_load(address : UInt64) : UInt64
-    value = uninitialized UInt64
-    {% if flag?(:x86_64) %}
-      asm("movq ($1), $0" : "=r"(value) : "r"(address) : "memory" : "volatile")
-    {% else %}
-      asm("ldar $0, [$1]" : "=r"(value) : "r"(address) : "memory" : "volatile")
-    {% end %}
-    value
+  def __tf_add(address : UInt64, delta : UInt64) : UInt64
+    __tf_word(address).value.add(delta)
   end
 
-  # A sequentially consistent store. x86_64 spells it as a plain store and
-  # a fence, not the `xchg` idiom it had: `xchg` writes the value register
-  # back with what the memory held, and the asm declared that register an
-  # input, so the optimiser was entitled to keep the value live in it — and
-  # in the release build it did, with the thread's stack base, which came
-  # back as 0 and was handed to `clone`. The plain build reloaded the value
-  # from the stack and never noticed.
-  fun __tf_store(address : UInt64, value : UInt64) : Nil
-    {% if flag?(:x86_64) %}
-      asm("movq $0, ($1)
-           mfence" :: "r"(value), "r"(address) : "memory" : "volatile")
+  def __tf_load(address : UInt64) : UInt64
+    __tf_word(address).value.get
+  end
+
+  def __tf_store(address : UInt64, value : UInt64) : Nil
+    __tf_word(address).value.set(value)
+  end
+
+  # One word every thread adds to on every turn of its loop — the
+  # contended case, where a lost update is what a non-atomic
+  # read-modify-write does under a second thread. The sum of the threads'
+  # own counters is what it must equal at the end, and under
+  # `-Dtf_plain_add` the add is a load and a store, so it does not: the
+  # driver's failure proof for the prelude's atomic.
+  def __tf_add_shared(address : UInt64) : Nil
+    {% if flag?(:tf_plain_add) %}
+      word = __tf_word(address)
+      word.value.set(word.value.get &+ 1_u64)
     {% else %}
-      asm("stlr $0, [$1]" :: "r"(value), "r"(address) : "memory" : "volatile")
+      __tf_word(address).value.add(1_u64)
     {% end %}
   end
 
@@ -98,16 +92,19 @@
     @@resumed : UInt64 = 0_u64
     # Handlers that read a context whose sp was not their thread's stack.
     @@astray : UInt64 = 0_u64
+    # The word every thread adds to on every turn: the contended atomic.
+    @@shared : UInt64 = 0_u64
 
     def self.setup(count : Int64) : Nil
       @@count = count
       @@table = __iyi_mmap(LINE * count.to_u64).address
-      shared = __iyi_mmap(LINE * 5_u64).address
+      shared = __iyi_mmap(LINE * 6_u64).address
       @@stop = shared
       @@suspended = shared + LINE
       @@resume = shared + LINE * 2_u64
       @@resumed = shared + LINE * 3_u64
       @@astray = shared + LINE * 4_u64
+      @@shared = shared + LINE * 5_u64
     end
 
     def self.count : Int64
@@ -136,6 +133,10 @@
 
     def self.astray : UInt64
       @@astray
+    end
+
+    def self.shared : UInt64
+      @@shared
     end
 
     # What Stage 4's handler does between counting itself in and parking:
@@ -170,9 +171,12 @@
       Tls.slot = tid
       # Spin until told to stop, counting: a thread that is running when a
       # signal lands is the case a stop-the-world has to handle, and a
-      # parked one is the easy case.
+      # parked one is the easy case. Two counts a turn — the thread's own
+      # word and the one word they all share — and the two totals must
+      # agree at the end.
       while __tf_load(Threads.stop) == 0_u64
         __tf_add(line + 16_u64, 1_u64)
+        __tf_add_shared(Threads.shared)
         if Tls.slot != tid || Tls.seed != tid
           __tf_store(line + 32_u64, 1_u64)
         end
@@ -1220,18 +1224,28 @@
   puts "  stop   best #{best_stop} ns  mean #{total_stop // rounds} ns  worst #{worst_stop} ns"
   puts "  resume best #{best_resume} ns  mean #{total_resume // rounds} ns"
 
-  # The threads were running the whole time: every counter moved.
+  # The threads were running the whole time: every counter moved. And the
+  # word they all added to holds exactly the sum of the words each added
+  # to alone — the prelude's `Atomic(UInt64).add` under contention, which
+  # a load-and-store in its place (`-Dtf_plain_add`) fails by losing
+  # updates.
   __tf_store(Threads.stop, 1_u64)
   index = 0_i64
+  turns = 0_u64
   while index < count
     join_thread(index)
-    fail("thread #{index} never ran its loop") if __tf_load(Threads.line(index) + 16_u64) == 0_u64
+    own = __tf_load(Threads.line(index) + 16_u64)
+    fail("thread #{index} never ran its loop") if own == 0_u64
+    turns = turns &+ own
     seed = __tf_load(Threads.line(index) + 24_u64)
     fail("thread #{index} found #{seed.to_i64} in its thread-local seed, not the image's 7") if seed != 7_u64
     fail("thread #{index} saw another thread's value in its own thread-local slot") if __tf_load(Threads.line(index) + 32_u64) != 0_u64
     index = index + 1_i64
   end
   puts "joined: #{describe_join}"
+  shared = __tf_load(Threads.shared)
+  fail("shared counter: #{count} threads added #{turns.to_i64} times to one word and it holds #{shared.to_i64}, so #{(turns &- shared).to_i64} updates were lost") if shared != turns
+  puts "atomic: #{turns.to_i64} contended adds from #{count} threads landed as #{shared.to_i64}, none lost"
   {% if !flag?(:tf_mach) %}
     # Every handler read a context whose sp was its own thread's stack, and
     # the deepest any handler ran below the interrupted sp is the budget a

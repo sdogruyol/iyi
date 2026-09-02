@@ -1,0 +1,88 @@
+# iyi: `Atomic(T)` — a word two threads may both write. SPEC.md III.4.10.
+#
+# The first thing in this prelude that assumes a second thread, and it
+# arrived the way everything here arrives, with a caller: the thread
+# floor (`bench/thread_floor.iyi`) counted its threads in and out on
+# three `fun`s of inline asm, and the release build's `xchg` clobbered a
+# register the asm had declared an input, which cost a day. These six
+# verbs are the compiler's own instructions instead — `atomicrmw`,
+# `cmpxchg`, an ordered load and an ordered store — so the register
+# allocation is LLVM's problem, the aarch64 arm is whatever the target's
+# CPU offers (`ldaxr`/`stlxr` loops, or LSE's `ldaddal` where the
+# machine has it), and nothing is spelled twice per architecture. The
+# floor holds: `nm -u` on a program that uses one names nothing new,
+# because a 64-bit-or-narrower atomic is an instruction on every target
+# iyi links for, never a `__atomic_*` call. `bench/thread_floor.sh`
+# asserts that, plain and release, on both Linux arms and on darwin.
+#
+# **One ordering, sequentially consistent, and no parameter to weaken
+# it.** This is Go's rule (its memory model makes every `sync/atomic`
+# operation sequentially consistent and the package has no ordering
+# argument) rather than C++'s or Rust's, and it is a decision, not an
+# omission. An ordering parameter is the part of an atomic API people
+# get wrong, the compiler cannot check, and a program cannot test for;
+# the cost of not having it is a fence on the architectures that
+# distinguish the orderings, and on x86_64 — the machine the floor was
+# measured on — a sequentially consistent `add` and a relaxed one are
+# the same `lock xadd`. On aarch64 the difference is `ldaddal` against
+# `ldadd`, and it is not yet a number: the day a profile of the marker
+# or the scheduler names one, that measurement is what adds the
+# weaker spelling, and it will be added as its own verb rather than a
+# parameter, so a call site says what it means.
+#
+# `T` is one of the four integers `primitives.iyi` gives arithmetic to.
+# A pointer or a reference is refused by name rather than admitted
+# untested: the arena list that will want one is the caller that will
+# bring it. The verbs and their answers are Crystal's, so a program that
+# reads the same under `--crystal` means the same: `add`, `sub` and
+# `swap` answer the value the word held before; `compare_and_set`
+# answers that value and whether the exchange happened, which is what a
+# retry loop needs without a second load.
+#
+# An `Atomic(T)` is a struct holding the word, so it lives where it is
+# declared — a class's field, a class variable, a mapping — and the
+# instructions address that word in place. Copying one copies a number,
+# not a synchronisation, which is the same contract Crystal's has.
+struct Atomic(T)
+  @value : T
+
+  def initialize(@value : T)
+    {% unless T == Int32 || T == Int64 || T == UInt8 || T == UInt64 %}
+      {% raise "Atomic(#{T}) is not one iyi's prelude admits: T is Int32, Int64, UInt8 or UInt64, " \
+               "the four integers primitives.iyi gives arithmetic to. A pointer or a " \
+               "reference arrives with the caller that needs one." %}
+    {% end %}
+  end
+
+  # The word, read once, ordered.
+  def get : T
+    IyiAtomic.load(pointerof(@value), :sequentially_consistent, false)
+  end
+
+  # The word, written once, ordered.
+  def set(value : T) : Nil
+    IyiAtomic.store(pointerof(@value), value, :sequentially_consistent, false)
+  end
+
+  # `word += value`; answers what the word held before.
+  def add(value : T) : T
+    IyiAtomic.rmw(:add, pointerof(@value), value, :sequentially_consistent, false)
+  end
+
+  # `word -= value`; answers what the word held before.
+  def sub(value : T) : T
+    IyiAtomic.rmw(:sub, pointerof(@value), value, :sequentially_consistent, false)
+  end
+
+  # `word = value`; answers what the word held before.
+  def swap(value : T) : T
+    IyiAtomic.rmw(:xchg, pointerof(@value), value, :sequentially_consistent, false)
+  end
+
+  # If the word holds `expected`, it now holds `desired`. Answers what the
+  # word held, and whether the exchange happened; a retry loop feeds the
+  # first back in as its next `expected`.
+  def compare_and_set(expected : T, desired : T) : Tuple(T, Bool)
+    IyiAtomic.cmpxchg(pointerof(@value), expected, desired, :sequentially_consistent, :sequentially_consistent)
+  end
+end

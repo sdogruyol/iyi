@@ -237,11 +237,15 @@ block and the program name the clash. So a thread-local class variable
 is the mechanism, and the runtime's cutover is a spelling: the
 scheduler's current fiber, run queue and poller become `@[ThreadLocal]`
 per scheduler thread, and the allocator's fast path becomes per-thread
-state with the shared arena list behind the atomics. Which is the other
-absence: the prelude has no atomic because nothing in it has had a
-second thread to race with; the probe's `lock xadd` and
-`ldaxr`/`stlxr` loop are what the mark word's CAS and every shared
-counter will be.
+state with the shared arena list behind the atomics. The other absence
+is closed: the prelude has `Atomic(T)` now (`src/iyi/atomic.iyi`, SPEC.md
+III.4.10), built for the probe as its first caller and gated by it —
+`get`, `set`, `add`, `sub`, `swap`, `compare_and_set` on the four
+arithmetic integers, sequentially consistent and nothing else, the
+compiler's `atomicrmw`/`cmpxchg` rather than asm, and no name on the
+floor. The mark word's CAS is `compare_and_set` on a `UInt64`, and every
+shared counter is an `add`; what Stage 7 measures decides whether a
+weaker verb is ever added.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are
