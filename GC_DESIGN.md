@@ -186,20 +186,39 @@ timeslice, not the signal. Two decisions follow for Stages 4 and 7:
 marking workers never exceed the core count, and the mutator side is M:N
 with M bounded the same way, or a stop is milliseconds by construction.
 
-Two absences the probe priced by running without them. No `CLONE_SETTLS`:
-the child thread ran compiled iyi code — a `fun`, atomics by inline
-asm, syscalls — with no thread pointer at all, so the compiler emits
-nothing thread-relative for a body that neither allocates nor raises.
-The corollary is the real first cost of threads, and it is not the
-thread: `IyiScheduler.current`, the poller fd, the arena's free lists and
-the collector's own state are all class variables today, one thread's
-globals, and where that state lives per thread is the design question
-the runtime has to answer before a second thread may allocate. And no
-atomic: the prelude has none because nothing in it has had a second
-thread to race with; the probe's `lock xadd` and `ldaxr`/`stlxr` loop
-are what the mark word's CAS and every shared counter will be. darwin's
-thread is libSystem's `pthread_create` and `pthread_kill` by III.9's own
-rule, and its floor is that job's to read.
+The first run had no thread pointer at all — no `CLONE_SETTLS` — and the
+child still ran compiled iyi code (a `fun`, atomics by inline asm,
+syscalls), so the compiler emits nothing thread-relative for a body that
+neither allocates nor raises. That located the real first cost of
+threads, which is not the thread: `IyiScheduler.current`, the poller fd,
+the arena's free lists and the collector's own state are all class
+variables today, one thread's globals. The second run answered where
+per-thread state can live, and it is the language's own
+`@[ThreadLocal]`, on the floor. The compiler now emits such a variable
+local-exec outright — one `%fs:`-relative or `tpidr_el0`-relative load at
+a link-time offset — because a program iyi links is always an
+executable; the general-dynamic default was relaxed to the same
+instructions by the linker but left `__tls_get_addr` undefined in the
+dynamic symbol table, a name the floor counts for a call never made,
+and that name is gone. The probe lays out each thread's block the way a
+static libc's startup does: PT_TLS found by walking the program headers
+from `__ehdr_start`, the initialised image copied, the rest zero, the
+pointer placed by the ABI's variant (below the block with a self-pointer
+at `%fs:0` on x86_64, above a 16-byte control block on aarch64) and
+handed to `clone`. Every thread then saw the image's initialiser in its
+own copy and its own tid in its own slot for the whole run, the main
+thread's slot survived them all, and dropping the one flag bit — the
+driver's failure proof — makes every thread share the main thread's
+block and the program name the clash. So a thread-local class variable
+is the mechanism, and the runtime's cutover is a spelling: the
+scheduler's current fiber, run queue and poller become `@[ThreadLocal]`
+per scheduler thread, and the allocator's fast path becomes per-thread
+state with the shared arena list behind the atomics. Which is the other
+absence: the prelude has no atomic because nothing in it has had a
+second thread to race with; the probe's `lock xadd` and
+`ldaxr`/`stlxr` loop are what the mark word's CAS and every shared
+counter will be. darwin's thread is libSystem's `pthread_create` and
+`pthread_kill` by III.9's own rule, and its floor is that job's to read.
 
 **Owner's Decision:** Own the garbage collector. Concurrency, parallelism, and performance control are the reasons. gcry is prior art: measurements, design hints, and a record of what has already been tried and cost what. iyi writes the heap, the STW mechanism, root discovery, and finalizers from scratch.
 

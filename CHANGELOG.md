@@ -113,6 +113,38 @@
   is libSystem's by III.9's rule and is that job's measurement, still to
   be taken.
 
+- **Per-thread state has its mechanism, and it is the language's own
+  `@[ThreadLocal]`, on the floor.** The thread floor's first run had no
+  thread pointer at all and located the real first cost of threads: the
+  scheduler, the poller and the arena are one thread's class variables.
+  The second run answers it. A `@[ThreadLocal]` class variable is now
+  emitted local-exec outright — one `%fs:`-relative or
+  `tpidr_el0`-relative load at a link-time offset — because a program
+  iyi links is always an executable, never a shared object. The
+  general-dynamic default was relaxed to the same instructions by the
+  linker but left `__tls_get_addr@GLIBC_2.3` undefined in the dynamic
+  symbol table: a name on the link line the dependency floor counts,
+  for a call that was never made. It is gone; a program with a
+  thread-local variable keeps the five C-template names and nothing
+  else, and the aarch64 object carries `TLSLE` relocations and a `mrs
+  TPIDR_EL0`. `bench/thread_floor.iyi` then lays out a block per raw
+  thread the way a static libc's startup does — PT_TLS found by walking
+  the program headers from `__ehdr_start`, the initialised image copied,
+  the pointer placed by the ABI's variant and handed to `clone` with
+  `CLONE_SETTLS` — and every thread saw the image's initialiser in its
+  own copy and its own tid in its own slot for the whole run, with the
+  main thread's slot untouched. The driver's new failure proof drops the
+  one flag bit, so every thread shares the main thread's block, and the
+  program names the clash. The runtime's cutover to threads is therefore
+  a spelling, not a mechanism: the scheduler's state becomes
+  `@[ThreadLocal]` per scheduler thread and the allocator's fast path
+  per-thread, with the shared structures behind the atomics the probe
+  already wrote. GC_DESIGN.md carries the reading. The LLVM binding
+  gained `LLVM::ThreadLocalMode` and `Value#thread_local_mode=` for it;
+  `spec/compiler/codegen/thread_local_spec.cr` and `class_var_spec.cr`
+  pass, and the wasm32 cross-compile of a sample and of `--crystal`'s
+  stdlib sample still compile to their objects.
+
 ### Fixed
 
 - **`make -B iyi-tarball` packaged an unoptimised compiler past the guard

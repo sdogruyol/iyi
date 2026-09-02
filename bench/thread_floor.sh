@@ -6,21 +6,27 @@
 #
 #     bash bench/thread_floor.sh
 #
-# Four steps, and the last is a failure proof, because a gate that cannot
-# fail is not a gate:
+# Five steps, and the last two are failure proofs, because a gate that
+# cannot fail is not a gate:
 #
 #   1. The program holds every property, plain and --release: N threads by
-#      raw `clone`, each with a tid of its own; every one stopped where it
-#      ran by `tgkill` and a handler, released by one futex wake; every one
-#      joined on the tid word the kernel clears at exit.
+#      raw `clone`, each with a tid of its own and a thread-local block of
+#      its own laid out from the executable's PT_TLS; every one stopped
+#      where it ran by `tgkill` and a handler, released by one futex wake;
+#      every one joined on the tid word the kernel clears at exit; every
+#      `@[ThreadLocal]` slot still its owner's at the end.
 #   2. The binary keeps the floor: the runtime's five C-template names and
 #      nothing else. This is the measurement the file exists for — a thread
-#      without pthreads adds no symbol — and it is asserted, not printed.
+#      without pthreads adds no symbol, and a thread-local variable adds no
+#      `__tls_get_addr` — and it is asserted, not printed.
 #   3. The pause, by thread count, printed from real runs. Reported rather
 #      than budgeted: a budget would be a number this script made up, and
 #      the shape (how it scales past the core count) is the finding.
-#   4. The tid assertion is reachable: a program whose thread reads the
-#      process id instead of a thread id exits 1 at that check's own name.
+#   4. The ran-its-loop assertion is reachable: a thread that counts into
+#      the wrong word exits 1 at that check's own name.
+#   5. The thread-local assertion is reachable: `clone` without
+#      CLONE_SETTLS leaves every thread on the main thread's block, and the
+#      program exits 1 naming the slot another thread wrote into.
 #
 # Linux x86_64 and aarch64 only. darwin's thread is libSystem's by III.9's
 # rule and its floor is measured by its own job; here the script says so
@@ -99,6 +105,21 @@ fi
 timeout 60 ./idle 2 10 > idle.txt 2>&1
 if [ $? -ne 1 ] || ! grep -q "never ran its loop" idle.txt; then
   echo "the loop check did not fire:"; cat idle.txt; exit 1
+fi
+
+# ── 5. Failure proof: the thread-local assertion is reachable ─────────────
+# The one flag bit, dropped from the constant and from both arms' asm
+# immediates: every thread then inherits the parent's thread pointer and
+# shares its block, so the slots clash and the program says whose.
+step "failure proof: threads sharing one thread-local block are refused"
+sed 's/012d/0125/g' "$REPO/bench/thread_floor.iyi" > shared.iyi
+[ "$(grep -c '0125' shared.iyi)" -ge 3 ] || { echo "the sed found nothing to change"; exit 1; }
+if ! "$IYI" build shared.iyi -o shared > build-shared.log 2>&1; then
+  cat build-shared.log; exit 1
+fi
+timeout 60 ./shared 2 10 > shared.txt 2>&1
+if [ $? -ne 1 ] || ! grep -q "thread-local slot" shared.txt; then
+  echo "the thread-local check did not fire:"; cat shared.txt; exit 1
 fi
 
 echo "workdir $WORK"
