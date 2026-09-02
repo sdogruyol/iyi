@@ -226,14 +226,13 @@
   about one. Past the core count the resume is XNU's 10 ms quantum,
   the way the stop is Linux's timeslice, so the core-count bound on
   marking workers and on M holds on darwin with more force. Two
-  things found on the way: `bzero` is in every darwin `--release`
+  things found on the way: `bzero` was in every darwin `--release`
   binary, `hello` included — the aarch64 back end's lowering of a
   memset it will not inline, and the compiler zeroes every
   `Pointer.malloc` with one; a plain binary with a large constant one
-  names it too — and no gate had seen it because
-  `bench/dependency_floor.sh` builds plain; the thread floor's release
-  list carries it, labelled as the release build's and not the
-  thread's. The price of the spelling is measured too: ten million
+  named it too — and no gate had seen it because
+  `bench/dependency_floor.sh` builds plain; it is the prelude's own
+  now, under Fixed. The price of the spelling is measured too: ten million
   read-modify-writes of a `@[ThreadLocal]` against a plain class
   variable, release build, each in its own `@[NoInline]` frame, cost
   3.2 ns to 2.0 on darwin and 4.7 to 3.0 on aarch64 Linux in a
@@ -262,6 +261,28 @@
   GC_DESIGN.md carries the reading.
 
 ### Fixed
+
+- **A darwin binary clears its own memory: `bzero` is the prelude's.**
+  Every darwin `--release` binary — `hello` included — and any plain one
+  with a large constant `Pointer.malloc` asked libSystem for `bzero`,
+  because codegen zeroes every allocation with an `llvm.memset` and the
+  aarch64 back end spells a zeroing memset it will not inline `bzero`,
+  not `memset`; the prelude intercepted `memset` by defining it and had
+  never heard of the other name, and no gate read a release binary on
+  darwin until the thread floor did. The measure is Go's: a runtime
+  competing with it links libSystem for the kernel's door and for
+  nothing it can write itself, and a clear loop is the first thing it
+  can. The prelude now defines `bzero` beside `memset` in the collector's
+  branch (the `-Dgc_none` branch takes libSystem's allocator by choice
+  and keeps its `memset` and `bzero` with it). The body is inline-asm
+  stores, a word then bytes, on both darwin architectures, and not a
+  loop or a call to `memset`: the loop-idiom pass spares only functions
+  named `memset` and `memcpy`, and the first version, written as
+  `memset`'s loop, came back from the optimiser as a tail call to
+  itself on its own byte tail and hung the root exercise. A release
+  `hello` on darwin is back to the runtime's twelve names; the thread
+  floor's release list is its plain list; the root gate's list lost the
+  name it had carried for a day.
 
 - **darwin's clock is the 24 MHz counter now, not a microsecond
   rounding of it.** The prelude read `clock_gettime_nsec_np(6)`,
@@ -307,9 +328,8 @@
   `clock_gettime_nsec_np`) and root discovery (`pthread_self`,
   `pthread_get_stackaddr_np`, the two `_dyld_get_image_*`) put on every
   darwin program's line; each list is now the exact set the gate's
-  binary asks for, with a reason beside every name, `bzero` among the
-  root gate's because a 1.5 MiB `Pointer.malloc` there is zeroed by a
-  memset the aarch64 back end will not inline. The fourth was real:
+  binary asks for, with a reason beside every name (`bzero` was among
+  the root gate's for a day, until the prelude owned it). The fourth was real:
   `collect_trigger.iyi`'s release build on darwin panicked at
   "scavenge: 6 arenas at the peak and none went back to the kernel",
   because the spike's root sat in a global written and never read, the
@@ -3032,7 +3052,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,681-line library and nothing else. Every other
+  written against iyi's own 5,718-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

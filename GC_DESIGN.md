@@ -287,15 +287,20 @@ probe's proof is the assertion alone — every thread read the image's 7
 in its own copy and its own tid in its own slot for the whole run — and
 the driver's failure proof is to delete the annotation, after which the
 slots are one thread's class variables and the program names the clash
-on the first thread joined. One more name appears in a darwin
-`--release` binary and it is not the thread's: `bzero`, the aarch64
+on the first thread joined. One more name appeared in a darwin
+`--release` binary and it was not the thread's: `bzero`, the aarch64
 back end's lowering of a memset it will not inline, and the compiler
 zeroes every `Pointer.malloc` with one — a plain binary has only small
 constant ones, a release binary inlines the allocator and keeps its
 variable-length ones, and a plain binary with a large constant one (the
-root exercise's 1.5 MiB object) names it too. A release `hello` carries
-it, `bench/dependency_floor.sh` builds plain and never sees it, and the
-thread floor's release list carries it, labelled.
+root exercise's 1.5 MiB object) named it too. A release `hello` carried
+it and `bench/dependency_floor.sh`, which builds plain, never saw it.
+It is the program's own now: the prelude defines `bzero` beside its
+`memset`, in inline-asm stores because the loop-idiom pass would turn
+a zeroing loop in a function of any other name back into the intrinsic
+(the first version tail-called itself), and a darwin binary asks
+libSystem to clear nothing — which is where Go stands on darwin, with
+its own `memclr` and libSystem only for the kernel's door.
 
 The numbers, release build, an M2 Pro (10 cores, 6 performance and 4
 efficiency), 200 rounds, threads spinning the whole time, read on the

@@ -126,13 +126,11 @@ case "$(uname -s)" in
     #   __tlv_bootstrap                              a @[ThreadLocal]: the
     #       thunk in every Mach-O thread-local descriptor, which dyld
     #       rebinds to its own tlv_get_addr at load
-    # The release build carries one more, `bzero`, and it is not the
-    # thread's: the compiler zeroes every `Pointer.malloc` with an
-    # `llvm.memset`, and the aarch64 back end lowers a memset it will not
-    # inline — variable length, or large — to `bzero`. A plain build has
-    # only small constant ones here; a --release build inlines the allocator
-    # and keeps its variable-length ones, so a release `hello` on darwin
-    # names it too. bench/dependency_floor.sh builds plain and never sees it.
+    # The release build once carried one more, `bzero`: the compiler zeroes
+    # every `Pointer.malloc` with an `llvm.memset`, and the aarch64 back end
+    # lowers a memset it will not inline to a `bzero` call. The prelude
+    # defines `bzero` now, the way it defines `memset`, so the name resolves
+    # to the program's own and the release list is the plain list.
     step "dependency floor: what a thread costs darwin, by name"
     runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pthread_get_stackaddr_np _pthread_self _write'
     thread='__tlv_bootstrap _os_unfair_lock_lock _os_unfair_lock_unlock _pthread_create _pthread_join _pthread_kill _pthread_threadid_np _sigaction'
@@ -142,8 +140,8 @@ case "$(uname -s)" in
     #   thread_get_state                             the registers, read held
     mach='__tlv_bootstrap _pthread_create _pthread_join _pthread_mach_thread_np _pthread_threadid_np _thread_get_state _thread_resume _thread_suspend'
     printf '%s\n' $runtime $thread | LC_ALL=C sort > expected-floor.txt
-    printf '%s\n' $runtime $thread _bzero | LC_ALL=C sort > expected-floor-release.txt
-    printf '%s\n' $runtime $mach _bzero | LC_ALL=C sort > expected-floor-mach.txt
+    printf '%s\n' $runtime $thread | LC_ALL=C sort > expected-floor-release.txt
+    printf '%s\n' $runtime $mach | LC_ALL=C sort > expected-floor-mach.txt
     for bin in floor floor-release floor-mach; do
       nm -u "$bin" | sed -e 's/^ *//' | awk '{ print $NF }' | LC_ALL=C sort > "found-$bin.txt"
       if ! diff "expected-$bin.txt" "found-$bin.txt" > "diff-$bin.txt"; then
@@ -158,7 +156,7 @@ case "$(uname -s)" in
         exit 1
       fi
     done
-    echo "  the runtime's twelve names, the thread's eight (the Mach stop's other eight), libSystem alone; release adds bzero"
+    echo "  the runtime's twelve names, the thread's eight (the Mach stop's other eight), libSystem alone, plain and release"
     ;;
 esac
 

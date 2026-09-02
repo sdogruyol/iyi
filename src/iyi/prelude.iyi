@@ -1074,6 +1074,43 @@ require "./file"
       destination
     end
 
+    {% if flag?(:darwin) %}
+      # `bzero` is defined for the same reason on darwin: the aarch64 back end
+      # lowers a zeroing `llvm.memset` it will not inline — every
+      # `Pointer.malloc` clears with one, and a --release build keeps the
+      # allocator's variable-length ones — to a `bzero` call rather than a
+      # `memset` call, so without this every darwin release binary asked
+      # libSystem for one more name (bench/thread_floor.sh was the gate that
+      # first read it; bench/dependency_floor.sh builds plain and never saw
+      # it). The stores are inline asm, not a loop the compiler can read:
+      # the loop-idiom pass turns a zeroing store loop into the very
+      # `llvm.memset` this exists to catch, and it spares only functions
+      # named `memset` and `memcpy` — the first version of this, written as
+      # `memset`'s loop, came back as a tail call to itself on its own byte
+      # tail. A call to `memset` would fold the same way. A word per store,
+      # the shape `memset` above has, and the byte tail is at most seven.
+      fun bzero(destination : Void*, count : UInt64) : Nil
+        address = destination.address
+        filled = 0_u64
+        while filled + 8_u64 <= count
+          {% if flag?(:aarch64) %}
+            asm("str xzr, [$0]" :: "r"(address + filled) : "memory" : "volatile")
+          {% else %}
+            asm("movq $$0, ($0)" :: "r"(address + filled) : "memory" : "volatile")
+          {% end %}
+          filled = filled + 8_u64
+        end
+        while filled < count
+          {% if flag?(:aarch64) %}
+            asm("strb wzr, [$0]" :: "r"(address + filled) : "memory" : "volatile")
+          {% else %}
+            asm("movb $$0, ($0)" :: "r"(address + filled) : "memory" : "volatile")
+          {% end %}
+          filled = filled + 1_u64
+        end
+      end
+    {% end %}
+
     # GC_DESIGN.md's Stage 3: the root set, made enumerable. Nothing marks and
     # nothing collects here. What lands is the answer to "where could a
     # pointer to a live object be", asked of the one thread this language has,
