@@ -95,6 +95,30 @@
   twice and packages release, and the plain `make iyi-tarball` against a
   stale unoptimised binary still refuses by name.
 
+### Learned
+
+- **The next 18 MB of tarball is the compiler's own backtrace, and it
+  stays.** After the diet the Linux package is 215 MB unpacked and
+  `bin/` is 197 MB of it: `iyi` and `iyi-daemon` at 103 MB each, the
+  same sources built with and without `-Dwithout_mt`. `size -A` on one
+  says 38 MB of that is DWARF — `.debug_info` 10.8 MB, `.debug_line`
+  6.9 MB, `.debug_ranges` 3.6 MB and their strings — all of it Crystal's
+  default line tables for the compiler, since MinSizeRel LLVM emits none.
+  Stripped, the package would be 143 MB and the tarball 52.5 MB against
+  70. Measured, and refused: a three-line program built `--no-debug`,
+  `strip`ped, or `strip --strip-debug`ged prints its unhandled exception
+  as `from ./bt in '??'` on every frame, because the runtime takes
+  function *names* from DWARF too, not from the symbol table. A downloaded
+  compiler whose crash report is three rows of `??` is the wrong 18 MB to
+  save. The Linux runtime reads DWARF from the executable alone
+  (`Exception::CallStack.load_debug_info_impl`), where darwin already
+  looks for a sibling `.dSYM`; a `bin/iyi.debug` companion the Linux
+  runtime could learn to open would make the saving free, and is the
+  shape this should take if it is ever taken. The other 103 MB — the
+  daemon being a second copy of the compiler with LLVM inside — is a
+  runtime question (`fork` against multithreaded codegen), not a
+  packaging one.
+
 ## 0.8.0 — 2026-09-01
 
 **The collector is the default.** 0.7.0 built it; this release seats it: a
