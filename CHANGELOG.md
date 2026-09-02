@@ -97,13 +97,22 @@
   struct and a two-instruction `rt_sigreturn` restorer where x86_64
   needs one, `tgkill` to every thread, a handler that counts itself in,
   parks on a futex and counts itself out on one wake. Release build, 20
-  cores, threads spinning the whole time: stopping 1 thread is 1.6 µs
-  best, 4 are 4.1 µs, 16 are 22 µs; 64 — past the core count — are 98 µs
-  best but 7.3 ms mean, because a signalled thread with no CPU runs its
-  handler when the scheduler next gives it one. Resume is one wake at
-  0.3 µs. So marking workers never exceed the core count and the mutator
-  side is bounded the same way, or a pause is milliseconds by
-  construction. The probe also priced two absences by running without
+  cores, 200 rounds, threads spinning the whole time: stopping 1 thread
+  is 2.1 µs best, 4 are 5.0 µs, 16 are 22 µs, and 64 — past the core
+  count — are 84 µs best and 139 µs mean, because a handler that parks
+  gives its core up and the next signalled thread runs on it at once.
+  Resume is where the oversubscription lands: 0.6 µs for 1 thread, 2.9
+  µs for 4, 11 µs best but 0.4 ms mean for 16, and 6.4 ms best for 64,
+  because every woken thread goes back to spinning and the last one to
+  count itself out waits for a timeslice. So marking workers never
+  exceed the core count and the mutator side is bounded the same way,
+  or a pause is milliseconds by construction. That reading replaced a
+  first one that put the milliseconds on the stop and called the resume
+  one wake at 0.3 µs: the release build's `xchg` store had clobbered
+  the register the three counters were zeroed from, so nobody parked
+  and the resume woke no one (the Fixed entry below has the
+  instruction; the plain build of the same probe gave the shape above
+  all along). The probe also priced two absences by running without
   them: no thread pointer at all, so the compiler emits nothing
   thread-relative for a body that neither allocates nor raises, and the
   real first cost of threads is that the scheduler, the poller and the
@@ -253,7 +262,7 @@
   kill after the first costs 6–7 µs in the call itself (the loop alone
   is 24, 83 and 612 µs for 4, 8 and 16) where Linux's `tgkill` is
   about one. Past the core count the resume is XNU's 10 ms quantum,
-  the way the stop is Linux's timeslice, so the core-count bound on
+  the way it is Linux's timeslice, so the core-count bound on
   marking workers and on M holds on darwin with more force. Two
   things found on the way: `bzero` was in every darwin `--release`
   binary, `hello` included — the aarch64 back end's lowering of a
@@ -301,12 +310,20 @@
   in the register across the store of it into the table, got 0 back, and
   the child's first instruction faulted at 0x3fff0 — a segfault with no
   line, in the samples job, on the commit that added the held-context
-  read and happened to be the first to reuse a stored value. Found by
-  building the release for x86_64-linux-gnu and running it under Rosetta
-  in a container with a SIGSEGV handler that prints rip, rsp and the
-  faulting address out of the same ucontext offsets the probe measures.
-  The store is `mov` and `mfence` now. `__tf_add`'s `lock xadd` was
-  already right: its register is tied to the output.
+  read. Found by building the release for x86_64-linux-gnu and running
+  it under Rosetta in a container with a SIGSEGV handler that prints
+  rip, rsp and the faulting address out of the same ucontext offsets the
+  probe measures. The store is `mov` and `mfence` now. `__tf_add`'s
+  `lock xadd` was already right: its register is tied to the output.
+  It was not the first reuse, only the first that faulted: the release
+  probe had zeroed its three counters through one register from the
+  start, `xchg %rcx,(%rax)` three times with no reload between, so the
+  second and third stores wrote the first counter's old value — the
+  thread count — into `resumed` and `resume`, no handler ever parked,
+  and the first Linux reading's "resume is one wake at 0.3 µs" was a
+  wake of nobody. The reading above was taken again with the fixed
+  store, and the plain build of the old probe, which reloads, had been
+  giving the corrected shape all along.
 
 - **A darwin binary clears its own memory: `bzero` is the prelude's.**
   Every darwin `--release` binary — `hello` included — and any plain one

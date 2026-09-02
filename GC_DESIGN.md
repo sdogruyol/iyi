@@ -189,16 +189,24 @@ first is affordable.
 
 The numbers, release build, 20 cores, 200 rounds, threads spinning the
 whole time (the case a stop has to handle; a parked thread is the easy
-one): stop 1 thread best 1.6 µs / mean 1.9 µs; 4 threads 4.1 / 5.5 µs; 16
-threads 22 / 32 µs with a 1.3 ms worst; 64 threads best 98 µs but mean
-7.3 ms and worst 14.6 ms. Resume is one wake: 0.3 µs best for 1 to 16
-threads, 0.7 µs for 64. The shape is the finding. Below the core count
-the pause is a signal per thread, roughly a microsecond each; past it a
-signalled thread with no CPU runs its handler when the kernel's scheduler
-next gives it one, so the pause floor over oversubscribed threads is the
-timeslice, not the signal. Two decisions follow for Stages 4 and 7:
-marking workers never exceed the core count, and the mutator side is M:N
-with M bounded the same way, or a stop is milliseconds by construction.
+one): stop 1 thread best 2.1 µs / mean 2.3 µs; 4 threads 5.0 / 5.9 µs; 8
+threads 8.2 / 11.5 µs; 16 threads 22 / 31 µs; 64 threads 84 / 139 µs
+with a 0.6 ms worst. Resume: 0.6 / 0.8 µs for 1 thread, 2.9 / 4.0 µs
+for 4, 4.3 / 36 µs for 8, 11 µs best but 0.42 ms mean for 16, and 6.4
+ms best / 11.9 ms mean for 64. The shape is the finding. Below the core
+count the pause is a signal per thread, roughly a microsecond each. Past
+it the stop stays bounded, because a handler that parks gives its core
+up and the next signalled thread runs its handler on it at once; the
+resume is the timeslice, because every woken thread goes straight back
+to spinning and the last one to count itself out waits for the kernel's
+scheduler to reach it — the same shape darwin's section below reads off
+XNU's quantum. (A first reading put the milliseconds on the stop and
+called the resume one wake: the release probe's `xchg` store had
+clobbered the register its counters were zeroed from, so no thread
+parked; CHANGELOG.md's Fixed entry has the instruction.) Two decisions
+follow for Stages 4 and 7: marking workers never exceed the core count,
+and the mutator side is M:N with M bounded the same way, or a resume is
+milliseconds by construction.
 
 The first run had no thread pointer at all — no `CLONE_SETTLS` — and the
 child still ran compiled iyi code (a `fun`, atomics by inline asm,
@@ -359,8 +367,8 @@ threads at that slope. Past the core count the resume, not the stop,
 is the timeslice: the released threads run and spin, and a thread the
 unlock woke has to wait for one of them to be descheduled, which on
 XNU's default 10 ms quantum is the 4 ms best and 20 ms mean 16 threads
-show — the same shape as Linux's oversubscribed stop, on the other
-half of the pause and at the larger quantum. The two decisions above
+show — the same half of the pause Linux's oversubscribed resume lands
+on, at the larger quantum. The two decisions above
 stand on darwin with more force: marking workers and the mutator's M
 are bounded by the core count, or a resume is tens of milliseconds by
 construction.
