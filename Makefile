@@ -404,7 +404,9 @@ iyi-tarball: $(O)/iyi$(EXE) $(O)/$(IYI_DAEMON_BIN) check_iyi_is_release
 	find "$(O)/iyi-package/share/iyi/samples" -type f -perm -u+x -delete
 	find "$(O)/iyi-package/share/iyi/samples" -type d -empty -delete
 # What the binaries need at runtime and a fresh machine has no reason to
-# own — LLVM above all, and everything LLVM itself asks for. Not a
+# own — libgc, and libstdc++ on Linux; LLVM is inside the binary when it
+# was linked against `scripts/build-static-llvm.sh`'s archive, and the
+# script refuses a package that carries libLLVM in that case. Not a
 # curated list: the script takes what the loader reports, and CI's clean
 # room (a bare image with nothing but a C toolchain) is what judges it.
 	bash scripts/bundle-runtime-libs.sh "$(O)/iyi-package"

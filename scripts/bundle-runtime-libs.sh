@@ -159,7 +159,7 @@ if [ "$mode" != "--verify-only" ]; then
   # linked against shared LLVM must ship it — a package without it needs
   # the host's, which is the bug this script exists for. A compiler
   # linked against the static LLVM (the tarball diet: built per Crystal's
-  # own recipe, GC_DESIGN's Learned entry collected) must ship *no*
+  # own recipe by `build-static-llvm.sh`) must ship *no*
   # libLLVM, because one in `lib/` would mean the link quietly went
   # shared after all. Which direction applies is read off the binary,
   # not assumed.
