@@ -12,7 +12,9 @@
 # Two layers, because either alone can be fooled. The symbol list catches a
 # dependency arriving as a call into something the linker resolves from libc.
 # The library list catches one arriving as a whole `-l`, which adds no undefined
-# symbol a naive check would notice once it is satisfied.
+# symbol a naive check would notice once it is satisfied. Two builds, plain
+# and --release, because the optimiser can put a name on the line the plain
+# build never had (`bzero` on darwin was one, for a day).
 #
 # A new entry is not automatically wrong. It is a dependency being taken on,
 # which is a decision, and the way to record the decision is to add it here in
@@ -156,25 +158,34 @@ case "$(uname -s)" in
   *) allowed_symbols="$ALLOWED_SYMBOLS_DARWIN" ;;
 esac
 
-echo "== programs, plain build"
+# Plain and --release both, into one set: the optimiser is a source of
+# names of its own. It inlines the allocator and leaves variable-length
+# `llvm.memset`s behind, and the aarch64 back end spelled those `bzero` —
+# a name every darwin release binary asked libSystem for, that this gate
+# never saw while it built plain, and that the thread floor found by
+# reading its own release binary. The floor is what a program a person
+# ships asks for, and a person ships --release.
 found_syms="$WORK/syms"
 found_libs="$WORK/libs"
 : >"$found_syms"
 : >"$found_libs"
 
-for source in "$REPO"/samples/iyi/*.iyi; do
-  sample="$(basename "$source" .iyi)"
-  if ! "$IYI" build -o "$WORK/$sample" "$source" >"$WORK/$sample.log" 2>&1; then
-    echo "$sample: build failed"
-    tail -5 "$WORK/$sample.log"
-    status=1
-    continue
-  fi
-  symbols "$WORK/$sample" >>"$found_syms"
-  libraries "$WORK/$sample" >>"$found_libs"
-  printf '  %-12s %s | %s\n' "$sample" \
-    "$(symbols "$WORK/$sample" | tr '\n' ' ')" \
-    "$(libraries "$WORK/$sample" | tr '\n' ' ')"
+for mode in "" "--release"; do
+  echo "== programs, ${mode:-plain} build"
+  for source in "$REPO"/samples/iyi/*.iyi; do
+    sample="$(basename "$source" .iyi)${mode:+-release}"
+    if ! "$IYI" build $mode -o "$WORK/$sample" "$source" >"$WORK/$sample.log" 2>&1; then
+      echo "$sample: build failed"
+      tail -5 "$WORK/$sample.log"
+      status=1
+      continue
+    fi
+    symbols "$WORK/$sample" >>"$found_syms"
+    libraries "$WORK/$sample" >>"$found_libs"
+    printf '  %-20s %s | %s\n' "$sample" \
+      "$(symbols "$WORK/$sample" | tr '\n' ' ')" \
+      "$(libraries "$WORK/$sample" | tr '\n' ' ')"
+  done
 done
 
 [ "$status" -eq 0 ] || { echo; echo "a sample did not build, so no floor was measured"; exit 1; }
