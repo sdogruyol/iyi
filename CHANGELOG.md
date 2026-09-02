@@ -57,9 +57,29 @@
   this entry was written — 13 minutes on 20 cores, `--shared-mode`
   `static`, the five targets, `-lrt -ldl -lm` as its whole system list —
   and the tarball built against it packages libgc and libstdc++ and
-  nothing else, exactly as CI's own build did. darwin's first run is the
-  job's to report, and the guards above are what make its verdict a
-  verdict.
+  nothing else, exactly as CI's own build did.
+
+  darwin was then run the same way, on an M2 Pro (10 cores, Xcode's
+  clang 21, macOS 26.5). The recipe took 9m36s, answered `static`, and
+  its whole system list is `-lm`; `make -B iyi-tarball` against it said
+  "static LLVM: no libLLVM to carry, and none carried", bundled
+  `libgc.1.dylib` alone, and closed. Against 0.8.0's darwin package:
+  the tarball fell from 72 MB to 50 MB and the unpacked footprint from
+  217 MB to 154 MB; `lib/` went from 173 MB (libLLVM.dylib at 164 MB,
+  libz3, libzstd, libgc) to 208 KB. It fell by less than Linux's because
+  `bin/` grew from 30 MB to 139 MB — `iyi` and `iyi-daemon` each carry
+  LLVM inside now, 72 MB apiece. `otool -L` on the packaged `iyi` names
+  `/usr/lib/libSystem.B.dylib`, `/usr/lib/libc++.1.dylib` and
+  `@rpath/libgc.1.dylib`; the bundler's fixed point converged in one
+  turn; unpacked under `/tmp` the package ran `hello.iyi`, the kqueue
+  exercise, `--crystal` and the daemon, and `iyi version` reported a
+  release build. The four gates held against the compiler it built, and
+  the floor's measured list for the compiler is `libc++ libgc libSystem`
+  — libLLVM left it. One thing the run found that CI cannot: a shell
+  exporting brew llvm's suggested `LDFLAGS=-L/opt/homebrew/opt/llvm/lib`
+  rides into `--link-flags` ahead of `llvm-config --ldflags`, the linker
+  takes brew's LLVM 22 archives for the static 20.1.2 ones, and the link
+  dies on zstd and zlib symbols. Unset it.
 
 ### Fixed
 
