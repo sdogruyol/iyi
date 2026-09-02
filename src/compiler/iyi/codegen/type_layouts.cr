@@ -37,7 +37,9 @@ module Iyi
     # *type* must be a concrete instance-variable container: a class, a
     # struct, or an instantiated generic one. Callers filter, because an
     # uninstantiated generic has no layout and a module or enum has no fields
-    # to map.
+    # to map - and a static array lowers to an LLVM array, not a struct: no
+    # fields, every word an element, so it gets no entry and the marker
+    # word-scans it to its size, which is exactly the elements.
     def gc_type_layout(type : Type) : IyiMod::TypeLayout
       typer = llvm_typer
       struct_type = typer.llvm_struct_type(type)

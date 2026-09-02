@@ -17,6 +17,15 @@ module Iyi
   GET_EXCEPTION_NAME     = "__crystal_get_exception"
   ONCE_INIT              = "__crystal_once_init"
   ONCE                   = "__crystal_once"
+  # iyi: the collector's write barrier (GC_DESIGN.md Stage 9). While a mark
+  # runs beside the program, every store of a pointer-bearing value is
+  # bracketed: `begin` marks the thread as inside a barrier so a stop
+  # defers past it, the store lands, and the barrier shades whatever the
+  # destination now holds. The flag the store checks is `__iyi_marking`,
+  # a byte codegen defines and the marker sets.
+  WRITE_BARRIER_BEGIN_NAME = "__iyi_write_barrier_begin"
+  WRITE_BARRIER_NAME       = "__iyi_write_barrier"
+  MARKING_NAME             = "__iyi_marking"
 
   class Program
     def run(code, filename : String? = nil, debug = Debug::Default)
@@ -271,6 +280,8 @@ module Iyi
     @malloc_fun : LLVMTypedFunction?
     @malloc_atomic_fun : LLVMTypedFunction?
     @realloc_fun : LLVMTypedFunction?
+    @write_barrier_begin_fun : LLVMTypedFunction?
+    @write_barrier_fun : LLVMTypedFunction?
     @raise_overflow_fun : LLVMTypedFunction?
     @raise_cast_failed_fun : LLVMTypedFunction?
     @c_malloc_fun : LLVMTypedFunction?
@@ -614,7 +625,8 @@ module Iyi
         case node.name
         when MALLOC_NAME, MALLOC_ATOMIC_NAME, REALLOC_NAME, RAISE_NAME,
              @codegen.personality_name, GET_EXCEPTION_NAME, RAISE_OVERFLOW_NAME,
-             RAISE_CAST_FAILED_NAME, ONCE_INIT, ONCE
+             RAISE_CAST_FAILED_NAME, ONCE_INIT, ONCE,
+             WRITE_BARRIER_BEGIN_NAME, WRITE_BARRIER_NAME
           @codegen.accept node
         end
 
@@ -2369,14 +2381,23 @@ module Iyi
         closure_skip_parent = false
 
         if parent_closure_type
-          store parent_context.not_nil!.closure_ptr.not_nil!, gep(closure_type, closure_ptr, 0, closure_vars.size, "parent")
+          # iyi: a heap pointer into a fresh heap object, under the write
+          # barrier like any other (the closure is a `Pointer`-shaped
+          # value to the marker: conservative, and bracketed by type).
+          slot = gep(closure_type, closure_ptr, 0, closure_vars.size, "parent")
+          iyi_with_write_barrier(slot, @program.pointer_of(@program.void)) do
+            store parent_context.not_nil!.closure_ptr.not_nil!, slot
+          end
         end
 
         if self_closured
           offset = parent_closure_type ? 1 : 0
           self_value = to_rhs(llvm_self, current_context.type)
 
-          store self_value, gep(closure_type, closure_ptr, 0, closure_vars.size + offset, "self")
+          slot = gep(closure_type, closure_ptr, 0, closure_vars.size + offset, "self")
+          iyi_with_write_barrier(slot, current_context.type) do
+            store self_value, slot
+          end
 
           current_context.closure_self = current_context.type
         end
@@ -2628,6 +2649,85 @@ module Iyi
       else
         nil
       end
+    end
+
+    # iyi: the barrier's two entry points, and the flag they hang on.
+    def iyi_write_barrier_begin_fun
+      @write_barrier_begin_fun ||= typed_fun?(@main_mod, WRITE_BARRIER_BEGIN_NAME)
+      if barrier_fun = @write_barrier_begin_fun
+        check_main_fun WRITE_BARRIER_BEGIN_NAME, barrier_fun
+      else
+        nil
+      end
+    end
+
+    def iyi_write_barrier_fun
+      @write_barrier_fun ||= typed_fun?(@main_mod, WRITE_BARRIER_NAME)
+      if barrier_fun = @write_barrier_fun
+        check_main_fun WRITE_BARRIER_NAME, barrier_fun
+      else
+        nil
+      end
+    end
+
+    def iyi_marking_flag
+      declare_lib_var(MARKING_NAME, @program.uint8, false)
+    end
+
+    # iyi: a store whose destination is a stack slot — an alloca, or a
+    # field or element of one — needs no barrier: the stack is rescanned
+    # at the mark's final stop. Walked through the GEPs and casts codegen
+    # puts between a local and its parts.
+    def iyi_stack_pointer?(pointer) : Bool
+      value = pointer.to_unsafe
+      16.times do
+        return true unless LibLLVM.is_a_alloca_inst(value).null?
+        if !LibLLVM.is_a_get_element_ptr_inst(value).null? || !LibLLVM.is_a_bit_cast_inst(value).null?
+          value = LibLLVM.get_operand(value, 0)
+        else
+          return false
+        end
+      end
+      false
+    end
+
+    # iyi: bracket a pointer-bearing store with the collector's write
+    # barrier (GC_DESIGN.md Stage 9). The flag is read once, so `begin`
+    # and the barrier pair exactly; a store the flag finds clear pays a
+    # load and a branch. `target_pointer` may be a stack slot — the
+    # barrier only reads what it finds there, and a stack word shaded is
+    # a root shaded early.
+    def iyi_with_write_barrier(target_pointer, target_type, &)
+      unless @program.iyi_gc_arena? && target_type.has_inner_pointers? && !iyi_stack_pointer?(target_pointer)
+        yield
+        return
+      end
+      begin_fun = iyi_write_barrier_begin_fun
+      barrier_fun = iyi_write_barrier_fun
+      unless begin_fun && barrier_fun
+        yield
+        return
+      end
+      marking = load(llvm_context.int8, iyi_marking_flag)
+      active = not_equal? marking, int8(0)
+      begin_block, plain_block, join_block = new_blocks "barrier_begin", "barrier_plain", "barrier_join"
+      cond active, begin_block, plain_block
+      position_at_end begin_block
+      call begin_fun
+      br join_block
+      position_at_end plain_block
+      br join_block
+      position_at_end join_block
+      yield
+      return if @builder.end
+      bytes = @program.size_of(target_type)
+      words = size_t(((bytes + 7_u64) // 8_u64).clamp(1_u64..))
+      after_block, done_block = new_blocks "barrier_shade", "barrier_done"
+      cond active, after_block, done_block
+      position_at_end after_block
+      call barrier_fun, [cast_to_void_pointer(target_pointer), words]
+      br done_block
+      position_at_end done_block
     end
 
     def crystal_raise_overflow_fun

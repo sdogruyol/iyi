@@ -114,6 +114,18 @@ class Iyi::CodeGenVisitor
     unless @single_module
       symbol.linkage = LLVM::Linkage::External
     end
+
+    # The marking flag the write barrier checks (GC_DESIGN.md Stage 9):
+    # one byte, zero until the marker raises it, defined here beside the
+    # table for the same reason — the prelude declares it, the program
+    # must own it, and the collector's builds are the only ones with a
+    # marker to raise it.
+    flag = @main_mod.globals[MARKING_NAME]? ||
+           @main_mod.globals.add(@main_llvm_context.int8, MARKING_NAME)
+    flag.initializer = @main_llvm_context.int8.const_int(0)
+    unless @single_module
+      flag.linkage = LLVM::Linkage::External
+    end
   end
 
   # The same filter `collect_iyi_layouts` applies to a module's own types,
@@ -127,7 +139,7 @@ class Iyi::CodeGenVisitor
 
     @program.llvm_id.each_type do |type|
       next unless type.is_a?(NonGenericClassType) || type.is_a?(GenericClassInstanceType)
-      next if type.is_a?(GenericType)
+      next if type.is_a?(GenericType) || type.is_a?(StaticArrayInstanceType)
 
       layout = @program.gc_type_layout(type)
       next if layout.type_id == 0

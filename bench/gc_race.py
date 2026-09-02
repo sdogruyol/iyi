@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The collector against the two it is measured by: Boehm, which Crystal
-ships, and Go's.
+"""The collector against the two it is measured by: Boehm, which the
+upstream compiler ships, and Go's.
 
 The same three programs, written once in iyi and once in Go, built release,
 run on an idle machine. Per arm: wall time (best of RUNS), peak RSS (the

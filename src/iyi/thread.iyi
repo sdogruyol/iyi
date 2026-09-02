@@ -551,6 +551,7 @@
     def self.start_helper(entry : UInt64, argument : UInt64) : Nil
       {% if flag?(:linux) %}
         stack = __iyi_mmap(IYI_THREAD_STACK).address
+        __iyi_madvise_nohuge(stack, IYI_THREAD_STACK)
         __iyi_conc_syscall3(IYI_SYS_MPROTECT, stack.to_i64, 4096_i64, 0_i64)
         # The tid word is the stack's guard-side scratch: nobody joins.
         scratch = __iyi_mmap(4096_u64).address
@@ -654,8 +655,10 @@
     # each has its registers and sp on its line and is parked. Answers
     # how many stopped, which is how many `resume_others` releases.
     def self.stop_others : Int64
+      # A helper has no line and stops every registered thread; a thread
+      # with a line stops every other.
       line = @@line
-      return 0_i64 if line == 0 || @@count <= 1_i64
+      return 0_i64 if @@count == 0_i64 || (line != 0 && @@count <= 1_i64)
       started = IyiMark.now_ns
       page = control
       word(page + IYI_TC_SUSPENDED).value.set(0_u64)

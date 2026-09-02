@@ -106,6 +106,7 @@
     index = index + 1_u64
   end
   churn(67108864_u64)
+  IyiMark.settle
   first_wave = IyiMark.collections
   raise "trigger: 64 MiB of churn ran no collection, so nothing triggers" if first_wave == 0
   arenas = arena_count
@@ -131,6 +132,7 @@
   IyiMark.collect
   after_reset = IyiMark.collections
   churn(67108864_u64)
+  IyiMark.settle
   second_wave = IyiMark.collections - after_reset
   if second_wave * 2_u64 >= first_wave
     raise "budget: #{count(second_wave)} collections against a 4 MiB live set, #{count(first_wave)} against none, so the budget is not growing with what survives"
@@ -167,6 +169,7 @@
     end
     before_state = IyiMark.collections
     churn(67108864_u64)
+    IyiMark.settle
     state_wave = IyiMark.collections - before_state
     after = scheduler_marks(0x5A5A5A5A5A5A5A5A_u64)
     raise "scheduler state: the churn beside it triggered nothing" if state_wave == 0
@@ -182,6 +185,7 @@
   # and both numbers are printed; the allocator must have swept at least
   # one arena per collection, or the sweep is not lazy at all — the
   # driver's proof removes the allocator's sweep and this check names it.
+  IyiMark.settle
   swept_lazily = IyiMark.swept_by_allocator
   in_pauses = IyiMark.debt_paid_in_pause
   raise "lazy: #{count(IyiMark.collections)} collections and the allocator swept #{count(swept_lazily)} arenas, so the sweep is not lazy" if swept_lazily < IyiMark.collections
@@ -217,11 +221,15 @@
         0
       end
       ready.receive
-      churn(4194304_u64)
+      # Twice the budget that stands, whatever the last mark left it at:
+      # one crossing is certain, and one collection is what the fiber's
+      # reference has to live through.
+      churn(IyiMark.budget * 2_u64)
       release.send(1)
       answer = verdict.receive
       raise "fiber: a parked fiber's only reference was collected under pressure" if answer != 0
     end
+    IyiMark.settle
     fiber_wave = IyiMark.collections - before_fibers
     raise "fiber: the churn beside a parked fiber triggered nothing" if fiber_wave == 0
     puts "    fiber: #{count(fiber_wave)} collections triggered beside a parked fiber, its 80 bytes intact"

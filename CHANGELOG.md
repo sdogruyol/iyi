@@ -581,7 +581,96 @@
   paused 94 ms to 51, wall 0.266 s to 0.219. A linked list — live churn —
   gains nothing, as no parallel marker can: a chain is one worker's walk.
 
+- **The mark runs beside the program, on a write barrier the compiler
+  emits — Stage 9.** A collection is two stops now and neither is the
+  mark: the first, on the triggering thread, grays the roots, raises a
+  byte (`__iyi_marking`), wakes the helpers and resumes the world — 15 to
+  35 µs; the helpers drain beside the program; the second, on helper 0
+  once every helper found the pool empty, flushes every thread's barrier
+  stack, rescans the roots, drains what that found, and turns the epoch.
+  Codegen wraps every store that can put a heap pointer into heap memory
+  — the `assign` funnel every typed store comes through, a C struct's
+  field, a closure's captured variables, parent and `self` — in a test
+  of the byte and, while it is up, a call after the store with the
+  destination's words, each heap pointer among them grayed onto the
+  storing thread's own stack (Dijkstra's insertion barrier, by re-reading
+  the destination, so one shape serves a word and a struct). Stores into
+  stack slots, walked through the GEPs and casts to their `alloca`, are
+  not wrapped: the stack is rescanned at the second stop. Objects born
+  under the mark are born gray; a `realloc`'s copy is shaded whole; and
+  the bracket around a store is the allocator's own depth counter, so a
+  thread is never parked between a pointer store and its shade. The
+  second stop looks before it drains: a white root, or a pool past
+  sixteen batches, and it resumes the program, marks beside it once
+  more, and stops again, up to eight times — a pointer loaded from a
+  white object into a register was a 200 000-node chain walked inside
+  the stop, 2 ms, before the retreat — and what the last stop finds it
+  drains alone, because waking fifteen helpers inside a stop cost up to
+  1.5 ms for a thousand entries. The first collection of a program goes
+  beside it too, helpers spawned before the stop; stopped, it was the
+  longest pause in every table. The last epoch's sweep debt is paid by
+  the triggering thread before its stop, under the lock the allocator's
+  own sweep takes — 500 µs of sweeping was the first stop's largest part
+  against 20 µs of roots, and paying it beside the program is Stage 8.
+  What was allocated under the mark is counted marked but not survived:
+  the budget is twice the rest, and those bytes open the next budget.
+  `bench/concurrent_mark.sh`: twenty-four rounds each move a payload out
+  of an unmarked 200 000-node chain into a holder the marker blackened
+  first, under a mark the round started itself, and read it back after
+  — its header without the sweep's free flag, its bytes the pattern
+  written — and the failure proof removes the barrier's shade and the
+  first payload is freed by name. Release, 20 cores: the chain marked
+  stopped is 1.9 ms; beside the program the longest first stop 0.6 ms,
+  the longest second 0.2 ms. `bench/gc_race.py` against Go: binary
+  trees' longest pause 0.10 ms to Go's 0.19 (was 2.3 with the parallel
+  marker), live churn 0.47 to 0.10, churn 0.03 to 0.48; total paused
+  2.6 ms to 2.1, 1.1 to 0.3, 0.3 to 3.6. Resident memory is Go's column
+  still (62 MB to 18 on binary trees), the price of no assists; that and
+  Stage 8 are next. `IyiMark.settle` waits out a collection in flight,
+  for a program that reads the count after churn: the count is of
+  finished collections, and a mark beside the program is not one yet.
+
 ### Fixed
+
+- **The layout table refused a `StaticArray`, and any program holding
+  one in an `uninitialized` local failed to build.** `gc_type_layout`
+  asked an LLVM array for its struct elements; a static array has no
+  fields, every word of it is an element, and it gets no entry now — the
+  marker word-scans an object it has no entry for to its size, which is
+  exactly the elements. Found writing a debug print with a stack buffer.
+
+- **The darwin floor lists were behind the parallel marker by two
+  names, and the identity floor found the race script calling the
+  upstream compiler by its name.** `pthread_create` and `sysctlbyname`
+  joined every darwin program with Stage 7 — the collector starts its
+  helpers as kernel threads sized by `hw.ncpu` — and `pipe` joins with
+  Stage 9, whose second stop registers the main thread, and a line's park
+  on darwin is a pipe; the six darwin lists carry the three, the thread
+  floor's runtime list rather than its probe's, and
+  `bench/dependency_floor.sh` says why. `bench/gc_race.py`'s docstring
+  said the Boehm arm was what Crystal ships; it is what the upstream
+  compiler ships.
+
+- **A helper's stop stopped nobody in a program that never started a
+  thread, and the sweep ran beside it.** The main thread has no line
+  until the first `IyiThread.start`; the trigger registers it before its
+  first concurrent collection, before the lock, because registering takes
+  it. Found by `bench/collect_trigger.sh`'s no-lazy-sweep proof, a
+  segfault in the scavenge one run in four.
+
+- **The first concurrent collection hung one run in twenty: the pool's
+  page was made by whichever thread reached it first.** With the helpers
+  started before the stop, a helper and the collector reached it at
+  once, each mapped a page, and the helpers counted ready on one the
+  collector never read. The collector makes it before the first helper
+  exists.
+
+- **A mark worker's stack cost 2 MB resident for 4 KB used.** The 32
+  MiB mapping, touched at one end, was given a transparent huge page at
+  its first touch — 34 MB across sixteen workers, on a program with a
+  4 MiB budget. The worker stacks and the helper threads' stacks refuse
+  huge pages by `madvise(MADV_NOHUGEPAGE)`, a syscall on Linux and no
+  name on the floor: churn's resident memory 49 MB to 19.
 
 - **The thread floor's x86_64 store clobbered its own value, and the
   release build handed `clone` a stack of 0.** `__tf_store` was the
@@ -3397,7 +3486,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 7,822-line library and nothing else. Every other
+  written against iyi's own 8,299-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

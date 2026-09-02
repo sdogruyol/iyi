@@ -714,6 +714,27 @@ require "./file"
         Pointer(Void).new(result.to_u64)
       end
 
+      # `madvise(MADV_NOHUGEPAGE)`, syscall 28 on x86_64 and 233 on aarch64:
+      # a mapping that is large and touched only at one end - a mark
+      # worker's stack, a helper thread's - would otherwise be given a
+      # transparent huge page at its first touch, two megabytes resident
+      # for four kilobytes used, sixteen workers and 34 MB of it.
+      fun __iyi_madvise_nohuge(address : UInt64, length : UInt64) : Nil
+        result = uninitialized Int64
+        {% if flag?(:x86_64) %}
+          asm("syscall" : "={rax}"(result)
+                        : "{rax}"(28_i64), "{rdi}"(address), "{rsi}"(length), "{rdx}"(15_i64)
+                        : "rcx", "r11", "memory"
+                        : "volatile")
+        {% else %}
+          asm("svc #0" : "={x0}"(result)
+                       : "{x8}"(233_i64), "{x0}"(address), "{x1}"(length), "{x2}"(15_i64)
+                       : "memory"
+                       : "volatile")
+        {% end %}
+        # Advice refused (a kernel without THP) is no failure.
+      end
+
       fun __iyi_munmap(address : UInt64, length : UInt64) : Nil
         result = uninitialized Int64
         {% if flag?(:x86_64) %}
@@ -1003,7 +1024,7 @@ require "./file"
       # allocations cost no shared write until then.
       def self.take(size : UInt64, clear : Bool) : UInt64
         table = cache
-        write64(table.address + CACHE_INSIDE, 1_u64)
+        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) + 1_u64)
         slice = read64(table.address + CACHE_SLICE) + size
         if slice >= SLICE
           write64(table.address + CACHE_SLICE, 0_u64)
@@ -1015,11 +1036,38 @@ require "./file"
           write64(table.address + CACHE_SLICE, slice)
         end
         head = take_inside(table, size, clear)
-        write64(table.address + CACHE_INSIDE, 0_u64)
-        {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
-          IyiThread.park_if_requested if read64(table.address + CACHE_REQUEST) != 0
-        {% end %}
+        # Born while a mark runs beside the program: gray, and on this
+        # thread's barrier stack, so a worker scans it once its fields are
+        # written — every write to them goes through the barrier — and
+        # counts it alive in its arena.
+        IyiMark.born_during_mark(head + HEADER, size) if LibIyiGCTable.__iyi_marking != 0_u8
+        leave(table)
         head
+      end
+
+      # Out of the allocator, or the barrier: the depth counter down, and
+      # a stop that was deferred while it was up is paid now.
+      def self.leave(table : Pointer(UInt64)) : Nil
+        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) - 1_u64)
+        {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+          if read64(table.address + CACHE_INSIDE) == 0_u64 && read64(table.address + CACHE_REQUEST) != 0
+            IyiThread.park_if_requested
+          end
+        {% end %}
+      end
+
+      # The write barrier's bracket (GC_DESIGN.md Stage 9), the same depth
+      # counter the allocator uses: a thread between a pointer store and
+      # the barrier that shades it is not parked where it stands, or the
+      # final stop's rescan could miss what the store just put into a
+      # black object.
+      def self.enter_barrier : Nil
+        table = cache
+        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) + 1_u64)
+      end
+
+      def self.leave_barrier : Nil
+        leave(cache)
       end
 
       def self.take_inside(table : Pointer(UInt64), size : UInt64, clear : Bool) : UInt64
@@ -1345,6 +1393,10 @@ require "./file"
           (destination + index.to_i64).value = (source + index.to_i64).value
           index = index + 1
         end
+        # The copy was bytes, invisible to the barrier the compiler puts on
+        # pointer stores; what the new block now holds is shaded here, so a
+        # buffer of references grown under a running mark keeps them.
+        IyiMark.barrier(new_pointer.address, limit.unsafe_div(8_u64)) if LibIyiGCTable.__iyi_marking != 0_u8
         free(pointer)
         new_pointer
       end
@@ -2032,6 +2084,16 @@ require "./file"
         each_fiber_root(visit)
         each_global_root(visit)
       end
+
+      # The root set as a helper sees it at the mark's second stop: every
+      # stopped thread's registers and stack, the fibers, the globals — and
+      # not the helper's own stack, which holds no object of the program's
+      # and sits in a mapping no thread base bounds.
+      def self.each_root_of_others(visit : Proc(UInt64, Nil)) : Nil
+        each_thread_root(visit)
+        each_fiber_root(visit)
+        each_global_root(visit)
+      end
     end
 
     # iyi: GC_DESIGN.md Stage 5, the mark phase. Roots go gray, the queue
@@ -2072,6 +2134,21 @@ require "./file"
     # external the link already owes, no library.
     lib LibIyiGCTable
       $__iyi_gc_layouts : Void*
+      # Non-zero while a mark runs beside the program: what every
+      # pointer-bearing store the compiler emits checks before it calls
+      # the barrier. Codegen defines the byte; only the marker writes it.
+      $__iyi_marking : UInt8
+    end
+
+    # The barrier's two entry points, called by name from the code the
+    # compiler emits around a store (SPEC.md II.5, GC_DESIGN.md Stage 9).
+    fun __iyi_write_barrier_begin : Nil
+      IyiHeap.enter_barrier
+    end
+
+    fun __iyi_write_barrier(address : Void*, words : UInt64) : Nil
+      IyiMark.barrier(address.address, words)
+      IyiHeap.leave_barrier
     end
 
     class IyiMark
@@ -2216,6 +2293,12 @@ require "./file"
         IyiHeap.write64(base - 8_u64, (word - (word & COLOUR)) | colour)
       end
 
+      # The pool's page, made by the first collection before any helper
+      # exists: `start_helpers` makes it, under the runtime lock, and a
+      # helper's first `pool_word` finds it made. Two threads reaching
+      # here at once would each map a page and count on different ones -
+      # the first concurrent collection hung that way, its helpers ready
+      # on a page the collector never read.
       def self.pool : UInt64
         @@pool = __iyi_mmap(4096_u64).address if @@pool == 0
         @@pool
@@ -2251,14 +2334,96 @@ require "./file"
       end
 
       # This thread's worker page and stack, mapped on first use.
+      # Every page ever made, linked for the final stop, which flushes what
+      # every mutator's barrier left on its stack.
+      W_NEXT = 72_u64
+      # Bytes this thread allocated while a mark ran beside it: born gray,
+      # so counted marked, but not survivors of anything - the budget is
+      # set from the marked bytes less these.
+      W_BORN = 80_u64
+      @@worker_pages : UInt64 = 0_u64
+
       def self.worker : UInt64
         w = @@worker
         if w == 0
           w = __iyi_mmap(4096_u64).address
-          IyiHeap.write64(w + W_STACK, __iyi_mmap(STACK_WORDS * 8_u64).address)
+          stack = __iyi_mmap(STACK_WORDS * 8_u64).address
+          {% if flag?(:linux) %}
+            __iyi_madvise_nohuge(stack, STACK_WORDS * 8_u64)
+          {% end %}
+          IyiHeap.write64(w + W_STACK, stack)
+          pool_lock
+          IyiHeap.write64(w + W_NEXT, @@worker_pages)
+          @@worker_pages = w
+          pool_unlock
           @@worker = w
         end
         w
+      end
+
+      # ── The write barrier's half ────────────────────────────────────────
+      #
+      # A mutator that stored a pointer-bearing value while a mark runs
+      # calls in with the destination's words; each heap pointer among them
+      # is grayed and queued on this thread's own stack, which is handed to
+      # the pool in batches so the helpers marking beside the program find
+      # it. An object born during the mark comes the same way.
+      MUTATOR_BATCH = 64_u64
+
+      def self.barrier(address : UInt64, words : UInt64) : Nil
+        w = worker
+        index = 0_u64
+        while index < words
+          base = IyiRoots.base_of(IyiHeap.read64(address + index * 8_u64))
+          mutator_shade(w, base) if base != 0
+          index = index + 1_u64
+        end
+      end
+
+      def self.born_during_mark(base : UInt64, size : UInt64) : Nil
+        w = worker
+        IyiHeap.write64(w + W_BORN, IyiHeap.read64(w + W_BORN) + size)
+        word_pointer = Pointer(Atomic(UInt64)).new(base - 8_u64)
+        word = word_pointer.value.get
+        return if word & COLOUR != WHITE
+        if word_pointer.value.compare_and_set(word, word | GRAY)[1]
+          mutator_push(w, base)
+        end
+      end
+
+      def self.mutator_shade(w : UInt64, base : UInt64) : Nil
+        word_pointer = Pointer(Atomic(UInt64)).new(base - 8_u64)
+        word = word_pointer.value.get
+        while word & COLOUR == WHITE
+          if word_pointer.value.compare_and_set(word, word | GRAY)[1]
+            mutator_push(w, base)
+            return
+          end
+          word = word_pointer.value.get
+        end
+      end
+
+      def self.mutator_push(w : UInt64, base : UInt64) : Nil
+        len = IyiHeap.read64(w + W_LEN)
+        IyiHeap.write64(IyiHeap.read64(w + W_STACK) + len * 8_u64, base)
+        len = len + 1_u64
+        IyiHeap.write64(w + W_LEN, len)
+        flush_mutator(w) if len >= MUTATOR_BATCH
+      end
+
+      # A mutator's stack to the pool, whole.
+      def self.flush_mutator(w : UInt64) : Nil
+        len = IyiHeap.read64(w + W_LEN)
+        return if len == 0_u64
+        stack = IyiHeap.read64(w + W_STACK)
+        given = 0_u64
+        while given < len
+          count = len - given
+          count = BATCH if count > BATCH
+          publish(stack + given * 8_u64, count)
+          given = given + count
+        end
+        IyiHeap.write64(w + W_LEN, 0_u64)
       end
 
       # Onto this worker's stack — and, with helpers, work shared where it
@@ -2624,6 +2789,7 @@ require "./file"
       # would sleep through the mark, and the collector waits for every
       # helper to answer a generation it turned.
       def self.start_helpers(count : UInt64) : Nil
+        pool
         while @@helpers < count
           IyiThread.start_helper(helper_entry, @@helpers)
           @@helpers = @@helpers + 1_u64
@@ -2655,6 +2821,16 @@ require "./file"
             fold_helper(w)
           end
           pool_word(POOL_HELPERS_DONE).value.add(1_u64)
+          # Beside the program, the drain's end is not the mark's: helper 0
+          # waits for the rest, then takes the second stop.
+          if @@concurrent && index == 0_u64
+            while pool_word(POOL_HELPERS_DONE).value.get < @@helpers
+              spin_pause
+            end
+            # The finish turns the generation once more, for the
+            # remainder; that is the one this helper waits past next.
+            seen = finish_concurrent
+          end
         end
       end
 
@@ -2921,6 +3097,7 @@ require "./file"
       @@epoch_flag : UInt64 = 16_u64
       @@debt : UInt64 = 0_u64
       @@debt_paid_in_pause : UInt64 = 0_u64
+      @@debt_paid_before_stop : UInt64 = 0_u64
       @@swept_by_allocator : UInt64 = 0_u64
       @@bytes_marked : UInt64 = 0_u64
 
@@ -2940,6 +3117,12 @@ require "./file"
 
       # Arenas the pauses swept before marking, in all — the lazy sweep's
       # honest failure count, printed by the exercise.
+      # Arenas a concurrent collection's triggering thread swept before its
+      # first stop: paid by the program, but by nobody else's clock.
+      def self.debt_paid_before_stop : UInt64
+        @@debt_paid_before_stop
+      end
+
       def self.debt_paid_in_pause : UInt64
         @@debt_paid_in_pause
       end
@@ -3001,12 +3184,34 @@ require "./file"
       end
 
       def self.collect_if_due : Nil
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          # Helper 0 takes a concurrent mark's second stop, and a stop
+          # names registered threads only: a program that never started a
+          # thread has a main thread with no line until here, and the
+          # helper would have stopped nobody and swept beside it. Before
+          # the lock, because registering takes it.
+          decide_helpers
+          if concurrent_possible?
+            IyiThread.register_current
+            IyiThread.install_handler
+          end
+        {% end %}
         IyiRuntimeLock.lock
-        if allocated_since < budget
+        if allocated_since < budget || @@collecting
           IyiRuntimeLock.unlock
           return
         end
         @@collecting = true
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          if concurrent_possible?
+            # The mark runs beside the program: this thread stops the world
+            # for the roots only and goes back to its allocation; helper 0
+            # finishes the collection and clears `@@collecting`.
+            start_concurrent
+            IyiRuntimeLock.unlock
+            return
+          end
+        {% end %}
         collect_locked(false)
         @@collecting = false
         IyiRuntimeLock.unlock
@@ -3022,15 +3227,39 @@ require "./file"
       # trigger's collections leave the sweep to the allocator.
       def self.collect : Nil
         IyiRuntimeLock.lock
+        # A collection already running beside the program is finished by
+        # its helper; this one waits for it rather than racing it.
+        while @@collecting
+          IyiRuntimeLock.unlock
+          spin_pause
+          IyiRuntimeLock.lock
+        end
+        @@collecting = true
         collect_locked(true)
+        @@collecting = false
         IyiRuntimeLock.unlock
       end
 
-      def self.collect_locked(eager : Bool) : Nil
-        if !@@helpers_decided
-          @@helpers_decided = true
-          @@helpers_wanted = default_helpers unless @@workers_set
+      # Wait out a collection running beside the program, if one is. The
+      # count below is of finished collections — a mark in flight has not
+      # swept, so it is not one yet — and a program that reads the count
+      # after churn wants the one it triggered included.
+      def self.settle : Nil
+        while @@collecting
+          spin_pause
         end
+      end
+
+      # How many helpers a mark may use, decided once, at the first
+      # collection: what the program set, or the core count's default.
+      def self.decide_helpers : Nil
+        return if @@helpers_decided
+        @@helpers_decided = true
+        @@helpers_wanted = default_helpers unless @@workers_set
+      end
+
+      def self.collect_locked(eager : Bool) : Nil
+        decide_helpers
         started = now_ns
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
           others = IyiThread.stop_others
@@ -3072,6 +3301,251 @@ require "./file"
         budget = @@budget
         budget == 0 ? MIN_BUDGET : budget
       end
+
+      {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+        # ── The mark beside the program — GC_DESIGN.md Stage 9 ──────────────
+        #
+        # Two stops instead of one. The first is the roots: every thread
+        # stopped, the debt paid, the roots grayed onto the pool, the
+        # marking flag raised, the helpers woken, and the program resumed
+        # — while it runs, every pointer-bearing store it makes goes through
+        # the write barrier the compiler emitted, which grays what the
+        # store put where it put it (Dijkstra's insertion barrier), and
+        # every object it allocates is born gray. The helpers drain the
+        # pool beside it. When helper 0 finds the pool empty and every
+        # worker idle, it takes the second stop: the roots again (a pointer
+        # a thread loaded from the heap since the first stop may sit in a
+        # register that no store ever wrote), every mutator's barrier
+        # stack flushed, the remainder drained, the flag lowered, and the
+        # epoch turned. Both stops are proportional to roots and to what
+        # the program changed under the mark, never to the live set — the
+        # live set is walked between them, by the helpers, while the
+        # program runs.
+        @@concurrent : Bool = false
+        @@stw_first_ns : UInt64 = 0_u64
+
+        # Concurrent needs a thread to finish on: at least one helper, and
+        # a live set past the threshold under which a mark alone is the
+        # cheaper pause — or no live set measured yet: a program's first
+        # collection has no estimate, and stopped it was the longest pause
+        # in every table (1.9 ms for binary trees, against tens of
+        # microseconds for the rest), so it goes beside the program too.
+        def self.concurrent_possible? : Bool
+          @@helpers_wanted > 0_u64 && (@@last_marked >= PARALLEL_FROM || @@collections == 0_u64)
+        end
+
+        # The first stop, on the triggering thread, under the runtime lock.
+        # The helpers are started before it: their first spawn is half a
+        # millisecond, which is no part of a stop.
+        def self.start_concurrent : Nil
+          start_helpers(@@helpers_wanted)
+          # The last epoch's debt — an unswept arena wears the last mark's
+          # colours, which this mark cannot read — is paid here, under the
+          # lock the allocator's own sweep takes, before the world stops:
+          # the triggering thread's time, as an allocation's sweep is, and
+          # no other thread's. It was the first stop's largest part (500 us
+          # of sweeping against 20 us of roots), and it is what Stage 8's
+          # sweep beside the program is for.
+          while sweep_one_held
+            @@debt_paid_before_stop = @@debt_paid_before_stop + 1_u64
+          end
+          started = now_ns
+          others = IyiThread.stop_others
+          w = worker
+          @@collector_worker = w
+          IyiHeap.write64(w + W_LEN, 0_u64)
+          IyiHeap.write64(w + W_BYTES, 0_u64)
+          @@bytes_marked = 0_u64
+          @@helper_black = 0_u64
+          arena = IyiHeap.first_arena
+          while arena != 0
+            IyiHeap.arena_live_reset(arena)
+            arena = IyiHeap.arena_next(arena)
+          end
+          IyiHeap.write64(pool + POOL_HEAD, 0_u64)
+          IyiHeap.write64(pool + POOL_CURSOR, IyiHeap.read64(pool + POOL_REGION_BASE))
+          helpers = @@helpers
+          @@workers = helpers + 1_u64
+          IyiHeap.write64(pool + POOL_ASKED, helpers)
+          # Every helper holds work until it finds none; the pool is what
+          # they hold, and the triggering thread is not a worker after this.
+          pool_word(POOL_ACTIVE).value.set(helpers)
+          pool_word(POOL_HELPERS_DONE).value.set(0_u64)
+          IyiRoots.each_root(->(base : UInt64) { shade(base) })
+          flush_mutator(w)
+          @@concurrent = true
+          LibIyiGCTable.__iyi_marking = 1_u8
+          pool_word(POOL_GENERATION).value.add(1_u64)
+          wake_helpers
+          IyiThread.resume_others(others)
+          @@stw_first_ns = now_ns - started
+        end
+
+        # The second stop, on helper 0, once every helper found nothing.
+        # Answers the generation helper 0 waits past next.
+        #
+        # The stop rescans the roots and flushes every mutator's barrier
+        # stack, and what that finds is not always small: a pointer a
+        # thread loaded from a white object into a register is a whole
+        # structure the marker never reached — 200 000 nodes of a chain,
+        # 2 ms walked inside the stop, longer than the mark it was meant to
+        # hide — and what the program published between the helpers
+        # finding the pool empty and the stop can be as large. So the stop
+        # looks first: a white root, or a pool past FINISH_BATCHES, and it
+        # resumes the program, marks beside it once more, and stops again,
+        # up to FINISH_RETRIES times; Go's mark termination makes the same
+        # check and the same retreat. What the last stop still finds is
+        # drained alone — waking fifteen helpers inside a stop cost more
+        # than the thousand entries they were woken for — unless the
+        # retries ran out on a full pool, when they are woken for it.
+        FINISH_BATCHES = 16_u64
+        FINISH_RETRIES = 8_u64
+
+        def self.finish_concurrent : UInt64
+          attempts = 0_u64
+          retries_ns = 0_u64
+          longest_retry = 0_u64
+          while true
+            IyiRuntimeLock.lock
+            started = now_ns
+            others = IyiThread.stop_others
+            w = worker
+            @@collector_worker = w
+            IyiHeap.write64(w + W_LEN, 0_u64)
+            @@workers = @@helpers
+            page = @@worker_pages
+            while page != 0
+              flush_mutator(page) if page != w
+              page = IyiHeap.read64(page + W_NEXT)
+            end
+            IyiRoots.each_root_of_others(->(base : UInt64) { shade(base) })
+            white_roots = IyiHeap.read64(w + W_LEN)
+            batches = pool_batches
+            if attempts < FINISH_RETRIES && (white_roots > 0_u64 || batches > FINISH_BATCHES)
+              IyiThread.resume_others(others)
+              IyiRuntimeLock.unlock
+              retry = now_ns - started
+              retries_ns = retries_ns + retry
+              longest_retry = retry if retry > longest_retry
+              remainder_round(w)
+              attempts = attempts + 1_u64
+              next
+            end
+            if batches > FINISH_BATCHES
+              generation = remainder_round(w)
+            else
+              @@workers = 1_u64
+              pool_word(POOL_ACTIVE).value.set(1_u64)
+              drain(w)
+              generation = pool_word(POOL_GENERATION).value.get
+            end
+            @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
+            @@last_marked = @@bytes_marked
+            LibIyiGCTable.__iyi_marking = 0_u8
+            @@concurrent = false
+            @@workers = 0_u64
+            scavenge
+            begin_sweep
+            sweep_large
+            # What the program allocated under the mark was marked - born
+            # gray - but survived nothing: the budget is twice what did,
+            # and those bytes are the first of the next budget's, allocated
+            # after the survivors were measured. Counted the other way, a
+            # program allocating through every mark doubled its heap each
+            # cycle (churn: 16 MB resident stopped, 70 MB beside).
+            born = 0_u64
+            page = @@worker_pages
+            while page != 0
+              born = born + IyiHeap.read64(page + W_BORN)
+              IyiHeap.write64(page + W_BORN, 0_u64)
+              page = IyiHeap.read64(page + W_NEXT)
+            end
+            survived = @@bytes_marked > born ? @@bytes_marked - born : 0_u64
+            IyiHeap.allocated_word.value.set(born)
+            doubled = survived * 2_u64
+            @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
+            IyiThread.resume_others(others)
+            pause = now_ns - started
+            @@stop_second_ns = pause
+            @@finish_retries = @@finish_retries + attempts
+            # Every stop is the collection's pause: the longest of them is
+            # the number a program feels, and the sum is what it paid.
+            total = pause + @@stw_first_ns + retries_ns
+            longest = pause > @@stw_first_ns ? pause : @@stw_first_ns
+            longest = longest_retry if longest_retry > longest
+            @@pause_last = longest
+            @@pause_max = longest if longest > @@pause_max
+            @@pause_total = @@pause_total + total
+            @@concurrent_collections = @@concurrent_collections + 1_u64
+            @@collecting = false
+            IyiRuntimeLock.unlock
+            return generation
+          end
+        end
+
+        # The pool's remainder and helper 0's own stack, drained by helper
+        # 0 and the helpers together — inside the stop or beside the
+        # program, the caller's choice. Answers the generation it turned.
+        def self.remainder_round(w : UInt64) : UInt64
+          helpers = @@helpers
+          @@workers = helpers
+          IyiHeap.write64(pool + POOL_ASKED, helpers)
+          pool_word(POOL_ACTIVE).value.set(helpers)
+          pool_word(POOL_HELPERS_DONE).value.set(0_u64)
+          generation = pool_word(POOL_GENERATION).value.add(1_u64) + 1_u64
+          wake_helpers
+          drain(w)
+          while pool_word(POOL_HELPERS_DONE).value.get < helpers - 1_u64
+            spin_pause
+          end
+          generation
+        end
+
+        # How many batches the pool holds, counted up to one past
+        # FINISH_BATCHES: the stop asks whether it is past, not how far.
+        def self.pool_batches : UInt64
+          count = 0_u64
+          batch = IyiHeap.read64(pool + POOL_HEAD)
+          while batch != 0 && count <= FINISH_BATCHES
+            count = count + 1_u64
+            batch = IyiHeap.read64(batch)
+          end
+          count
+        end
+
+        @@finish_retries : UInt64 = 0_u64
+
+        # How many times a second stop found the pool full and retreated,
+        # across every collection, for the exercises.
+        def self.finish_retries : UInt64
+          @@finish_retries
+        end
+
+        @@concurrent_collections : UInt64 = 0_u64
+
+        # The last concurrent collection's two stops, for the exercises:
+        # the roots stop on the triggering thread, and helper 0's finish.
+        @@stop_second_ns : UInt64 = 0_u64
+
+        def self.stop_first_ns : UInt64
+          @@stw_first_ns
+        end
+
+        def self.stop_second_ns : UInt64
+          @@stop_second_ns
+        end
+
+        # Whether a mark is running beside the program right now: the byte
+        # the barrier checks, for an exercise that wants to act under one.
+        def self.marking? : Bool
+          LibIyiGCTable.__iyi_marking != 0_u8
+        end
+
+        # Collections that ran beside the program, for the exercises.
+        def self.concurrent_collections : UInt64
+          @@concurrent_collections
+        end
+      {% end %}
 
       # What the last sweep did. GC_DESIGN.md Stage 6 asks for statistics and
       # this is the honest subset: counted as the walk went rather than sampled

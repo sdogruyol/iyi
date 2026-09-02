@@ -1,12 +1,18 @@
 # iyi Garbage Collector Design
 
-**Status:** Stages 1, 2, 3, 4, 5 and 6 built, and **the collector is the
+**Status:** Stages 1 to 7 and 9 built, and **the collector is the
 default allocator on POSIX**: a plain build allocates from the arena,
 collects under its own allocation-pressure trigger, and hands memory back.
 The flip followed the measurement below. `-Dgc_none` opts out to the bump
 pointer, `-Dgc_boehm` to libgc. Stage 4 is the stop-the-world over kernel
-threads the runtime now has (`src/iyi/thread.iyi`, the section below);
-Stages 7 to 9 have threads to run on now, and Stage 10 is design.
+threads the runtime has (`src/iyi/thread.iyi`, the section below); Stage 7
+is the parallel marker on helper threads; Stage 9 is the mark beside the
+program, on the compiler's write barrier, with two stops of tens of
+microseconds where the mark was one stop of milliseconds (the section
+after Stage 4's). Stage 8, the sweep beside the program, is the next
+measured target: the last epoch's sweep debt is paid by the triggering
+thread before its stop, and it is the largest thing a collection still
+costs a single-threaded program. Stage 10 is design.
 
 Stage 6: the sweep. One walk over every carved chunk, a white object's chunk
 goes back on its class's free list, a black one survives and is repainted white
@@ -371,6 +377,94 @@ cores: 76 ns an allocation with one thread, 162 with four, 268 with
 eight — wall time per allocation per thread, every pause included,
 which is what Stages 7 and 8 exist to bring down: every thread stands
 still for a sweep one thread runs.
+
+**The mark runs beside the program, on the compiler's write barrier —
+Stage 9, built, and Stage 7's other half.** The parallel marker made a
+mark of a million nodes 6 ms on twenty cores; it was still a stop of 6
+ms. The stop is two now, and neither is the mark. The first, on the
+triggering thread under the runtime lock: the world stopped, the roots
+grayed onto the pool, a byte raised (`__iyi_marking`), the helpers
+woken, the world resumed — 15 to 35 µs, roots and nothing else. The
+helpers drain beside the program. The second, on helper 0 once every
+helper found the pool empty: every thread's barrier stack flushed, the
+roots again, and what those found drained; then the scavenge, the
+sweep's beginning, the budget, and the byte lowered.
+
+What the program does between the stops is what the barrier is for.
+Codegen wraps every store that can put a heap pointer into heap memory
+— an instance variable, a class variable, an ivar initialiser, a tuple
+element, a `Pointer#value=` (which is what `Pointer#[]=` and every
+collection's store come to), a C struct's field, a closure's captured
+variables, its parent and its `self` — in a
+test of the byte and, while it is up, a call after the store with the
+destination's words: each heap pointer among them is grayed and queued
+on the storing thread's own stack (Dijkstra's insertion barrier, done
+by re-reading the destination rather than by passing the value, so one
+shape serves a word and a struct alike). Stores into stack slots — an
+`alloca`, or a field or element of one, walked through the casts and
+GEPs codegen puts between a local and its parts — are not wrapped: the
+stack is rescanned at the second stop. The test is a byte load and a
+branch, and `bench/defer_cost.sh` still reads 15 ns a defer; a store
+under a running mark pays the call. Objects born under the mark are
+born gray and queued the same way, and a `realloc`'s copy is shaded
+whole. The bracket around a store — a depth counter on the thread's
+cache page, the same one the allocator uses — is what keeps a thread
+from being parked between a pointer store and the barrier that shades
+it, or the second stop's rescan could miss what the store just put
+into a black object.
+
+Two things the second stop found, and what it does about them. A
+pointer a thread loaded from a white object into a register is a
+whole structure the marker never reached — 200 000 nodes of a chain,
+2 ms walked inside the stop — and what the program published between
+the helpers finding the pool empty and the stop can be as large. So
+the stop looks before it drains: a white root, or a pool past sixteen
+batches, and it resumes the program, marks beside it once more, and
+stops again, up to eight times — Go's mark termination makes the same
+check and the same retreat. What the last stop still finds is drained
+alone: waking fifteen helpers inside a stop cost 0.1 to 1.5 ms of
+scheduling for the thousand entries they were woken for.
+
+Three things the build corrected. A program that never started a
+thread had a main thread with no line, so a helper's stop stopped
+nobody and swept beside it; the trigger registers the main thread
+before its first concurrent collection, before the lock, because
+registering takes it. The pool's page was made by whichever thread
+reached it first, and with the helpers started before the stop, two
+threads reached it at once and counted ready on different pages; the
+collector makes it before the first helper exists. And a mark-worker's
+32 MiB stack, touched at one end, was given a transparent huge page at
+its first touch: 2 MB resident per worker for 4 KB used, 34 MB across
+sixteen, so the stacks refuse huge pages by `madvise`.
+
+The budget is twice what survived, and what was allocated under the
+mark did not survive anything: born gray, so counted marked, but not
+live in the sense the budget wants, and counted the other way a program
+allocating through every mark doubled its heap each cycle. Those bytes
+are the first of the next budget's instead. The first collection of a
+program has no live-set estimate and went beside the program too, the
+helpers spawned before its stop; stopped, it was the longest pause in
+every table.
+
+`bench/concurrent_mark.sh` holds it: twenty-four rounds each build a
+200 000-node chain with a payload on its last node, allocate until the
+byte is up, move the payload from the chain's tail into a holder the
+marker blackened first and cut the tail's edge — a barrier-only
+object — and read it back after the collection, its header without the
+sweep's free flag and its bytes the pattern written; and the failure
+proof removes the barrier's shade from a copy of the prelude and the
+first payload is freed by name. The numbers, release, 20 cores: the
+same chain marked stopped is 1.9 ms; beside the program the longest
+first stop is 0.6 ms (the trigger's second collection, its helpers'
+first spawn) and the longest second 0.2 ms, with about twenty of
+forty-eight second stops retreating once. On `bench/gc_race.py` against
+Go: binary trees' longest pause 0.10 ms to Go's 0.19, total paused 2.6
+ms to 2.1; live churn 0.47 to 0.10 and 1.1 to 0.3; churn 0.03 to 0.48
+and 0.3 to 3.6. Resident memory is where Go still wins — 62 MB to 18
+on binary trees, 316 to 134 on live churn — the price of no assists: a
+mutator allocating faster than the helpers mark is never slowed, and
+the budget grows from the marked bytes. That, and Stage 8, are the
+next measured targets.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are

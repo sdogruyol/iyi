@@ -75,14 +75,20 @@ class Iyi::CodeGenVisitor
     target_type = target_type.remove_indirection
     value_type = value_type.remove_indirection
 
-    if target_type == value_type
-      if target_type.nil_type?
-        value
+    # iyi: every typed store funnels through here — an instance variable,
+    # a class variable, a `Pointer#value=`, a closure slot, an ivar
+    # initialiser, a tuple element — so this is where the collector's
+    # write barrier brackets the pointer-bearing ones.
+    iyi_with_write_barrier(target_pointer, target_type) do
+      if target_type == value_type
+        if target_type.nil_type?
+          value
+        else
+          store to_rhs(value, target_type), target_pointer
+        end
       else
-        store to_rhs(value, target_type), target_pointer
+        assign_distinct target_pointer, target_type, value_type, value
       end
-    else
-      assign_distinct target_pointer, target_type, value_type, value
     end
   end
 

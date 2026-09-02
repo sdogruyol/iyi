@@ -941,7 +941,10 @@ class Iyi::CodeGenVisitor
     end
 
     value = to_rhs call_arg, field_type
-    store value, yield(field_type)
+    field_pointer = yield(field_type)
+    iyi_with_write_barrier(field_pointer, field_type) do
+      store value, field_pointer
+    end
 
     original_call_arg
   end

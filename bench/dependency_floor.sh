@@ -82,9 +82,15 @@ trap 'rm -rf "$WORK"' EXIT
 # Stage 4): every darwin program's collector can stop a thread, and the
 # stop's name is referenced whether or not the program ever starts one
 # (the plain build keeps it; the optimiser drops it as unreachable with
-# no thread to stop). The park's `pipe` is made only by `IyiThread.start`,
-# so no sample carries it and it is not listed; Linux's stop is syscalls.
-ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap pthread_kill _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
+# no thread to stop). Linux's stop is syscalls.
+# `pthread_create` and `sysctlbyname` joined with the parallel marker
+# (Stage 7): the collector starts its helpers as kernel threads of its own
+# and sizes them by `hw.ncpu`. `pipe` joined with the concurrent mark
+# (Stage 9): helper 0 takes the mark's second stop, which stops the main
+# thread, so the main thread registers a line - and on darwin a line's park
+# is a pipe - the first time a mark runs beside it. Linux names none of
+# the three: clone, sched_getaffinity and futex are syscalls.
+ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap pipe pthread_create pthread_kill sysctlbyname _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
 ALLOWED_SYMBOLS_LINUX="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
 
 # What a program may link. The platform libc only.

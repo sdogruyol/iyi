@@ -1,0 +1,265 @@
+# The mark beside the program, exercised: GC_DESIGN.md Stage 9.
+#
+#   ./bin/iyi run bench/concurrent_mark.iyi
+#
+# What a concurrent mark has to get right is the one thing a stop-the-world
+# mark never faces: the program moving pointers while the marker walks. The
+# losing move is a pointer taken out of an object the marker has not reached
+# (white) and stored into one it has finished (black), the old edge cut —
+# without a write barrier the marker never sees the object again, and the
+# sweep frees something the program holds. This program makes exactly that
+# move, many times, each time under a mark it started itself:
+#
+#   - `holders`: a rooted array of 64 boxes, one hop from a global, so the
+#     marker blackens them early;
+#   - a chain of 200 000 nodes, built while the trigger is off, with a
+#     payload hanging off its last node — the object the marker reaches
+#     last, if it reaches it;
+#   - allocation until the marking flag is up, then the payload moved from
+#     the chain's tail into a holder and the chain's edge cut, with no
+#     local keeping it: a barrier-only object;
+#   - the collection waited out, and the payload read back through the
+#     holder: its header must not carry the sweep's free flag and its bytes
+#     must be the pattern written into them.
+#
+# Every round that made its move under a mark counts; the program asks for
+# at least one, and reports how many. The pauses are printed beside the
+# stop-the-world mark's over the same chain: a concurrent collection's two
+# stops, the longest of each, against the one stop that marked it all —
+# and how many second stops found a white root or a full pool and retreated
+# to mark it beside the program before stopping again.
+#
+# bench/concurrent_mark.sh drives it and proves the check fails when the
+# barrier shades nothing.
+
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+  def fail(message : String) : Nil
+    print "FAIL: #{message}\n"
+    __iyi_exit(1)
+  end
+
+  class Payload
+    @bytes : Pointer(UInt8)
+    @seed : UInt64
+
+    def initialize(@seed : UInt64)
+      @bytes = Pointer(UInt8).malloc(256_u64)
+      index = 0_u64
+      while index < 256_u64
+        (@bytes + index.to_i64).value = ((@seed &+ index) & 0xFF_u64).to_u8
+        index = index + 1_u64
+      end
+    end
+
+    def intact? : Bool
+      index = 0_u64
+      while index < 256_u64
+        return false if (@bytes + index.to_i64).value != ((@seed &+ index) & 0xFF_u64).to_u8
+        index = index + 1_u64
+      end
+      true
+    end
+
+    def seed : UInt64
+      @seed
+    end
+  end
+
+  class Cell
+    @next : Cell?
+    @payload : Payload?
+
+    def initialize(@next : Cell?, @payload : Payload?)
+    end
+
+    def next : Cell?
+      @next
+    end
+
+    def payload : Payload?
+      @payload
+    end
+
+    def payload=(value : Payload?)
+      @payload = value
+    end
+  end
+
+  class Holder
+    @payload : Payload?
+
+    def initialize
+      @payload = nil
+    end
+
+    def payload : Payload?
+      @payload
+    end
+
+    def payload=(value : Payload?)
+      @payload = value
+    end
+  end
+
+  class Roots
+    @@holders : Array(Holder) = [] of Holder
+
+    def self.holders : Array(Holder)
+      @@holders
+    end
+  end
+
+  CHAIN = 200000
+
+  # The chain, its tail first: the last node made is the head, so the
+  # payload sits on the node the marker reaches last.
+  def build_chain(seed : UInt64) : Cell
+    head = Cell.new(nil, Payload.new(seed))
+    count = 1
+    while count < CHAIN
+      head = Cell.new(head, nil)
+      count = count + 1
+    end
+    head
+  end
+
+  def tail(link : Cell) : Cell
+    cursor = link
+    while true
+      following = cursor.next
+      break unless following.is_a?(Cell)
+      cursor = following
+    end
+    cursor
+  end
+
+  def churn(bytes : UInt64) : Nil
+    burned = 0_u64
+    while burned < bytes
+      block = Pointer(UInt8).malloc(64_u64)
+      block.value = 1_u8
+      burned = burned + 64_u64
+    end
+  end
+
+  # Allocate until a mark is running beside this thread, or the budget has
+  # gone by twice, which means no mark will be concurrent here.
+  def allocate_until_marking : Bool
+    burned = 0_u64
+    limit = IyiMark.budget * 2_u64
+    while burned < limit
+      block = Pointer(UInt8).malloc(64_u64)
+      block.value = 1_u8
+      burned = burned + 64_u64
+      return true if IyiMark.marking?
+    end
+    false
+  end
+
+  # The move, under a mark: payload from the chain's tail into a holder,
+  # the tail's edge cut. `@[NoInline]` so the local that carried it is
+  # gone with the frame before the mark finishes.
+  @[NoInline]
+  def move(chain : Cell, holder : Holder) : Nil
+    last = tail(chain)
+    holder.payload = last.payload
+    last.payload = nil
+  end
+
+  def check(holder : Holder, seed : UInt64, round : Int32) : Nil
+    payload = holder.payload
+    fail("round #{round}: the holder's payload is nil") unless payload.is_a?(Payload)
+    address = payload.object_id.to_u64
+    if IyiHeap.read64(address - 8_u64) & IyiHeap::FREE_FLAG != 0
+      fail("round #{round}: the payload moved into a black holder under the mark was freed: the barrier lost it")
+    end
+    fail("round #{round}: the payload's seed is #{payload.seed.to_i64} rather than #{seed.to_i64}: its chunk was reused") if payload.seed != seed
+    fail("round #{round}: the payload's bytes changed under the mark") unless payload.intact?
+  end
+
+  # The two stops of the last concurrent collection, folded into the
+  # longest of each.
+  class Stops
+    @@first : UInt64 = 0_u64
+    @@second : UInt64 = 0_u64
+
+    def self.note : Nil
+      first = IyiMark.stop_first_ns
+      second = IyiMark.stop_second_ns
+      @@first = first if first > @@first
+      @@second = second if second > @@second
+    end
+
+    def self.first : UInt64
+      @@first
+    end
+
+    def self.second : UInt64
+      @@second
+    end
+  end
+
+  def note_stops : Nil
+    Stops.note
+  end
+
+  index = 0
+  while index < 64
+    Roots.holders << Holder.new
+    index = index + 1
+  end
+
+  # ── The stop-the-world mark over the same chain, for the pause ────────
+  IyiMark.auto = false
+  IyiMark.workers = 0_u64
+  chain = build_chain(1_u64)
+  IyiMark.collect
+  IyiMark.collect
+  stw_pauses = 0_u64
+  round = 0
+  while round < 5
+    started = IyiMark.pause_total_ns
+    IyiMark.collect
+    stw_pauses = stw_pauses + (IyiMark.pause_total_ns - started)
+    round = round + 1
+  end
+  stw_mean = stw_pauses.unsafe_div(5_u64)
+  fail("the chain's tail lost its payload under a stop-the-world mark") unless tail(chain).payload.is_a?(Payload)
+
+  # ── The moves, under marks beside the program ─────────────────────────
+  IyiMark.workers = 15_u64
+  under_mark = 0
+  rounds = 24
+  round = 0
+  concurrent_before = IyiMark.concurrent_collections
+  while round < rounds
+    IyiMark.auto = false
+    seed = 1000_u64 + round.to_u64
+    chain = build_chain(seed)
+    holder = Roots.holders[round % 64]
+    holder.payload = nil
+    IyiMark.auto = true
+    marking = allocate_until_marking
+    under_mark = under_mark + 1 if marking
+    move(chain, holder)
+    # The chain is garbage from here; the payload lives in the holder only.
+    chain = build_chain(0_u64)
+    IyiMark.settle
+    note_stops
+    churn(IyiMark.budget)
+    IyiMark.settle
+    note_stops
+    check(holder, seed, round)
+    round = round + 1
+  end
+  IyiMark.auto = false
+  concurrent = IyiMark.concurrent_collections - concurrent_before
+  fail("no round made its move under a mark: nothing here was concurrent") if under_mark == 0
+  fail("no collection ran beside the program across #{rounds} rounds") if concurrent == 0_u64
+
+  puts "moves: #{under_mark} of #{rounds} rounds moved a payload into a black holder under a running mark, #{concurrent.to_i64} collections ran beside the program, every payload intact"
+  puts "pause: #{stw_mean.unsafe_div(1000_u64).to_i64} us to mark the chain stopped; beside the program the longest first stop was #{Stops.first.unsafe_div(1000_u64).to_i64} us, the longest second #{Stops.second.unsafe_div(1000_u64).to_i64} us, and #{IyiMark.finish_retries.to_i64} second stops retreated to mark what they found"
+  puts "concurrent mark: every property held"
+{% else %}
+  puts "concurrent mark: needs the collector and a thread target; nothing to exercise here"
+{% end %}

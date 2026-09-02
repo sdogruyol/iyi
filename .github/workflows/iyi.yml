@@ -474,6 +474,14 @@ jobs:
       - name: The parallel marker
         run: bash bench/parallel_mark.sh
 
+      # The mark beside the program (GC_DESIGN.md Stage 9): twenty-four
+      # rounds each move a payload out of an unmarked chain into a
+      # blackened holder under a running mark and read it back intact, the
+      # two stops printed beside the stopped mark's one, and the proof that
+      # a barrier which shades nothing loses the payload.
+      - name: The mark beside the program
+        run: bash bench/concurrent_mark.sh
+
       # iyi is a permanent fork, so Crystal's name standing in for iyi's is a
       # defect and not a detail. Both layers: a tree that should have been
       # renamed, and a name left inside a file that was otherwise cut over.
@@ -860,6 +868,9 @@ jobs:
 
       - name: The parallel marker (GC_DESIGN.md Stage 7)
         run: bash bench/parallel_mark.sh
+
+      - name: The mark beside the program (GC_DESIGN.md Stage 9)
+        run: bash bench/concurrent_mark.sh
 
       # The collector's gates, which the collector's own darwin arm (the
       # default allocator there since the flip) had never been held to in

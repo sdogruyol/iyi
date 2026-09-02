@@ -206,6 +206,12 @@ lib LibLLVM
   fun get_num_arg_operands = LLVMGetNumArgOperands(instr : ValueRef) : UInt
   fun set_instruction_call_convention = LLVMSetInstructionCallConv(instr : ValueRef, cc : LLVM::CallConvention)
   fun get_instruction_call_convention = LLVMGetInstructionCallConv(instr : ValueRef) : LLVM::CallConvention
+  # iyi: the collector's write barrier asks whether a store's destination is
+  # a stack slot, which needs the instruction's class and its operands.
+  fun is_a_alloca_inst = LLVMIsAAllocaInst(val : ValueRef) : ValueRef
+  fun is_a_get_element_ptr_inst = LLVMIsAGetElementPtrInst(val : ValueRef) : ValueRef
+  fun is_a_bit_cast_inst = LLVMIsABitCastInst(val : ValueRef) : ValueRef
+  fun get_operand = LLVMGetOperand(val : ValueRef, index : UInt) : ValueRef
   fun set_instr_param_alignment = LLVMSetInstrParamAlignment(instr : ValueRef, idx : AttributeIndex, align : UInt)
   fun add_call_site_attribute = LLVMAddCallSiteAttribute(c : ValueRef, idx : AttributeIndex, a : AttributeRef)
 

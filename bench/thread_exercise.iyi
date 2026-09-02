@@ -233,6 +233,7 @@
     burst = burst + 1
   end
   join_all(threads)
+  IyiMark.settle
   collections = IyiMark.collections - before
   fail("no collection ran across #{count} threads' churn") if collections == 0_u64
   fail("#{Tally.verified.value.get.to_i64} of #{count} threads verified their lists") if Tally.verified.value.get != count.to_u64

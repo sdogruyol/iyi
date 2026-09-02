@@ -1110,7 +1110,7 @@ module Iyi
       layouts = [] of {String, IyiMod::TypeLayout}
       types.each do |type|
         next unless type.is_a?(NonGenericClassType) || type.is_a?(GenericClassInstanceType)
-        next if type.is_a?(GenericType)
+        next if type.is_a?(GenericType) || type.is_a?(StaticArrayInstanceType)
         layouts << {type.to_s, program.gc_type_layout(type)}
       end
 
@@ -1227,7 +1227,7 @@ module Iyi
       layouts = [] of {String, IyiMod::TypeLayout}
       types.each do |type|
         next unless type.is_a?(NonGenericClassType) || type.is_a?(GenericClassInstanceType)
-        next if type.is_a?(GenericType)
+        next if type.is_a?(GenericType) || type.is_a?(StaticArrayInstanceType)
         layouts << {type.to_s, program.gc_type_layout(type)}
       end
 
