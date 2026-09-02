@@ -257,11 +257,14 @@ in its own copy and its own tid in its own slot for the whole run — and
 the driver's failure proof is to delete the annotation, after which the
 slots are one thread's class variables and the program names the clash
 on the first thread joined. One more name appears in a darwin
-`--release` binary and it is not the thread's: `bzero`, LLVM's spelling
-of the zeroing memset it makes of the arena's clearing loops on
-aarch64, present in a release `hello` too and unseen by
-`bench/dependency_floor.sh`, which builds plain. The thread floor's
-release list carries it, labelled.
+`--release` binary and it is not the thread's: `bzero`, the aarch64
+back end's lowering of a memset it will not inline, and the compiler
+zeroes every `Pointer.malloc` with one — a plain binary has only small
+constant ones, a release binary inlines the allocator and keeps its
+variable-length ones, and a plain binary with a large constant one (the
+root exercise's 1.5 MiB object) names it too. A release `hello` carries
+it, `bench/dependency_floor.sh` builds plain and never sees it, and the
+thread floor's release list carries it, labelled.
 
 The numbers, release build, an M2 Pro (10 cores, 6 performance and 4
 efficiency), 200 rounds, threads spinning the whole time, read on the

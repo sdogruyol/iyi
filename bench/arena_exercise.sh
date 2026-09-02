@@ -143,11 +143,16 @@ echo "== the allocation floor, measured against the -Dgc_iyi binary"
 # measures a plain build. This measures the build that floor cannot see. The
 # Linux list is unchanged from that script's, because the arena allocator
 # issues mmap and munmap as raw syscalls there and asks libc for nothing. The
-# darwin list is that script's plus three: `mmap` and `munmap`, which are
-# libSystem's VM interface and carry the same standing `write` does on that
-# platform (Apple documents libSystem as the interface and raw syscalls as not
-# a stable ABI), and `clock_gettime`, which is the exercise program's own
-# stopwatch rather than the allocator's, and is not on any sample's line.
+# darwin list is that script's, every name libSystem's (Apple documents
+# libSystem as the interface and raw syscalls as not a stable ABI), minus the
+# file calls no exercise makes, plus `clock_gettime`, which is the exercise
+# program's own stopwatch rather than the allocator's and is not on any
+# sample's line. The list is exact and every entry is used: `malloc`,
+# `memset` and `realloc` were here from before the collector became the
+# default and would have let a fallback to libSystem's allocator pass; the
+# kqueue, clock and dyld names arrived with the concurrency runtime and the
+# owned collector and were never recorded here, because this gate did not
+# run on darwin until the darwin job took it.
 case "$(uname -s)" in
   Linux)
     allowed_symbols="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
@@ -156,7 +161,7 @@ case "$(uname -s)" in
       exit 2
     fi
     ;;
-  *) allowed_symbols="chmod close exit malloc memset open read realloc unlink write mmap munmap clock_gettime" ;;
+  *) allowed_symbols="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide clock_gettime clock_gettime_nsec_np exit kevent kqueue mmap munmap pthread_get_stackaddr_np pthread_self write" ;;
 esac
 allowed_libs="libSystem libc.so ld-linux libgcc_s"
 

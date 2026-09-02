@@ -108,9 +108,13 @@ if [ -f "$WORK/mark" ]; then
   # mmap and munmap, both already bound for the arenas. The five loader-glue
   # names are every dynamically linked binary's baseline on Linux, the same
   # list `bench/arena_exercise.sh` allows: they come from crt/cc linkage, not
-  # from marking.
+  # from marking. On darwin every program also carries the poller, its clock
+  # and errno (`kqueue`, `kevent`, `clock_gettime_nsec_np`, `__error`),
+  # because the panic path runs through the scheduler; they are libSystem's
+  # and bench/dependency_floor.sh's, not marking's.
   extra="$(undefined_symbols "$WORK/mark" | grep -vxF -e clock_gettime -e exit -e mmap -e munmap -e write \
     -e pthread_self -e pthread_get_stackaddr_np -e _dyld_get_image_header -e _dyld_get_image_vmaddr_slide \
+    -e kqueue -e kevent -e clock_gettime_nsec_np -e __error \
     -e open -e openat -e close -e read -e unlink -e chmod \
     -e ITM_deregisterTMCloneTable -e ITM_registerTMCloneTable -e _cxa_finalize -e _gmon_start__ -e _libc_start_main || true)"
   if [ -n "$extra" ]; then

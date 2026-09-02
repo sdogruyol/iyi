@@ -106,10 +106,12 @@ case "$(uname -s)" in
     #       thunk in every Mach-O thread-local descriptor, which dyld
     #       rebinds to its own tlv_get_addr at load
     # The release build carries one more, `bzero`, and it is not the
-    # thread's: LLVM's optimiser turns the arena's clearing loops into a
-    # memset, and the aarch64 back end spells a zeroing memset `bzero`.
-    # A --release `hello` on darwin names it too; bench/dependency_floor.sh
-    # builds plain and never sees it.
+    # thread's: the compiler zeroes every `Pointer.malloc` with an
+    # `llvm.memset`, and the aarch64 back end lowers a memset it will not
+    # inline — variable length, or large — to `bzero`. A plain build has
+    # only small constant ones here; a --release build inlines the allocator
+    # and keeps its variable-length ones, so a release `hello` on darwin
+    # names it too. bench/dependency_floor.sh builds plain and never sees it.
     step "dependency floor: what a thread costs darwin, by name"
     runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pthread_get_stackaddr_np _pthread_self _write'
     thread='__tlv_bootstrap _os_unfair_lock_lock _os_unfair_lock_unlock _pthread_create _pthread_join _pthread_kill _pthread_threadid_np _sigaction'

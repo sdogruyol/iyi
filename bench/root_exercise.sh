@@ -155,7 +155,16 @@ echo "== what root discovery asks the machine for"
 # `pthread_get_stackaddr_np` for the stack base, and
 # `_dyld_get_image_header` with `_dyld_get_image_vmaddr_slide` for the segment
 # ranges. Apple documents libSystem as the interface and raw syscalls as not a
-# stable ABI, so there is no rawer answer to reach for.
+# stable ABI, so there is no rawer answer to reach for. The rest of the darwin
+# list is every darwin program's — the poller, its clock and errno, which the
+# panic path carries — plus two this program's own: `mprotect`, the guard
+# page of the fiber it spawns, and `bzero`, which is not a call this file
+# makes. The compiler zeroes every `Pointer.malloc` with an `llvm.memset`,
+# and the aarch64 back end lowers a memset it will not inline to `bzero`:
+# the 1.5 MiB large object below is one, and a `--release` build of any
+# darwin program has the allocator's variable-length ones. The stale names
+# (`malloc`, `memset`, `realloc`, the file calls) are gone from the list,
+# because an entry nothing uses is a check without teeth.
 case "$(uname -s)" in
   Linux)
     allowed_symbols="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main __data_start _end"
@@ -165,7 +174,7 @@ case "$(uname -s)" in
     fi
     ;;
   *)
-    allowed_symbols="chmod close exit malloc memset open read realloc unlink write mmap munmap pthread_self pthread_get_stackaddr_np _dyld_get_image_header _dyld_get_image_vmaddr_slide"
+    allowed_symbols="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide bzero clock_gettime_nsec_np exit kevent kqueue mmap mprotect munmap pthread_get_stackaddr_np pthread_self write"
     ;;
 esac
 allowed_libs="libSystem libc.so ld-linux libgcc_s"
