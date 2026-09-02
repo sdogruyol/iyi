@@ -1,0 +1,418 @@
+# What a kernel thread costs the dependency floor, measured before any
+# design that needs one is written (GC_DESIGN.md: Stages 4, 7, 8 and 9
+# wait on threads; SPEC.md III.4.7: `Share` waits on a caller). The
+# question III.9 asks is exact — a scheduler that reached for pthreads
+# would put libc back on the link line — so this program reaches for the
+# kernel instead: `clone` onto a stack of its own mapping, `futex` to
+# join, `tgkill` and a signal handler to stop every thread where it
+# stands and start it again, which is the whole of what a stop-the-world
+# needs from the platform. bench/thread_floor.sh drives it and reads the
+# floor off the binary.
+#
+#   ./bin/iyi run bench/thread_floor.iyi
+#
+# Linux x86_64 and aarch64. darwin's arm is libSystem's `pthread_create`
+# and `pthread_kill` by III.9's own rule and is measured there, not here.
+# Nothing in a thread body allocates or touches the scheduler: the arena
+# has no lock and the run queue is one thread's, which is precisely the
+# state this measurement exists to price.
+
+{% if flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64)) %}
+  {% if flag?(:x86_64) %}
+    TF_SYS_CLONE        =  56_i64
+    TF_SYS_EXIT         =  60_i64
+    TF_SYS_FUTEX        = 202_i64
+    TF_SYS_GETPID       =  39_i64
+    TF_SYS_GETTID       = 186_i64
+    TF_SYS_TGKILL       = 234_i64
+    TF_SYS_RT_SIGACTION =  13_i64
+    TF_SYS_SCHED_YIELD  =  24_i64
+    # x86_64 has no vdso trampoline the kernel will pick for a handler's
+    # return: SA_RESTORER must name one, and it is the two-instruction
+    # `rt_sigreturn` below.
+    TF_SA_FLAGS = 0x04000004_u64
+  {% else %}
+    TF_SYS_CLONE        = 220_i64
+    TF_SYS_EXIT         =  93_i64
+    TF_SYS_FUTEX        =  98_i64
+    TF_SYS_GETPID       = 172_i64
+    TF_SYS_GETTID       = 178_i64
+    TF_SYS_TGKILL       = 131_i64
+    TF_SYS_RT_SIGACTION = 134_i64
+    TF_SYS_SCHED_YIELD  = 124_i64
+    # aarch64's kernel supplies the sigreturn trampoline from the vdso when
+    # SA_RESTORER is absent; SA_SIGINFO alone.
+    TF_SA_FLAGS = 0x00000004_u64
+  {% end %}
+
+  # CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+  # CLONE_SYSVSEM | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID — a thread of
+  # this process, and the kernel writes the tid into the word named and
+  # clears it with a futex wake when the thread exits, which is the join.
+  # No CLONE_SETTLS: nothing here reads a thread pointer, and that absence
+  # is one of the findings (see the .sh).
+  TF_CLONE_FLAGS = 0x01250f00_i64
+  TF_SIGUSR1     = 10_i64
+  TF_FUTEX_WAIT  = 0_i64
+  TF_FUTEX_WAKE  = 1_i64
+  TF_STACK_BYTES = 262144_u64
+
+  def fail(message : String) : Nil
+    puts "FAIL: #{message}"
+    __iyi_exit(1)
+  end
+
+  # ── Atomics, by hand ────────────────────────────────────────────────────
+  #
+  # The prelude has no atomic because nothing in it has had a second thread
+  # to race with. This program does, so its counters are `lock xadd` and an
+  # `ldaxr`/`stlxr` loop, sequentially consistent, which is what a mark
+  # word's CAS will be too.
+  fun __tf_add(address : UInt64, delta : UInt64) : UInt64
+    previous = uninitialized UInt64
+    {% if flag?(:x86_64) %}
+      asm("lock xaddq $1, ($2)" : "=r"(previous) : "0"(delta), "r"(address) : "memory", "cc" : "volatile")
+    {% else %}
+      asm("1:
+           ldaxr $0, [$2]
+           add x5, $0, $1
+           stlxr w4, x5, [$2]
+           cbnz w4, 1b" : "=&r"(previous) : "r"(delta), "r"(address) : "x4", "x5", "memory", "cc" : "volatile")
+    {% end %}
+    previous
+  end
+
+  fun __tf_load(address : UInt64) : UInt64
+    value = uninitialized UInt64
+    {% if flag?(:x86_64) %}
+      asm("movq ($1), $0" : "=r"(value) : "r"(address) : "memory" : "volatile")
+    {% else %}
+      asm("ldar $0, [$1]" : "=r"(value) : "r"(address) : "memory" : "volatile")
+    {% end %}
+    value
+  end
+
+  fun __tf_store(address : UInt64, value : UInt64) : Nil
+    {% if flag?(:x86_64) %}
+      asm("xchgq $0, ($1)" :: "r"(value), "r"(address) : "memory" : "volatile")
+    {% else %}
+      asm("stlr $0, [$1]" :: "r"(value), "r"(address) : "memory" : "volatile")
+    {% end %}
+  end
+
+  # ── The thread ──────────────────────────────────────────────────────────
+  #
+  # `clone` returns twice, and the second return is on a stack the compiler
+  # has never heard of, so the child's whole life is inside the asm: it
+  # loads the function and argument the parent left at the top of its
+  # stack, calls, and exits with the thread-exit syscall. Only the parent's
+  # return falls out of the block. Inputs are pinned to callee-saved
+  # registers so the syscall's argument registers are free to be clobbered.
+  fun __tf_clone(stack_top : UInt64, entry : UInt64, argument : UInt64, tid_word : UInt64) : Int64
+    result = uninitialized Int64
+    {% if flag?(:x86_64) %}
+      asm("leaq -16(%r12), %rsi
+           movq %r13, 0(%rsi)
+           movq %r14, 8(%rsi)
+           movq $$0x01250f00, %rdi
+           xorq %rdx, %rdx
+           movq %r15, %r10
+           xorq %r8, %r8
+           movq $$56, %rax
+           syscall
+           testq %rax, %rax
+           jnz 1f
+           movq 8(%rsp), %rdi
+           movq 0(%rsp), %rax
+           andq $$-16, %rsp
+           callq *%rax
+           movq $$60, %rax
+           xorq %rdi, %rdi
+           syscall
+           1:" : "={rax}"(result)
+                : "{r12}"(stack_top), "{r13}"(entry), "{r14}"(argument), "{r15}"(tid_word)
+                : "rdi", "rsi", "rdx", "r10", "r8", "rcx", "r11", "memory", "cc"
+                : "volatile")
+    {% else %}
+      asm("sub x1, x19, #16
+           stp x20, x21, [x1]
+           mov x0, #0x0f00
+           movk x0, #0x0125, lsl #16
+           mov x2, #0
+           mov x3, x22
+           mov x4, #0
+           mov x8, #220
+           svc #0
+           cbnz x0, 1f
+           ldp x9, x0, [sp], #16
+           blr x9
+           mov x8, #93
+           mov x0, #0
+           svc #0
+           1:" : "={x0}"(result)
+                : "{x19}"(stack_top), "{x20}"(entry), "{x21}"(argument), "{x22}"(tid_word)
+                : "x1", "x2", "x3", "x4", "x8", "x9", "x30", "memory", "cc"
+                : "volatile")
+    {% end %}
+    result
+  end
+
+  # Where each thread lives: one 64-byte line per thread, so two threads'
+  # words never share a cache line and a false-sharing artefact cannot
+  # pose as a measurement.
+  #   +0   tid, written by the kernel at start, zeroed by it at exit
+  #   +8   the tid the thread read for itself with `gettid`
+  #   +16  work counter, the thread's own
+  class Threads
+    LINE = 64_u64
+    @@table : UInt64 = 0_u64
+    @@count : Int64 = 0_i64
+    # Shared words, each on its own line.
+    @@stop : UInt64 = 0_u64
+    @@suspended : UInt64 = 0_u64
+    @@resume : UInt64 = 0_u64
+    @@resumed : UInt64 = 0_u64
+
+    def self.setup(count : Int64) : Nil
+      @@count = count
+      @@table = __iyi_mmap(LINE * count.to_u64).address
+      shared = __iyi_mmap(LINE * 4_u64).address
+      @@stop = shared
+      @@suspended = shared + LINE
+      @@resume = shared + LINE * 2_u64
+      @@resumed = shared + LINE * 3_u64
+    end
+
+    def self.count : Int64
+      @@count
+    end
+
+    def self.line(index : Int64) : UInt64
+      @@table + LINE * index.to_u64
+    end
+
+    def self.stop : UInt64
+      @@stop
+    end
+
+    def self.suspended : UInt64
+      @@suspended
+    end
+
+    def self.resume : UInt64
+      @@resume
+    end
+
+    def self.resumed : UInt64
+      @@resumed
+    end
+  end
+
+  fun __tf_thread_main(line : UInt64) : Nil
+    tid = __iyi_conc_syscall3(TF_SYS_GETTID, 0_i64, 0_i64, 0_i64)
+    __tf_store(line + 8_u64, tid.to_u64)
+    # Spin until told to stop, counting: a thread that is running when a
+    # signal lands is the case a stop-the-world has to handle, and a
+    # parked one is the easy case.
+    while __tf_load(Threads.stop) == 0_u64
+      __tf_add(line + 16_u64, 1_u64)
+    end
+  end
+
+  # The address of a `fun`, by asm, for the reason concurrency.iyi gives.
+  @[NoInline]
+  @[Naked]
+  fun __tf_thread_main_address : UInt64
+    {% if flag?(:x86_64) %}
+      asm("leaq __tf_thread_main(%rip), %rax
+           retq" :::: "volatile")
+    {% else %}
+      asm("adrp x0, __tf_thread_main
+           add x0, x0, :lo12:__tf_thread_main
+           ret" :::: "volatile")
+    {% end %}
+  0_u64
+  end
+
+  def start_thread(index : Int64) : Nil
+    line = Threads.line(index)
+    stack = __iyi_mmap(TF_STACK_BYTES).address
+    result = __tf_clone(stack + TF_STACK_BYTES, __tf_thread_main_address, line, line)
+    fail("clone failed: #{result}") if result < 0
+  end
+
+  # Join: the kernel zeroes the tid word and wakes its futex when the
+  # thread exits; until then wait on the word holding the tid it holds.
+  def join_thread(index : Int64) : Nil
+    line = Threads.line(index)
+    while (tid = __tf_load(line)) != 0_u64
+      __iyi_conc_syscall6(TF_SYS_FUTEX, line.to_i64, TF_FUTEX_WAIT, tid.to_i64, 0_i64, 0_i64, 0_i64)
+    end
+  end
+
+  # ── Stop the world ──────────────────────────────────────────────────────
+  #
+  # The handler runs on the signalled thread, wherever it was. It counts
+  # itself suspended, parks on the resume word — a futex, so a stopped
+  # thread costs no CPU — and counts itself resumed on the way out. That
+  # is Stage 4's mechanism entire: what the collector would do between
+  # the two counts is read the thread's registers from the ucontext the
+  # kernel passes as the third argument, and scan its stack from the
+  # saved stack pointer up.
+  fun __tf_stop_handler(signal : Int32, info : Void*, context : Void*) : Nil
+    __tf_add(Threads.suspended, 1_u64)
+    while __tf_load(Threads.resume) == 0_u64
+      __iyi_conc_syscall6(TF_SYS_FUTEX, Threads.resume.to_i64, TF_FUTEX_WAIT, 0_i64, 0_i64, 0_i64, 0_i64)
+    end
+    __tf_add(Threads.resumed, 1_u64)
+  end
+
+  @[NoInline]
+  @[Naked]
+  fun __tf_stop_handler_address : UInt64
+    {% if flag?(:x86_64) %}
+      asm("leaq __tf_stop_handler(%rip), %rax
+           retq" :::: "volatile")
+    {% else %}
+      asm("adrp x0, __tf_stop_handler
+           add x0, x0, :lo12:__tf_stop_handler
+           ret" :::: "volatile")
+    {% end %}
+  0_u64
+  end
+
+  {% if flag?(:x86_64) %}
+    @[NoInline]
+    @[Naked]
+    fun __tf_sigreturn : Nil
+      asm("movq $$15, %rax
+           syscall" :::: "volatile")
+    end
+
+    @[NoInline]
+    @[Naked]
+    fun __tf_sigreturn_address : UInt64
+      asm("leaq __tf_sigreturn(%rip), %rax
+           retq" :::: "volatile")
+    0_u64
+    end
+  {% end %}
+
+  # The kernel's own sigaction: handler, flags, restorer, mask — the same
+  # four words on both targets, with the restorer meaningful only where
+  # TF_SA_FLAGS names it.
+  def install_stop_handler : Nil
+    action = Pointer(UInt64).malloc(4_u64)
+    action[0] = __tf_stop_handler_address
+    action[1] = TF_SA_FLAGS
+    {% if flag?(:x86_64) %}
+      action[2] = __tf_sigreturn_address
+    {% else %}
+      action[2] = 0_u64
+    {% end %}
+    action[3] = 0_u64
+    result = __iyi_conc_syscall6(TF_SYS_RT_SIGACTION, TF_SIGUSR1, action.address.to_i64, 0_i64, 8_i64, 0_i64, 0_i64)
+    fail("rt_sigaction failed: #{result}") if result < 0
+  end
+
+  # One round: signal every thread, wait until every handler has counted
+  # itself in, then release them all with one wake and wait until every
+  # handler has counted itself out. Answers the two pause halves in ns.
+  def stop_the_world(pid : Int64) : Tuple(Int64, Int64)
+    __tf_store(Threads.suspended, 0_u64)
+    __tf_store(Threads.resumed, 0_u64)
+    __tf_store(Threads.resume, 0_u64)
+    count = Threads.count
+
+    started = __iyi_monotonic_ns
+    index = 0_i64
+    while index < count
+      tid = __tf_load(Threads.line(index) + 8_u64).to_i64
+      result = __iyi_conc_syscall3(TF_SYS_TGKILL, pid, tid, TF_SIGUSR1)
+      fail("tgkill failed: #{result}") if result < 0
+      index = index + 1_i64
+    end
+    while __tf_load(Threads.suspended) < count.to_u64
+      __iyi_conc_syscall3(TF_SYS_SCHED_YIELD, 0_i64, 0_i64, 0_i64)
+    end
+    stopped = __iyi_monotonic_ns
+
+    __tf_store(Threads.resume, 1_u64)
+    __iyi_conc_syscall6(TF_SYS_FUTEX, Threads.resume.to_i64, TF_FUTEX_WAKE, 1000000_i64, 0_i64, 0_i64, 0_i64)
+    while __tf_load(Threads.resumed) < count.to_u64
+      __iyi_conc_syscall3(TF_SYS_SCHED_YIELD, 0_i64, 0_i64, 0_i64)
+    end
+    resumed = __iyi_monotonic_ns
+
+    {stopped - started, resumed - stopped}
+  end
+
+  # ── The run ─────────────────────────────────────────────────────────────
+  # `thread_floor THREADS ROUNDS`; 4 and 200 unless told otherwise, so the
+  # driver can ask how the pause scales with the count.
+  args = Program.args
+  count = args.size > 0 ? args[0].to_i.to_i64 : 4_i64
+  rounds = args.size > 1 ? args[1].to_i.to_i64 : 200_i64
+  fail("at least one thread") if count < 1_i64
+  Threads.setup(count)
+  pid = __iyi_conc_syscall3(TF_SYS_GETPID, 0_i64, 0_i64, 0_i64)
+  own_tid = __iyi_conc_syscall3(TF_SYS_GETTID, 0_i64, 0_i64, 0_i64)
+
+  index = 0_i64
+  while index < count
+    start_thread(index)
+    index = index + 1_i64
+  end
+
+  # Every thread reports a tid of its own, unlike this one's, before
+  # anything else is measured — the proof there are threads at all.
+  index = 0_i64
+  while index < count
+    line = Threads.line(index)
+    while __tf_load(line + 8_u64) == 0_u64
+      __iyi_conc_syscall3(TF_SYS_SCHED_YIELD, 0_i64, 0_i64, 0_i64)
+    end
+    seen = __tf_load(line + 8_u64).to_i64
+    kernel = __tf_load(line).to_i64
+    fail("thread #{index} read tid #{seen} but the kernel wrote #{kernel}") if seen != kernel
+    fail("thread #{index} has the main thread's tid") if seen == own_tid
+    index = index + 1_i64
+  end
+  puts "threads: #{count} started by raw clone, each with a tid of its own"
+
+  install_stop_handler
+
+  best_stop = 0_i64
+  best_resume = 0_i64
+  total_stop = 0_i64
+  total_resume = 0_i64
+  worst_stop = 0_i64
+  round = 0_i64
+  while round < rounds
+    pair = stop_the_world(pid)
+    stop_ns = pair[0]
+    resume_ns = pair[1]
+    best_stop = stop_ns if best_stop == 0_i64 || stop_ns < best_stop
+    best_resume = resume_ns if best_resume == 0_i64 || resume_ns < best_resume
+    worst_stop = stop_ns if stop_ns > worst_stop
+    total_stop = total_stop + stop_ns
+    total_resume = total_resume + resume_ns
+    round = round + 1_i64
+  end
+  puts "stop-the-world: #{count} running threads, #{rounds} rounds"
+  puts "  stop   best #{best_stop} ns  mean #{total_stop // rounds} ns  worst #{worst_stop} ns"
+  puts "  resume best #{best_resume} ns  mean #{total_resume // rounds} ns"
+
+  # The threads were running the whole time: every counter moved.
+  __tf_store(Threads.stop, 1_u64)
+  index = 0_i64
+  while index < count
+    join_thread(index)
+    fail("thread #{index} never ran its loop") if __tf_load(Threads.line(index) + 16_u64) == 0_u64
+    index = index + 1_i64
+  end
+  puts "joined: every thread exited and its tid word was cleared by the kernel"
+  puts "every property held"
+{% else %}
+  puts "thread floor: measured on Linux x86_64 and aarch64; nothing to measure here"
+{% end %}

@@ -154,6 +154,53 @@ the parallelism the decision was made for arrives after threads do.
 
 So the point of no return, Stage 5, is still ahead.
 
+**What a thread costs is now measured, before the design that needs one
+is written** (`bench/thread_floor.iyi`, driven by `bench/thread_floor.sh`,
+in CI beside the dependency floor with its aarch64 arm under emulation).
+III.9's fear was exact: a scheduler that reached for pthreads would put
+libc back on the link line. So the probe reaches for the kernel instead —
+`clone` with the thread flags onto a stack of the program's own mapping,
+the child's whole life inside the asm, `futex` on the tid word the kernel
+clears at exit for the join — and the binary keeps the floor: the five
+C-template names and nothing else, plain and release, and the aarch64
+object is as empty as any sample's. The stop-the-world is the same
+probe: `rt_sigaction` with the kernel's own four-word struct (a
+two-instruction `rt_sigreturn` restorer on x86_64, the vdso's on aarch64),
+`tgkill` to every thread, a handler that counts itself in, parks on a
+futex, and counts itself out on one wake. That is Stage 4's mechanism
+entire; what the collector adds between the two counts is reading the
+thread's registers from the `ucontext` the kernel hands the handler and
+scanning its stack from there — Stage 3's register capture, generalised
+to the thread that did not ask.
+
+The numbers, release build, 20 cores, 200 rounds, threads spinning the
+whole time (the case a stop has to handle; a parked thread is the easy
+one): stop 1 thread best 1.6 µs / mean 1.9 µs; 4 threads 4.1 / 5.5 µs; 16
+threads 22 / 32 µs with a 1.3 ms worst; 64 threads best 98 µs but mean
+7.3 ms and worst 14.6 ms. Resume is one wake: 0.3 µs best for 1 to 16
+threads, 0.7 µs for 64. The shape is the finding. Below the core count
+the pause is a signal per thread, roughly a microsecond each; past it a
+signalled thread with no CPU runs its handler when the kernel's scheduler
+next gives it one, so the pause floor over oversubscribed threads is the
+timeslice, not the signal. Two decisions follow for Stages 4 and 7:
+marking workers never exceed the core count, and the mutator side is M:N
+with M bounded the same way, or a stop is milliseconds by construction.
+
+Two absences the probe priced by running without them. No `CLONE_SETTLS`:
+the child thread ran compiled iyi code — a `fun`, atomics by inline
+asm, syscalls — with no thread pointer at all, so the compiler emits
+nothing thread-relative for a body that neither allocates nor raises.
+The corollary is the real first cost of threads, and it is not the
+thread: `IyiScheduler.current`, the poller fd, the arena's free lists and
+the collector's own state are all class variables today, one thread's
+globals, and where that state lives per thread is the design question
+the runtime has to answer before a second thread may allocate. And no
+atomic: the prelude has none because nothing in it has had a second
+thread to race with; the probe's `lock xadd` and `ldaxr`/`stlxr` loop
+are what the mark word's CAS and every shared counter will be. darwin's
+thread is libSystem's `pthread_create` and `pthread_kill` by III.9's own
+rule, and its floor is that job's to read.
+
 **Owner's Decision:** Own the garbage collector. Concurrency, parallelism, and performance control are the reasons. gcry is prior art: measurements, design hints, and a record of what has already been tried and cost what. iyi writes the heap, the STW mechanism, root discovery, and finalizers from scratch.
 
 ---

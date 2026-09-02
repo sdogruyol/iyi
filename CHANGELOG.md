@@ -81,6 +81,38 @@
   takes brew's LLVM 22 archives for the static 20.1.2 ones, and the link
   dies on zstd and zlib symbols. Unset it.
 
+- **What a kernel thread costs the floor, measured before the design
+  that needs one.** Every open row in the tree waits on threads —
+  GC_DESIGN.md's Stages 4, 7, 8 and 9, and `Share`, which III.4.7 counted
+  and then refused to build without a caller — and III.9's objection was
+  exact: a scheduler that reached for pthreads would put libc back on the
+  link line. `bench/thread_floor.iyi` reaches for the kernel instead and
+  the objection dissolves on Linux: `clone` with the thread flags onto a
+  stack of the program's own mapping, the child's whole life inside the
+  asm, `futex` on the tid word the kernel clears at exit for the join,
+  and the binary keeps the five C-template names and nothing else —
+  asserted by `bench/thread_floor.sh`, plain and release, with the
+  aarch64 arm run under emulation in CI beside III.4's. The same probe is
+  a stop-the-world entire: `rt_sigaction` with the kernel's four-word
+  struct and a two-instruction `rt_sigreturn` restorer where x86_64
+  needs one, `tgkill` to every thread, a handler that counts itself in,
+  parks on a futex and counts itself out on one wake. Release build, 20
+  cores, threads spinning the whole time: stopping 1 thread is 1.6 µs
+  best, 4 are 4.1 µs, 16 are 22 µs; 64 — past the core count — are 98 µs
+  best but 7.3 ms mean, because a signalled thread with no CPU runs its
+  handler when the scheduler next gives it one. Resume is one wake at
+  0.3 µs. So marking workers never exceed the core count and the mutator
+  side is bounded the same way, or a pause is milliseconds by
+  construction. The probe also priced two absences by running without
+  them: no thread pointer at all, so the compiler emits nothing
+  thread-relative for a body that neither allocates nor raises, and the
+  real first cost of threads is that the scheduler, the poller and the
+  arena are one thread's class variables; and no atomic in the prelude,
+  so the probe's `lock xadd` and `ldaxr`/`stlxr` are what the mark
+  word's CAS will be. GC_DESIGN.md carries the reading. darwin's thread
+  is libSystem's by III.9's rule and is that job's measurement, still to
+  be taken.
+
 ### Fixed
 
 - **`make -B iyi-tarball` packaged an unoptimised compiler past the guard

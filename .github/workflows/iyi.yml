@@ -447,6 +447,15 @@ jobs:
       - name: The dependency floor
         run: bash bench/dependency_floor.sh
 
+      # What a kernel thread costs that floor, measured before anything is
+      # designed on one (GC_DESIGN.md Stages 4, 7, 8, 9; III.4.7's `Share`):
+      # raw `clone`, a `tgkill` stop-the-world, a futex join, and the
+      # assertion that none of it put a symbol on the link line. The pause
+      # numbers are printed, not budgeted — a shared runner's clock is
+      # weather — and the aarch64 arm runs in cross-run.
+      - name: The thread floor
+        run: bash bench/thread_floor.sh
+
       # iyi is a permanent fork, so Crystal's name standing in for iyi's is a
       # defect and not a detail. Both layers: a tree that should have been
       # renamed, and a name left inside a file that was otherwise cut over.
@@ -615,6 +624,12 @@ jobs:
             -o cross/conc-musl bench/concurrency_exercise.iyi
           ./bin/iyi build --cross-compile --target aarch64-linux-gnu \
             -o cross/conc-aarch64 bench/concurrency_exercise.iyi
+          # The thread floor's aarch64 arm: raw `clone`, `futex`, `tgkill`
+          # and a signal handler with the kernel's vdso sigreturn, none of
+          # it run anywhere else. Its x86-64 arm is bench/thread_floor.sh in
+          # the samples job.
+          ./bin/iyi build --cross-compile --target aarch64-linux-gnu \
+            -o cross/floor-aarch64 bench/thread_floor.iyi
 
           # The Windows probe: the two shapes whose output has been seen wrong,
           # a case conversion and a number rendered into a string — then the
@@ -702,10 +717,15 @@ jobs:
               gcc hello-aarch64.o -o hello-aarch64 -lgc -lpthread &&
               ./hello-aarch64 > got.txt &&
               gcc conc-aarch64.o -o conc-aarch64 &&
-              timeout 120 ./conc-aarch64 > conc.txt
+              timeout 120 ./conc-aarch64 > conc.txt &&
+              gcc floor-aarch64.o -o floor-aarch64 &&
+              timeout 120 ./floor-aarch64 2 20 > floor.txt
             '
           diff cross/expected.txt cross/got.txt && echo "aarch64: same output"
           grep -q "every property held" cross/conc.txt && echo "aarch64: III.4 held"
+          # Under emulation the numbers are qemu's; the properties are the
+          # kernel's ABI and the asm, which is what this arm is for.
+          grep -q "every property held" cross/floor.txt && echo "aarch64: the thread floor held"
 
   # darwin arm64 is a run target now (SPEC.md III.4.8): the concurrency
   # runtime's kqueue arm, the panic registry and every sample run natively on
