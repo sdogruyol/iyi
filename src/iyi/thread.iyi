@@ -197,20 +197,6 @@
       result
     end
 
-    @[NoInline]
-    @[Naked]
-    fun __iyi_ehdr_start : UInt64
-      {% if flag?(:x86_64) %}
-        asm("leaq __ehdr_start(%rip), %rax
-             retq" :::: "volatile")
-      {% else %}
-        asm("adrp x0, __ehdr_start
-             add x0, x0, :lo12:__ehdr_start
-             ret" :::: "volatile")
-      {% end %}
-      0_u64
-    end
-
     # A thread's TLS block, from the executable's own PT_TLS, laid out the
     # way a static libc's startup lays out its own: the segment found by
     # walking the program headers from `__ehdr_start`, the initialised
@@ -223,9 +209,25 @@
       @@memsz : UInt64 = 0_u64
       @@align : UInt64 = 0_u64
 
+      # The ELF header's own address, the linker's `__ehdr_start`. Read in
+      # a def rather than a `fun` so the symbol is referenced only by a
+      # program that starts a thread: a `fun` is emitted into every
+      # binary, and this one put `__ehdr_start` on every Linux object's
+      # undefined list, which the root gate's cross-object audit counts.
+      def self.ehdr_start : UInt64
+        header = uninitialized UInt64
+        {% if flag?(:x86_64) %}
+          asm("leaq __ehdr_start(%rip), $0" : "=r"(header) ::: "volatile")
+        {% else %}
+          asm("adrp $0, __ehdr_start
+               add $0, $0, :lo12:__ehdr_start" : "=r"(header) ::: "volatile")
+        {% end %}
+        header
+      end
+
       def self.read_segment : Nil
         return if @@align != 0_u64
-        header = __iyi_ehdr_start
+        header = ehdr_start
         phoff = Pointer(UInt64).new(header + 32_u64).value
         phentsize = Pointer(UInt64).new(header + 48_u64).value.unsafe_shr(48_u64)
         phnum = Pointer(UInt64).new(header + 56_u64).value & 0xFFFF_u64
