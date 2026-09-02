@@ -53,10 +53,11 @@
 
   def monotonic_ns : UInt64
     stamp = Pointer(UInt64).malloc(2_u64)
-    # CLOCK_MONOTONIC is 6 on darwin, not the 1 Linux uses: measured against
-    # this machine's libSystem, where 1 answers EINVAL and 6 counts up from
-    # boot without running while the machine is asleep.
-    LibC.clock_gettime(6, stamp.as(Void*))
+    # CLOCK_MONOTONIC_RAW is 4 on darwin: 1 answers EINVAL there, 6 is
+    # CLOCK_MONOTONIC and is rounded to the microsecond on arm64, and 4 is
+    # the 24 MHz counter the prelude's own clock reads — a per-allocation
+    # figure in nanoseconds wants the ticks.
+    LibC.clock_gettime(4, stamp.as(Void*))
     stamp[0] * 1000000000_u64 + stamp[1]
   end
 {% end %}

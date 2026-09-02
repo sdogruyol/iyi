@@ -1659,7 +1659,9 @@ require "./file"
       # CLOCK_MONOTONIC — writing the timespec into a page of this module's
       # own, because a collector must not allocate from the heap it is
       # collecting, not even sixteen bytes for a stamp. darwin asks
-      # libSystem's clock_gettime_nsec_np, the scheduler's own clock.
+      # libSystem's clock_gettime_nsec_np for CLOCK_MONOTONIC_RAW, the
+      # scheduler's own clock and for its reason: a pause is microseconds,
+      # and 6 would report it in whole ones.
       @@stamp : UInt64 = 0_u64
 
       def self.now_ns : UInt64
@@ -1680,7 +1682,7 @@ require "./file"
           {% end %}
           IyiHeap.read64(stamp) * 1000000000_u64 + IyiHeap.read64(stamp + 8_u64)
         {% else %}
-          LibC.clock_gettime_nsec_np(6)
+          LibC.clock_gettime_nsec_np(4)
         {% end %}
       end
 

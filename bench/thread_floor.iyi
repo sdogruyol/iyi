@@ -687,14 +687,6 @@
       asm("yield" :::: "volatile")
     end
 
-    # The prelude's clock is CLOCK_MONOTONIC, which ticks in microseconds
-    # on darwin arm64 and would round a 2 µs stop to the nearest one.
-    # CLOCK_MONOTONIC_RAW (4) is the 24 MHz counter, 42 ns a tick, read
-    # through the same libSystem name the prelude already carries.
-    def now_ns : Int64
-      LibC.clock_gettime_nsec_np(4).to_i64
-    end
-
     def join_thread(index : Int64) : Nil
       handle = Pointer(Void).new(__tf_load(Threads.line(index)))
       result = LibC.pthread_join(handle, Pointer(Void).new(0_u64))
@@ -751,7 +743,7 @@
         index = index + 1_i64
       end
 
-      started = now_ns
+      started = __iyi_monotonic_ns
       index = 0_i64
       while index < count
         handle = Pointer(Void).new(__tf_load(Threads.line(index)))
@@ -762,7 +754,7 @@
       while __tf_load(Threads.suspended) < count.to_u64
         yield_cpu
       end
-      stopped = now_ns
+      stopped = __iyi_monotonic_ns
 
       index = 0_i64
       while index < count
@@ -772,7 +764,7 @@
       while __tf_load(Threads.resumed) < count.to_u64
         yield_cpu
       end
-      resumed = now_ns
+      resumed = __iyi_monotonic_ns
 
       {stopped - started, resumed - stopped}
     end

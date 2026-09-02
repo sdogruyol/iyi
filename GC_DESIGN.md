@@ -268,8 +268,9 @@ thread floor's release list carries it, labelled.
 
 The numbers, release build, an M2 Pro (10 cores, 6 performance and 4
 efficiency), 200 rounds, threads spinning the whole time, read on the
-24 MHz counter because the prelude's CLOCK_MONOTONIC ticks in
-microseconds on darwin: stop 1 thread best 2.0 µs / mean 2.2 µs; 4
+24 MHz counter (CLOCK_MONOTONIC_RAW, which is the prelude's darwin
+clock now, because CLOCK_MONOTONIC there is rounded to the
+microsecond): stop 1 thread best 2.0 µs / mean 2.2 µs; 4
 threads 23 / 35 µs; 8 threads 54 / 100 µs with a 1.9 ms worst; 16
 threads best 90 µs but mean 0.95 ms and worst 15 ms; 64 threads best
 0.5 ms, mean 2.2 ms, worst 35–54 ms. Resume: 0.2 µs for 1 thread, 10 /

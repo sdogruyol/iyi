@@ -233,11 +233,16 @@ end
   end
 {% end %}
 # CLOCK_MONOTONIC, in nanoseconds. The sleep queue's clock; never the
-# wall. darwin's libSystem has the one-call form, and 6 is its
-# CLOCK_MONOTONIC.
+# wall. darwin's libSystem has the one-call form, and the id is 4,
+# CLOCK_MONOTONIC_RAW, not 6: both stop while the machine sleeps and
+# both count from boot, but 6 is rounded to the microsecond on arm64
+# and 4 is the 24 MHz counter itself, 42 ns a tick — measured by the
+# thread floor, whose 2 µs stop came back as 2000 or 3000 on 6. A
+# deadline is a duration, so the slew 6 carries and 4 does not is
+# nothing the queue wants.
 def __iyi_monotonic_ns : Int64
   {% if flag?(:darwin) %}
-    LibC.clock_gettime_nsec_np(6).to_i64
+    LibC.clock_gettime_nsec_np(4).to_i64
   {% else %}
     spec = Pointer(UInt64).malloc(2_u64)
     result = __iyi_conc_syscall3(IYI_SYS_CLOCK_GETTIME, 1_i64, spec.address.to_i64, 0_i64)

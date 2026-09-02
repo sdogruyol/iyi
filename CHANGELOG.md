@@ -191,7 +191,7 @@
   the annotation, since there is no flag bit to drop, and the program
   names the clash on the first thread joined. The numbers, release,
   M2 Pro (10 cores), 200 rounds, spinning threads, on the 24 MHz
-  counter because the prelude's clock ticks in microseconds on darwin:
+  counter (CLOCK_MONOTONIC_RAW; see the clock entry under Fixed):
   stop 1 thread 2.0 µs best / 2.2 mean; 4 threads 23 / 35 µs; 8
   threads 54 / 100 µs; 16 threads 90 µs best, 0.95 ms mean, 15 ms
   worst; 64 threads 0.5 ms best, 2.2 ms mean. Resume 0.2 µs for 1, 10
@@ -214,6 +214,19 @@
   GC_DESIGN.md carries the reading.
 
 ### Fixed
+
+- **darwin's clock is the 24 MHz counter now, not a microsecond
+  rounding of it.** The prelude read `clock_gettime_nsec_np(6)`,
+  CLOCK_MONOTONIC, for the sleep queue, the collector's pause stamps and
+  the arena exercise's stopwatch, and on arm64 that clock answers in
+  whole microseconds: the thread floor's 2 µs stop came back as 2000 or
+  3000, its sub-microsecond resume as 0, and every `IyiMark.pause_*_ns`
+  a darwin program reports was rounded the same way. CLOCK_MONOTONIC_RAW
+  (4) is the counter itself, 42 ns a tick, the same libSystem name and
+  no new one; it stops in sleep and counts from boot exactly as 6 does,
+  and lacks only the slew a duration never wanted. All three readers use
+  it, and the thread floor's own darwin clock, written to get around the
+  rounding, is gone.
 
 - **The collector's five gates and the defer cost now run in the darwin
   job, and running them found what nobody had.** The owned collector
@@ -2949,7 +2962,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,674-line library and nothing else. Every other
+  written against iyi's own 5,681-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
