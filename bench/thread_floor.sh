@@ -9,28 +9,31 @@
 # Five steps, and the last two are failure proofs, because a gate that
 # cannot fail is not a gate:
 #
-#   1. The program holds every property, plain and --release: N threads by
-#      raw `clone`, each with a tid of its own and a thread-local block of
-#      its own laid out from the executable's PT_TLS; every one stopped
-#      where it ran by `tgkill` and a handler, released by one futex wake;
-#      every one joined on the tid word the kernel clears at exit; every
-#      `@[ThreadLocal]` slot still its owner's at the end.
-#   2. The binary keeps the floor: the runtime's five C-template names and
-#      nothing else. This is the measurement the file exists for — a thread
-#      without pthreads adds no symbol, and a thread-local variable adds no
-#      `__tls_get_addr` — and it is asserted, not printed.
+#   1. The program holds every property, plain and --release: N threads,
+#      each with a tid of its own and a thread-local block of its own;
+#      every one stopped where it ran by a signal and a handler, released
+#      by one wake; every one joined; every `@[ThreadLocal]` slot still its
+#      owner's at the end.
+#   2. The binary keeps the floor. This is the measurement the file exists
+#      for, and it is asserted, not printed. On Linux: the runtime's five
+#      C-template names and nothing else — a thread by raw `clone` adds no
+#      symbol, and a thread-local variable adds no `__tls_get_addr`. On
+#      darwin, where III.9's rule is that every call is libSystem's: the
+#      exact list below, which is the runtime's names plus what a thread
+#      costs there, spelled out one by one.
 #   3. The pause, by thread count, printed from real runs. Reported rather
 #      than budgeted: a budget would be a number this script made up, and
 #      the shape (how it scales past the core count) is the finding.
 #   4. The ran-its-loop assertion is reachable: a thread that counts into
 #      the wrong word exits 1 at that check's own name.
-#   5. The thread-local assertion is reachable: `clone` without
-#      CLONE_SETTLS leaves every thread on the main thread's block, and the
-#      program exits 1 naming the slot another thread wrote into.
+#   5. The thread-local assertion is reachable. On Linux, `clone` without
+#      CLONE_SETTLS leaves every thread on the main thread's block. On
+#      darwin dyld lays the block out and there is no bit to drop, so the
+#      `@[ThreadLocal]` annotation itself is dropped instead: the slots
+#      become one thread's class variables and clash. Either way the
+#      program exits 1 naming the thread-local that was not.
 #
-# Linux x86_64 and aarch64 only. darwin's thread is libSystem's by III.9's
-# rule and its floor is measured by its own job; here the script says so
-# and exits 0 without claiming anything.
+# Linux x86_64 and aarch64, darwin aarch64.
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,10 +44,14 @@ cd "$WORK" || exit 1
 
 step() { echo "== $1"; }
 
-if [ "$(uname -s)" != Linux ]; then
-  echo "thread floor: measured on Linux; darwin's arm is libSystem's pthread_create and is its own measurement"
-  exit 0
-fi
+case "$(uname -s)" in
+  Linux) cores="$(nproc)" ;;
+  Darwin) cores="$(sysctl -n hw.ncpu)" ;;
+  *)
+    echo "thread floor: measured on Linux and darwin; nothing to measure here"
+    exit 0
+    ;;
+esac
 
 # ── 1. The program, twice ─────────────────────────────────────────────────
 step "thread floor, plain build"
@@ -66,26 +73,69 @@ fi
 grep -q 'every property held' answers-release.txt || { cat answers-release.txt; exit 1; }
 
 # ── 2. The floor ──────────────────────────────────────────────────────────
-# The same five names bench/concurrency_exercise.sh allows, for the same
-# reason: they are crt1.o's, not the program's. `clone`, `futex`, `tgkill`,
-# `rt_sigaction` and `gettid` are syscalls here and appear as nothing.
-step "dependency floor: a thread without pthreads adds no symbol"
-for bin in floor floor-release; do
-  added="$(nm -u "$bin" |
-    sed -e 's/^ *[wU] *//' -e 's/@.*$//' |
-    grep -v -E '^(_ITM_deregisterTMCloneTable|_ITM_registerTMCloneTable|__cxa_finalize|__gmon_start__|__libc_start_main)$' |
-    grep -cv '^\s*$')"
-  if [ "$added" -ne 0 ]; then
-    echo "$bin put $added undefined symbols on the link line:"
-    nm -u "$bin"
-    exit 1
-  fi
-done
-echo "  five template names and nothing else, plain and release"
+case "$(uname -s)" in
+  Linux)
+    # The same five names bench/concurrency_exercise.sh allows, for the
+    # same reason: they are crt1.o's, not the program's. `clone`, `futex`,
+    # `tgkill`, `rt_sigaction` and `gettid` are syscalls here and appear
+    # as nothing.
+    step "dependency floor: a thread without pthreads adds no symbol"
+    for bin in floor floor-release; do
+      added="$(nm -u "$bin" |
+        sed -e 's/^ *[wU] *//' -e 's/@.*$//' |
+        grep -v -E '^(_ITM_deregisterTMCloneTable|_ITM_registerTMCloneTable|__cxa_finalize|__gmon_start__|__libc_start_main)$' |
+        grep -cv '^\s*$')"
+      if [ "$added" -ne 0 ]; then
+        echo "$bin put $added undefined symbols on the link line:"
+        nm -u "$bin"
+        exit 1
+      fi
+    done
+    echo "  five template names and nothing else, plain and release"
+    ;;
+  Darwin)
+    # The exact list, held the way bench/concurrency_exercise.sh holds the
+    # exercise's. Twelve names are every darwin program's (the runtime's
+    # list in bench/dependency_floor.sh). Eight are what a thread costs,
+    # and each one is a dependency taken on by name:
+    #   pthread_create, pthread_join, pthread_kill   the thread
+    #   pthread_threadid_np                          its id, both views
+    #   sigaction                                    the stop
+    #   os_unfair_lock_lock, os_unfair_lock_unlock   the park
+    #   __tlv_bootstrap                              a @[ThreadLocal]: the
+    #       thunk in every Mach-O thread-local descriptor, which dyld
+    #       rebinds to its own tlv_get_addr at load
+    # The release build carries one more, `bzero`, and it is not the
+    # thread's: LLVM's optimiser turns the arena's clearing loops into a
+    # memset, and the aarch64 back end spells a zeroing memset `bzero`.
+    # A --release `hello` on darwin names it too; bench/dependency_floor.sh
+    # builds plain and never sees it.
+    step "dependency floor: what a thread costs darwin, by name"
+    runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pthread_get_stackaddr_np _pthread_self _write'
+    thread='__tlv_bootstrap _os_unfair_lock_lock _os_unfair_lock_unlock _pthread_create _pthread_join _pthread_kill _pthread_threadid_np _sigaction'
+    printf '%s\n' $runtime $thread | LC_ALL=C sort > expected-floor.txt
+    printf '%s\n' $runtime $thread _bzero | LC_ALL=C sort > expected-floor-release.txt
+    for bin in floor floor-release; do
+      nm -u "$bin" | sed -e 's/^ *//' | awk '{ print $NF }' | LC_ALL=C sort > "found-$bin.txt"
+      if ! diff "expected-$bin.txt" "found-$bin.txt" > "diff-$bin.txt"; then
+        echo "$bin moved the darwin floor (< expected, > found):"
+        cat "diff-$bin.txt"
+        exit 1
+      fi
+      extra_libs="$(otool -L "$bin" | sed -n '2,$p' | awk '{ print $1 }' | grep -cv 'libSystem')"
+      if [ "$extra_libs" -ne 0 ]; then
+        echo "$bin links something besides libSystem:"
+        otool -L "$bin"
+        exit 1
+      fi
+    done
+    echo "  the runtime's twelve names, the thread's eight, libSystem alone; release adds bzero"
+    ;;
+esac
 
 # ── 3. The pause, by count ────────────────────────────────────────────────
-step "stop-the-world by thread count, release build ($(nproc) cores here)"
-for count in 1 4 16 64; do
+step "stop-the-world by thread count, release build ($cores cores here)"
+for count in 1 4 8 16 64; do
   echo "  $count threads:"
   timeout 120 ./floor-release "$count" 200 | grep -E '^  (stop|resume)' | sed 's/^/  /'
 done
@@ -108,17 +158,28 @@ if [ $? -ne 1 ] || ! grep -q "never ran its loop" idle.txt; then
 fi
 
 # ── 5. Failure proof: the thread-local assertion is reachable ─────────────
-# The one flag bit, dropped from the constant and from both arms' asm
-# immediates: every thread then inherits the parent's thread pointer and
-# shares its block, so the slots clash and the program says whose.
 step "failure proof: threads sharing one thread-local block are refused"
-sed 's/012d/0125/g' "$REPO/bench/thread_floor.iyi" > shared.iyi
-[ "$(grep -c '0125' shared.iyi)" -ge 3 ] || { echo "the sed found nothing to change"; exit 1; }
+case "$(uname -s)" in
+  Linux)
+    # The one flag bit, dropped from the constant and from both arms' asm
+    # immediates: every thread then inherits the parent's thread pointer
+    # and shares its block, so the slots clash and the program says whose.
+    sed 's/012d/0125/g' "$REPO/bench/thread_floor.iyi" > shared.iyi
+    [ "$(grep -c '0125' shared.iyi)" -ge 3 ] || { echo "the sed found nothing to change"; exit 1; }
+    ;;
+  Darwin)
+    # No bit to drop: dyld lays the block out for every pthread. What can
+    # be dropped is the annotation, and then the slot, the seed and the
+    # line are one thread's class variables that every thread writes.
+    sed '/@\[ThreadLocal\]/d' "$REPO/bench/thread_floor.iyi" > shared.iyi
+    [ "$(grep -c '@\[ThreadLocal\]' "$REPO/bench/thread_floor.iyi")" -ge 3 ] || { echo "the sed found nothing to change"; exit 1; }
+    ;;
+esac
 if ! "$IYI" build shared.iyi -o shared > build-shared.log 2>&1; then
   cat build-shared.log; exit 1
 fi
 timeout 60 ./shared 2 10 > shared.txt 2>&1
-if [ $? -ne 1 ] || ! grep -q "thread-local slot" shared.txt; then
+if [ $? -ne 1 ] || ! grep -q "thread-local" shared.txt; then
   echo "the thread-local check did not fire:"; cat shared.txt; exit 1
 fi
 
