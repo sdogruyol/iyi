@@ -628,14 +628,17 @@
     # The park is the finding. darwin has no futex, and the
     # `__ulock_wait`/`__ulock_wake` beneath libSystem's own locks is private
     # ABI, so a stopped thread must park on something libSystem exports.
-    # Three were measured (CHANGELOG.md has the numbers): a mutex and
+    # Five were measured (CHANGELOG.md has the numbers): a mutex and
     # condition, four names, released by one broadcast; one
     # `os_unfair_lock` the main thread holds, two names, released by one
     # unlock — which the kernel hands waiter to waiter, so the resume is a
-    # chain of wakeups at some 40 µs a link; and one `os_unfair_lock` per
+    # chain of wakeups at some 40 µs a link; one `os_unfair_lock` per
     # thread, on the thread's own line, two names, released by N unlocks
     # issued back to back, which wake in parallel and resume as fast as
-    # the broadcast does. The last is what is here. `sched_yield` was
+    # the broadcast does; then, once the question was asked with
+    # async-signal-safety in it, `sigsuspend` and a pipe per thread. The
+    # pipe is what is here, for the reason given at the stop below, and the
+    # per-thread lock and `sigsuspend` stay as flags. `sched_yield` was
     # measured too and is not here: the main thread spins on the counters
     # with a `yield` hint instead, which costs no name and, below the core
     # count, no time. And the stop has an alternative with no signal in
@@ -651,17 +654,27 @@
       fun pthread_kill(thread : Void*, signal : Int32) : Int32
       fun pthread_threadid_np(thread : Void*, id : UInt64*) : Int32
       fun sigaction(signal : Int32, action : Void*, previous : Void*) : Int32
-      fun os_unfair_lock_lock(lock : Void*) : Nil
-      fun os_unfair_lock_unlock(lock : Void*) : Nil
+      {% if flag?(:tf_park_sigsuspend) %}
+        fun sigsuspend(mask : Void*) : Int32
+      {% elsif flag?(:tf_park_lock) %}
+        fun os_unfair_lock_lock(lock : Void*) : Nil
+        fun os_unfair_lock_unlock(lock : Void*) : Nil
+      {% else %}
+        fun pipe(fds : Int32*) : Int32
+        fun read(fd : Int32, buffer : Void*, count : UInt64) : Int64
+        fun write(fd : Int32, buffer : Void*, count : UInt64) : Int64
+      {% end %}
     end
 
     TF_SIGUSR1 = 30_i32
+    TF_SIGUSR2 = 31_i32
     # struct sigaction on darwin arm64 is sixteen bytes: the handler, then
     # `sa_mask` (a 32-bit set) and `sa_flags` packed into the second word.
     # SA_SIGINFO is 0x40, in the high half.
     TF_SA_WORD = 0x0000004000000000_u64
-    # The thread's park word, an `os_unfair_lock` (OS_UNFAIR_LOCK_INIT is
-    # zero), on its own line at this offset.
+    # The thread's park word on its own line at this offset: the pipe's two
+    # descriptors, read end low, write end high; or under -Dtf_park_lock an
+    # `os_unfair_lock` (OS_UNFAIR_LOCK_INIT is zero).
     TF_PARK = 40_u64
     # libSystem's ucontext: uc_onstack and a 32-bit sigmask, a 24-byte
     # uc_stack, uc_link, uc_mcsize, then at 48 a pointer to the mcontext,
@@ -892,14 +905,139 @@
       # ── Stop the world ──────────────────────────────────────────────────────
       #
       # The handler runs on the signalled thread, wherever it was. It counts
-      # itself suspended, parks on its own line's lock, which the main
-      # thread took before signalling, and counts itself resumed once it has
-      # been handed the lock and let it go. What the collector would do
-      # between the two counts is the same as on Linux: the thread's
-      # registers are in the ucontext libSystem passes as the third argument.
+      # itself suspended, parks, and counts itself resumed. What the
+      # collector would do between the two counts is the same as on Linux:
+      # the thread's registers are in the ucontext libSystem passes as the
+      # third argument.
+      #
+      # Where it parks is a question with a wrong answer that measures well.
+      # An `os_unfair_lock` the main thread holds is the fastest release (N
+      # unlocks back to back) and is not on Apple's list of calls a signal
+      # handler may make: it works, with no promise, and it was the first
+      # answer here. The park is a pipe per thread now — the handler blocks
+      # in `read`, the main thread releases it with one `write` per thread —
+      # because `read` is async-signal-safe by POSIX's own list and the
+      # numbers are the lock's below the core count (CHANGELOG.md has both);
+      # it costs `pipe` and `read` where the lock cost its two calls. The
+      # other two parks are kept as flags so they stay measured:
+      #   -Dtf_park_lock        the `os_unfair_lock`, two names, the fastest
+      #                         resume, no promise;
+      #   -Dtf_park_sigsuspend  `sigsuspend` on a mask that lets SIGUSR2
+      #                         through, released by one `pthread_kill` per
+      #                         thread — Boehm's stop on every POSIX, one
+      #                         name, and a resume that pays the kill loop a
+      #                         second time.
+      # Go's answer, a handler that blocks nowhere and rewrites the context
+      # so the thread parks itself at a safe point in ordinary code, needs
+      # what Go's compiler gives it and LLVM's does not without being asked:
+      # a register no code ever holds live, to jump back through after every
+      # other register is restored (Go's REGTMP), or safe-point tables that
+      # say when one is free. On x86_64 `ret` pops the way back and no
+      # register is needed; on aarch64 there is no jump through memory, and
+      # x18, the one register darwin reserves, is zeroed by the kernel on
+      # any exception return. So that answer is a codegen decision — reserve
+      # a register the way Go reserves R27 — and is recorded in GC_DESIGN.md
+      # rather than faked here.
       def park_word(line : UInt64) : Pointer(Void)
         Pointer(Void).new(line + TF_PARK)
       end
+
+      {% if flag?(:tf_park_sigsuspend) %}
+        # A 32-bit darwin sigset with every signal but SIGUSR2 set.
+        TF_SUSPEND_MASK = 0xBFFFFFFF_u64
+
+        fun __tf_resume_handler(signal : Int32, info : Void*, context : Void*) : Nil
+        end
+
+        @[NoInline]
+        @[Naked]
+        fun __tf_resume_handler_address : UInt64
+          asm("adrp x0, ___tf_resume_handler@PAGE
+               add x0, x0, ___tf_resume_handler@PAGEOFF
+               ret" :::: "volatile")
+          0_u64
+        end
+
+        def park(line : UInt64) : Nil
+          mask = TF_SUSPEND_MASK
+          LibC.sigsuspend(pointerof(mask).as(Void*))
+        end
+
+        def take_parks(count : Int64) : Nil
+        end
+
+        def release_parks(count : Int64) : Nil
+          index = 0_i64
+          while index < count
+            handle = Pointer(Void).new(__tf_load(Threads.line(index)))
+            result = LibC.pthread_kill(handle, TF_SIGUSR2)
+            fail("pthread_kill (resume) failed: #{result}") if result != 0
+            index = index + 1_i64
+          end
+        end
+
+        def install_parks(count : Int64) : Nil
+          action = Pointer(UInt64).malloc(2_u64)
+          action[0] = __tf_resume_handler_address
+          action[1] = TF_SA_WORD
+          result = LibC.sigaction(TF_SIGUSR2, action.as(Void*), Pointer(Void).new(0_u64))
+          fail("sigaction (resume) failed: #{result}") if result != 0
+        end
+      {% elsif flag?(:tf_park_lock) %}
+        def park(line : UInt64) : Nil
+          LibC.os_unfair_lock_lock(park_word(line))
+          LibC.os_unfair_lock_unlock(park_word(line))
+        end
+
+        def take_parks(count : Int64) : Nil
+          index = 0_i64
+          while index < count
+            LibC.os_unfair_lock_lock(park_word(Threads.line(index)))
+            index = index + 1_i64
+          end
+        end
+
+        def release_parks(count : Int64) : Nil
+          index = 0_i64
+          while index < count
+            LibC.os_unfair_lock_unlock(park_word(Threads.line(index)))
+            index = index + 1_i64
+          end
+        end
+
+        def install_parks(count : Int64) : Nil
+        end
+      {% else %}
+        def park(line : UInt64) : Nil
+          byte = uninitialized UInt8
+          fd = (__tf_load(line + TF_PARK) & 0xFFFFFFFF_u64).to_i32
+          while LibC.read(fd, pointerof(byte).as(Void*), 1_u64) != 1_i64
+          end
+        end
+
+        def take_parks(count : Int64) : Nil
+        end
+
+        def release_parks(count : Int64) : Nil
+          byte = 1_u8
+          index = 0_i64
+          while index < count
+            fd = __tf_load(Threads.line(index) + TF_PARK).unsafe_shr(32_u64).to_i32
+            fail("write (resume) failed") if LibC.write(fd, pointerof(byte).as(Void*), 1_u64) != 1_i64
+            index = index + 1_i64
+          end
+        end
+
+        def install_parks(count : Int64) : Nil
+          fds = Pointer(Int32).malloc(2_u64)
+          index = 0_i64
+          while index < count
+            fail("pipe failed") if LibC.pipe(fds) != 0
+            __tf_store(Threads.line(index) + TF_PARK, fds[1].to_i64.to_u64.unsafe_shl(32_u64) | fds[0].to_i64.to_u64)
+            index = index + 1_i64
+          end
+        end
+      {% end %}
 
       # The interrupted sp is at most a few frames below the first frame's
       # local, and 64 KiB is well inside the 512 KiB a pthread's stack is,
@@ -915,8 +1053,7 @@
         mcontext = Pointer(UInt64).new(context.address + TF_UC_MCONTEXT).value
         Threads.held(Pointer(UInt64).new(mcontext + TF_MC_SP).value,
           Pointer(UInt64).new(mcontext + TF_MC_PC).value, pointerof(here).address)
-        LibC.os_unfair_lock_lock(park_word(Tls.line))
-        LibC.os_unfair_lock_unlock(park_word(Tls.line))
+        park(Tls.line)
         __tf_add(Threads.resumed, 1_u64)
       end
 
@@ -935,21 +1072,18 @@
         action[1] = TF_SA_WORD
         result = LibC.sigaction(TF_SIGUSR1, action.as(Void*), Pointer(Void).new(0_u64))
         fail("sigaction failed: #{result}") if result != 0
+        install_parks(Threads.count)
       end
 
-      # One round: take every thread's lock, signal every thread, wait until
-      # every handler has counted itself in, then drop every lock and wait
-      # until every handler has counted itself out. Answers the two pause
-      # halves in ns.
+      # One round: take every thread's park, signal every thread, wait until
+      # every handler has counted itself in, then release every park and
+      # wait until every handler has counted itself out. Answers the two
+      # pause halves in ns.
       def stop_the_world : Tuple(Int64, Int64)
         __tf_store(Threads.suspended, 0_u64)
         __tf_store(Threads.resumed, 0_u64)
         count = Threads.count
-        index = 0_i64
-        while index < count
-          LibC.os_unfair_lock_lock(park_word(Threads.line(index)))
-          index = index + 1_i64
-        end
+        take_parks(count)
 
         started = __iyi_monotonic_ns
         index = 0_i64
@@ -964,11 +1098,7 @@
         end
         stopped = __iyi_monotonic_ns
 
-        index = 0_i64
-        while index < count
-          LibC.os_unfair_lock_unlock(park_word(Threads.line(index)))
-          index = index + 1_i64
-        end
+        release_parks(count)
         while __tf_load(Threads.resumed) < count.to_u64
           yield_cpu
         end

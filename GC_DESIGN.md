@@ -251,16 +251,54 @@ kernel hands it waiter to waiter and the resume becomes a chain at some
 40 µs a link (177 µs mean for 4 threads, 415 µs for 8); one
 `os_unfair_lock` per thread, on its line, taken by the main thread
 before it signals and released by N unlocks issued back to back, is two
-names and resumes as fast as the broadcast. That is the probe's park,
-and the handler finds its own lock through a `@[ThreadLocal]`, which is
-what Stage 4's handler will do for the thread's state. `sched_yield`
-was measured and left out: it is a name, its own reschedule is 4 µs on
-the one-thread stop, and a `yield` hint in the main thread's spin costs
-neither. The floor is therefore held as an exact list by
-`bench/thread_floor.sh`: the runtime's twelve names, plus these eight
-— the five above, the two lock calls, and `__tlv_bootstrap`.
+names and resumes as fast as the broadcast. That was the probe's park
+for a day, and it has a defect the numbers cannot show:
+`os_unfair_lock_lock` is not on Apple's list of what a signal handler
+may call, so a stop built on it works with no promise. The question
+was asked again with async-signal-safety in it, and two parks that
+POSIX does promise were measured against the lock: `sigsuspend` on a
+mask that lets a second signal through, released by one `pthread_kill`
+per thread — Boehm's stop on every POSIX, one name, and a resume that
+pays the kill loop twice (711 µs mean for 8 threads against the lock's
+135) — and a pipe per thread, the handler blocked in `read` and the
+main thread releasing it with one `write` per thread, which is the
+lock's numbers below the core count (stop 2.0 / 20 / 50 µs best for 1,
+4, 8 threads; resume 0.8 µs, 27 µs, 122 µs mean) for `pipe` and `read`
+where the lock cost its two calls. The pipe is the probe's park now,
+and the handler finds its own pipe through a `@[ThreadLocal]`, which
+is what Stage 4's handler will do for the thread's state. Past the
+core count the pipe's stop mean is several times the lock's (3.6 ms
+against 0.5 for 16 threads) for a reason not yet read, and outside the
+regime the design lives in. `sched_yield` was measured and left out:
+it is a name, its own reschedule is 4 µs on the one-thread stop, and a
+`yield` hint in the main thread's spin costs neither. The floor is
+therefore held as an exact list by `bench/thread_floor.sh`: the
+runtime's twelve names, plus these eight — the five above, `pipe` and
+`read`, and `__tlv_bootstrap` — with each refused variant held to a
+list of its own.
 
-That last name is what a thread-local costs darwin. There is no
+Go's stop was weighed too, and it is the one this probe cannot build
+without the compiler's help. Go's handler blocks nowhere: it
+rewrites the interrupted context so the thread, on return from the
+signal, runs a trampoline that saves every register, parks in ordinary
+code where any lock is legal, restores every register and jumps back
+to the instruction it was interrupted at. The jump back is the
+problem: after every register is restored there must be one left to
+hold the address, and aarch64 has no jump through memory. Go's
+compiler reserves R27 for exactly this (and preempts only at safe
+points where it knows R27 is dead); LLVM reserves nothing for iyi, and
+x18, the one register darwin reserves, is zeroed by the kernel on any
+exception return, so a jump through it has a window a context switch
+can hit. On x86_64 `ret` pops the way back and no register is needed.
+So the Go-shaped stop on aarch64 is a codegen decision — reserve a
+register the way Go does, at the cost of one fewer for every
+function, and emit safe-point information or accept preempting
+anywhere — and Stage 4 records it as the option that buys a handler
+with no blocking call in it, against the pipe, which blocks in the
+one call POSIX promises. The pipe is the default until that decision
+is measured.
+
+`__tlv_bootstrap` is what a thread-local costs darwin. There is no
 local-exec on Mach-O: the compiler emits `adrp`/`add` to a 24-byte
 descriptor in `__thread_vars`, loads its thunk and calls it, and the
 thunk the linker wrote is `__tlv_bootstrap`, which dyld rebinds to its
@@ -343,7 +381,7 @@ to 2.2. Resume is worse still past 4 threads: 3 ms mean for 8 against
 returns only once its target has been through a core and stopped, and
 the next begins after it, where N `pthread_kill`s are queued at once
 and the handlers stop in parallel as their threads get a core. So
-Stage 4's darwin stop is the signal and the per-thread lock, and its
+Stage 4's darwin stop is the signal and the per-thread pipe, and its
 register capture is the handler's `ucontext`, as on Linux.
 
 **Owner's Decision:** Own the garbage collector. Concurrency, parallelism, and performance control are the reasons. gcry is prior art: measurements, design hints, and a record of what has already been tried and cost what. iyi writes the heap, the STW mechanism, root discovery, and finalizers from scratch.

@@ -146,6 +146,35 @@
   pass, and the wasm32 cross-compile of a sample and of `--crystal`'s
   stdlib sample still compile to their objects.
 
+- **The park is a pipe, because a signal handler may call `read` and
+  may not call `os_unfair_lock_lock`.** The per-thread lock the darwin
+  probe chose by its numbers is not on Apple's list of async-signal-safe
+  calls; it works, with no promise, which is not a footing for a
+  stop-the-world. Two parks POSIX does promise were measured against it,
+  same machine, release, 200 rounds: `sigsuspend` on a mask that admits
+  SIGUSR2, released by a second `pthread_kill` per thread — Boehm's stop
+  everywhere, one name in place of the lock's two, a resume that pays
+  the kill loop twice (8 threads: 711 µs mean against 135) — and a pipe
+  per thread, the handler blocked in `read`, released by one `write` per
+  thread, which is the lock's numbers below the core count: stop 2.0 /
+  20 / 50 µs best and resume 0.8 µs / 27 µs / 122 µs mean for 1, 4, 8
+  threads, against the lock's 2.1 / 25 / 56 and 0.3 / 34 / 136. The
+  pipe is the probe's park now, for `pipe` and `read` where the lock
+  cost `os_unfair_lock_lock` and `_unlock`; the lock and `sigsuspend`
+  stay as `-Dtf_park_lock` and `-Dtf_park_sigsuspend`, each held to its
+  own exact list and printed in its own table up to the core count.
+  Past it the pipe's stop mean is several times the lock's (16 threads:
+  3.6 ms against 0.5) for a reason not read yet, outside the regime the
+  design lives in and recorded as such. Go's park was weighed and not
+  built: its handler blocks nowhere and rewrites the context so the
+  thread parks itself in ordinary code, which on aarch64 needs a
+  register no code ever holds live to jump back through after every
+  other is restored — Go's compiler reserves R27 for it; LLVM reserves
+  nothing for iyi, and darwin's reserved x18 is zeroed by the kernel on
+  exception return. That is a codegen decision (reserve a register, at
+  one fewer for every function) and GC_DESIGN.md records it as Stage
+  4's open option against the pipe.
+
 - **The stop handler reads the held thread's registers, and measures
   its own depth.** The probe's handler used to count itself in and park;
   the part between, which is the collector's, is in it now: the
@@ -255,8 +284,9 @@
   3 ms mean resume for 8 threads against 155 µs — each suspend returns
   only once its target has been through a core and stopped, one after
   another, where N kills are queued at once and the handlers stop in
-  parallel. So Stage 4's darwin stop is the signal and the per-thread
-  lock. And the probe's "best" sentinel was 0,
+  parallel. So Stage 4's darwin stop is the signal and a per-thread
+  park — the lock, until the entry below asked whether a handler may
+  call it. And the probe's "best" sentinel was 0,
   which a microsecond clock can measure; it is the first round now.
   GC_DESIGN.md carries the reading.
 
