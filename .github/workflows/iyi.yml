@@ -728,22 +728,46 @@ jobs:
         with:
           persist-credentials: false
 
-      # Crystal's compiler to bootstrap, llvm for codegen, coreutils for
-      # the gates' `timeout`, pkgconf so `-Dgc_boehm` finds brew's bdw-gc
-      # (which already arrives beside Crystal's compiler).
+      # Crystal's compiler to bootstrap, coreutils for the gates' `timeout`,
+      # pkgconf so `-Dgc_boehm` finds brew's bdw-gc (which already arrives
+      # beside Crystal's compiler). brew's llvm is not asked for: the
+      # compiler this job ships links the static one built below, and the
+      # bootstrap Crystal brings whatever LLVM it needs for itself.
       - name: Install the bootstrap toolchain
         run: |
-          brew install crystal llvm coreutils pkgconf
+          brew install crystal coreutils pkgconf
           echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # The same diet the Linux tarball went on, from the same recipe file
+      # (`scripts/build-static-llvm.sh`): 0.8.0's darwin package carried
+      # brew's shared libLLVM in `lib/` and, by the bundler's fixed point,
+      # everything it names outside `/usr/lib` and `/System` — because the
+      # compiler linked `/opt/homebrew/opt/llvm`.
+      # Now it links a static minimal LLVM and `lib/` is libgc alone. Built
+      # on this runner because a static archive is bound to the libc++ and
+      # SDK it was compiled against; cached on the recipe's hash and the
+      # platform, so the build is paid once per recipe change. `$HOME`
+      # rather than `/tmp`: darwin's `/tmp` is a symlink into `/private`,
+      # and a cache path should not depend on how a symlink is archived.
+      - name: Restore the static LLVM
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/llvm-static
+          key: llvm-static-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-static-llvm.sh') }}
+      - name: Build the static LLVM (cache miss)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-static-llvm.sh "$HOME/llvm-static"
 
       # `iyi-tarball` builds `iyi` and its daemon in release mode, refuses an
       # unoptimised binary (`check_iyi_is_release`), and packages them — one
       # build pass, and every gate below runs against the compiler people
-      # would actually download.
+      # would actually download. The package script then reads the
+      # direction off the binary: a static-LLVM compiler must ship no
+      # libLLVM, and `otool -L` must name nothing outside the package but
+      # `/usr/lib` and `/System`.
       - name: Build `iyi`, its daemon, and the tarball
-        run: make iyi-tarball
-        env:
-          LLVM_CONFIG: /opt/homebrew/opt/llvm/bin/llvm-config
+        run: make iyi-tarball LLVM_CONFIG="$HOME/llvm-static/bin/llvm-config"
 
       - name: Samples
         run: |

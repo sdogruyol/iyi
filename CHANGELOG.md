@@ -28,8 +28,38 @@
   archive must be linked by the glibc it was compiled against, and an
   archive from a newer machine is a link error or a silent
   binary-for-newer-glibc. The roughly-an-hour build is paid once per
-  LLVM bump, not per push. darwin's tarball keeps brew's shared LLVM for
-  now, stated rather than implied: its diet is its own piece of work.
+  LLVM bump, not per push. darwin's tarball kept brew's shared LLVM for
+  one commit, stated rather than implied, and the entry below is its diet.
+
+- **darwin's tarball went on the same diet, and the recipe became one
+  file.** 0.8.0's darwin package carried brew's shared libLLVM in `lib/`
+  and, by the bundler's fixed point, everything it names outside
+  `/usr/lib` and `/System` — because the compiler linked
+  `/opt/homebrew/opt/llvm`. The darwin job now builds the same static
+  minimal LLVM the Linux job builds, links against it, and ships `lib/`
+  with libgc alone; `bundle-runtime-libs.sh`'s direction guard applies
+  unchanged, and `otool -L` on the packaged binary must name nothing
+  outside the package but `/usr/lib` and `/System`, which was already
+  darwin's only self-containment proof and is now the one that matters.
+
+  The recipe moved out of the workflow into `scripts/build-static-llvm.sh`
+  on the way, because two cmake lines in two jobs are two recipes the day
+  one is edited. It asserts what it built — `llvm-config --shared-mode`
+  must say `static`, and no `libLLVM.so`/`.dylib` may exist under the
+  prefix — and CI keys both caches on the file's own hash plus the
+  runner's platform: editing the recipe is what invalidates the cache,
+  no version token has to be remembered, and a darwin archive can never
+  be restored into the Linux container (cache keys are repository-wide,
+  and the previous key named no platform). The Linux cache rebuilds once
+  for the key change. brew's `llvm` left the darwin install line: nothing
+  in the job asks for it any more, and the bootstrap Crystal brings what
+  it needs for itself. The recipe was run to completion on Linux before
+  this entry was written — 13 minutes on 20 cores, `--shared-mode`
+  `static`, the five targets, `-lrt -ldl -lm` as its whole system list —
+  and the tarball built against it packages libgc and libstdc++ and
+  nothing else, exactly as CI's own build did. darwin's first run is the
+  job's to report, and the guards above are what make its verdict a
+  verdict.
 
 ### Fixed
 
@@ -44,7 +74,6 @@
   is now handed `release=1` explicitly; the same `-B` run builds release
   twice and packages release, and the plain `make iyi-tarball` against a
   stale unoptimised binary still refuses by name.
-
 
 ## 0.8.0 — 2026-09-01
 

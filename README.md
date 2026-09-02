@@ -361,12 +361,15 @@ $ ~/.local/bin/iyi run ~/.local/share/iyi/samples/hello.iyi
 
 The tarball is relocatable and carries both libraries: iyi's own 208 KB, and
 Crystal's standard library for `--crystal`. `bin/iyi` finds them beside itself,
-so there is nothing to configure and no `IYI_PATH` to set. It carries LLVM
-and what LLVM itself needs, which is most of its size and the reason it is
-tens of megabytes rather than a handful: a download that cannot start is
-not a download. The one thing it does not bring is a C toolchain, because
-iyi links through `cc`; CI proves the rest by unpacking the tarball in a
-bare image with nothing but `gcc` in it and building a program there.
+so there is nothing to configure and no `IYI_PATH` to set. LLVM is inside the
+binary — a static minimal build from `scripts/build-static-llvm.sh`, the same
+recipe on Linux and darwin — so `lib/` is libgc (and libstdc++ on Linux) and
+nothing else, and the package is tens of megabytes because a compiler is,
+not because it is carrying a shared LLVM's closure. The one thing it does
+not bring is a C toolchain, because iyi links through `cc`; CI proves the
+rest by unpacking the tarball in a bare image with nothing but `gcc` in it
+and building a program there, and on darwin by `otool -L` naming nothing
+outside the package but `/usr/lib` and `/System`.
 
 ### An editor, in one stanza
 
@@ -628,8 +631,10 @@ unmarked is private, so it needs `pub class`. A macro from another module
 reaching your type is exactly what `pub` governs.
 
 **The compiler itself links four libraries.** Crystal's published
-required-libraries list is thirteen long. `otool -L` on the `iyi` binary
-prints libLLVM, libc++, libgc and libSystem, and nothing else. LLVM is the back
+required-libraries list is thirteen long. `otool -L` on a locally built `iyi`
+prints libLLVM, libc++, libgc and libSystem, and nothing else; on the
+released binary libLLVM is absent from the list because it is inside the
+binary. LLVM is the back
 end and libc++ arrives with it. libgc is there because `-Dgc_none` was tried
 on the compiler and does not survive it: invalid IR on some runs, a crash in
 `main_user_code` on others. pcre2 was the fifth entry. Regex literals in four
