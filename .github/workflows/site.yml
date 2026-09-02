@@ -1,15 +1,18 @@
 name: site
 
+# Disabled for now: the site does not build on push. `workflow_dispatch`
+# stays so it can be run by hand; put the `push` trigger back to re-enable.
+#
+#   push:
+#     branches: [master]
+#     paths:
+#       - "site/**"
+#       - "bench/**"
+#       - "samples/**"
+#       - "SPEC.md"
+#       - "CHANGELOG.md"
+#       - "README.md"
 on:
-  push:
-    branches: [master]
-    paths:
-      - "site/**"
-      - "bench/**"
-      - "samples/**"
-      - "SPEC.md"
-      - "CHANGELOG.md"
-      - "README.md"
   workflow_dispatch:
 
 permissions:
