@@ -467,6 +467,13 @@ jobs:
       - name: Threads under the collector
         run: bash bench/thread_exercise.sh
 
+      # The parallel marker (GC_DESIGN.md Stage 7): a million-node tree
+      # marked alone and with helpers, the helpers' share asserted, the two
+      # pauses printed, and the proof that a marker which never shares its
+      # stack is refused.
+      - name: The parallel marker
+        run: bash bench/parallel_mark.sh
+
       # iyi is a permanent fork, so Crystal's name standing in for iyi's is a
       # defect and not a detail. Both layers: a tree that should have been
       # renamed, and a name left inside a file that was otherwise cut over.
@@ -850,6 +857,9 @@ jobs:
       # is the samples job's, the aarch64 arm is cross-run's.
       - name: Threads under the collector (GC_DESIGN.md Stage 4)
         run: bash bench/thread_exercise.sh
+
+      - name: The parallel marker (GC_DESIGN.md Stage 7)
+        run: bash bench/parallel_mark.sh
 
       # The collector's gates, which the collector's own darwin arm (the
       # default allocator there since the flip) had never been held to in

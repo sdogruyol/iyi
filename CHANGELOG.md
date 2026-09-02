@@ -546,6 +546,41 @@
   — the allocator must sweep at least an arena per collection, and the
   proof that removes its sweep is named — and every collector gate holds.
 
+- **The mark is parallel: helpers on kernel threads, a stack per worker,
+  a pool of batches between them — Stage 7.** `IyiThread.start_helper`
+  gives the collector kernel threads the stop never names — no line, no
+  cache, nothing allocated from the heap — and the marker keeps its state
+  on one page per worker named by one `@[ThreadLocal]`, read once when a
+  drain begins, because every thread-local read is a `noinline` call and
+  fifteen of them per object doubled the mark before the page. Gray goes
+  to the worker's own stack; a stack past 512 spills its top as a batch
+  to the pool, and — the finding — a stack of any depth donates its
+  bottom half when the pool is empty and a worker is idle, at most every
+  256 pushes: a depth-first mark of a tree keeps a stack as deep as the
+  tree and no deeper, its oldest entries are its widest subtrees, and a
+  marker that only spilled a full stack never shared a tree at all
+  (fifteen helpers idle through binary trees), while one that donated on
+  every push chopped a million nodes into eight-entry batches through
+  one lock and took twice as long as alone. Shading is a compare-and-swap
+  on the colour bits when helpers run and a plain store when the mark is
+  alone — a fence per object was a third of a mark — and blackening is
+  always a plain store, since only the worker that grayed an object holds
+  it. Helpers are sized by the work, one per MiB the last mark found
+  live, up to the core count less one capped at fifteen, and parked on a
+  futex between marks (a spin with a yield on darwin, which has none);
+  a mark under a MiB runs alone. Termination is a count of workers
+  holding work beside an empty pool, and a helper that read the
+  generation after it turned would have slept through the mark and hung
+  the collector waiting for its answer, so a helper counts itself ready
+  at its first park and the collector waits for every helper it started
+  before it turns the generation. `bench/parallel_mark.sh`: a million
+  typed nodes, 40 MiB, five marks alone and five with helpers, 12.7 ms
+  to 6.0 on 20 cores with the helpers blackening 95% of the nodes, and
+  the proof that a marker which never donates is refused by name. On
+  `bench/gc_race.py`: binary trees' longest pause 2.7 ms to 2.3, total
+  paused 94 ms to 51, wall 0.266 s to 0.219. A linked list — live churn —
+  gains nothing, as no parallel marker can: a chain is one worker's walk.
+
 ### Fixed
 
 - **The thread floor's x86_64 store clobbered its own value, and the
@@ -3362,7 +3397,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 7,328-line library and nothing else. Every other
+  written against iyi's own 7,822-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

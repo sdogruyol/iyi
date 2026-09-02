@@ -1,0 +1,84 @@
+# The parallel marker, exercised: GC_DESIGN.md Stage 7.
+#
+#   ./bin/iyi run bench/parallel_mark.iyi
+#
+# A wide live graph — a binary tree of a million typed nodes, 40 MiB —
+# marked by one thread and then by the collecting thread with its helpers,
+# five explicit collections each; the tree's checksum must hold through
+# both, the helpers must have blackened objects (a marker that never shares
+# a tree is one thread with fifteen spectators), and the two pause means
+# are printed side by side, reported rather than budgeted: how far the
+# mark falls with helpers is the finding, and the machine is the machine.
+#
+# bench/parallel_mark.sh drives it and proves the sharing check fails when
+# the marker stops donating its stack's bottom.
+
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+  def fail(message : String) : Nil
+    print "FAIL: #{message}\n"
+    __iyi_exit(1)
+  end
+
+  class Node
+    @left : Node?
+    @right : Node?
+    @value : Int64
+
+    def initialize(@left : Node?, @right : Node?, @value : Int64)
+    end
+
+    def sum : Int64
+      left = @left
+      right = @right
+      total = @value
+      total = total + left.sum if left.is_a?(Node)
+      total = total + right.sum if right.is_a?(Node)
+      total
+    end
+  end
+
+  def build(depth : Int32, seed : Int64) : Node
+    return Node.new(nil, nil, seed) if depth == 0
+    Node.new(build(depth - 1, seed &* 3_i64 &+ 1_i64), build(depth - 1, seed &* 5_i64 &+ 2_i64), seed)
+  end
+
+  # Five explicit collections, the mean pause and the last mark's helper
+  # count, with the tree checked after each.
+  def collect_five(tree : Node, expected : Int64) : Tuple(Int64, Int64)
+    total = 0_i64
+    helpers = 0_i64
+    round = 0
+    while round < 5
+      before = IyiMark.pause_total_ns
+      IyiMark.collect
+      total = total + (IyiMark.pause_total_ns - before).to_i64
+      helpers = IyiMark.helper_black.to_i64
+      fail("the tree's checksum changed under collection #{round}") if tree.sum != expected
+      round = round + 1
+    end
+    {total // 5_i64, helpers}
+  end
+
+  IyiMark.auto = false
+  tree = build(19, 7_i64)
+  expected = tree.sum
+  puts "tree: #{expected} over 1048575 nodes"
+
+  IyiMark.workers = 0_u64
+  # Two marks first so the marker's own estimate of the live set is warm
+  # for both arms alike.
+  IyiMark.collect
+  IyiMark.collect
+  alone = collect_five(tree, expected)
+  fail("helpers blackened #{alone[1]} objects with none asked") if alone[1] != 0_i64
+
+  IyiMark.workers = 15_u64
+  IyiMark.collect
+  helped = collect_five(tree, expected)
+  fail("the helpers blackened nothing: the mark was one thread and the rest watched") if helped[1] == 0_i64
+
+  puts "mark: #{alone[0] // 1000_i64} us alone, #{helped[0] // 1000_i64} us with helpers, which blackened #{helped[1]} of the last mark's nodes"
+  puts "parallel mark: every property held"
+{% else %}
+  puts "parallel mark: needs the collector and a thread target; nothing to exercise here"
+{% end %}

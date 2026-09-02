@@ -1317,11 +1317,6 @@ require "./file"
         write64(arena + OFF_LIVE, 0_u64)
       end
 
-      # One more object in this arena survived the mark.
-      def self.count_live(base : UInt64) : Nil
-        arena = arena_of(base)
-        write64(arena + OFF_LIVE, read64(arena + OFF_LIVE) + 1_u64) if arena != 0
-      end
 
       # Same-chunk growth within a class, allocate-and-copy across one,
       # because the old size rides under the object header, which is the only
@@ -2085,16 +2080,74 @@ require "./file"
       BLACK = 2_u64
       COLOUR = 3_u64
 
-      # The queue is its own mapping, never the heap being marked. A mark
-      # phase that allocated from that heap could carve a chunk, or hand back
-      # one it is about to decide the liveness of, which is a collector
-      # reasoning about memory it is mutating. It starts at one page of words
-      # and doubles into a fresh mapping when it fills; the old mapping is
-      # released, because a mark phase that leaked its own queue every cycle
-      # would outgrow the heap it was collecting.
-      @@queue : UInt64 = 0_u64
-      @@queue_words : UInt64 = 0_u64
-      @@queue_len : UInt64 = 0_u64
+      # ── The parallel marker's memory ───────────────────────────────────
+      #
+      # Nothing here is the heap being marked: a mark phase that allocated
+      # from that heap could carve a chunk, or hand back one it is about to
+      # decide the liveness of, which is a collector reasoning about memory
+      # it is mutating. Every worker — the collecting thread and the helpers
+      # `IyiThread.start_helper` gave the collector — has a stack of its
+      # own, a mapping named by a `@[ThreadLocal]`; gray objects go there
+      # first, and only a full stack spills. What is shared is a pool of
+      # batches (GC_DESIGN.md Stage 7's work distribution): a worker whose
+      # stack passes SPILL_AT moves a batch of BATCH entries to the pool
+      # under the pool's own lock, a worker whose stack runs dry takes a
+      # batch from it, and the mark is over when the pool is empty and no
+      # worker holds work. Batches come from a bump region the collection
+      # resets, so the pool never touches the heap and never leaks.
+      SPILL_AT = 512_u64
+      BATCH = 128_u64
+      BATCH_WORDS = 130_u64
+      STACK_WORDS = 4194304_u64
+      POOL_REGION = 67108864_u64
+
+      # A worker's state is one page, and one `@[ThreadLocal]` names the
+      # thread's page: read once when a drain begins and passed down as
+      # `w`, because every thread-local read is a `noinline` call (the
+      # compiler's rule, so a fiber that changes threads never reads a
+      # cached address), and fifteen of them per object doubled the mark.
+      #   +0   the stack's mapping     +8   its length in entries
+      #   +16  bytes this worker blackened
+      #   +24  the arena its pending live count is for   +32  the count
+      #   +40  the type id whose layout entry is cached   +48  the entry
+      @[ThreadLocal]
+      @@worker : UInt64 = 0_u64
+      @@collector_worker : UInt64 = 0_u64
+      W_STACK = 0_u64
+      W_LEN = 8_u64
+      W_BYTES = 16_u64
+      W_LIVE_ARENA = 24_u64
+      W_LIVE_PENDING = 32_u64
+      W_LAST_TYPE = 40_u64
+      W_LAST_ENTRY = 48_u64
+      W_BLACK = 56_u64
+      W_SINCE = 64_u64
+
+      # The pool: a lock word, the batch list's head, the bump region and its
+      # cursor, the count of workers holding work, and the generation the
+      # helpers wake on — each on a line of its own in one mapping.
+      @@pool : UInt64 = 0_u64
+      POOL_LOCK = 0_u64
+      POOL_HEAD = 64_u64
+      POOL_REGION_BASE = 128_u64
+      POOL_CURSOR = 192_u64
+      POOL_ACTIVE = 256_u64
+      POOL_GENERATION = 320_u64
+      POOL_HELPERS_DONE = 384_u64
+      POOL_ASKED = 448_u64
+      POOL_READY = 512_u64
+
+      # Helpers: how many the collector may use besides itself, how many
+      # exist, and the threshold under which a mark runs alone — waking
+      # fifteen threads to mark a hundred kilobytes costs more than the
+      # marking, and the last mark's live bytes are the estimate.
+      @@workers : UInt64 = 0_u64
+      @@helpers : UInt64 = 0_u64
+      @@helpers_wanted : UInt64 = 0_u64
+      @@helpers_decided : Bool = false
+      @@workers_set : Bool = false
+      @@last_marked : UInt64 = 0_u64
+      PARALLEL_FROM = 1048576_u64
 
       # What the last sweep reclaimed and kept, and how many collections have
       # run. Literal initializers, so codegen folds them to a static zero the
@@ -2163,31 +2216,172 @@ require "./file"
         IyiHeap.write64(base - 8_u64, (word - (word & COLOUR)) | colour)
       end
 
-      def self.queue_reserve : Nil
-        return if @@queue_len < @@queue_words
-        words = @@queue_words == 0 ? 512_u64 : @@queue_words * 2_u64
-        fresh = __iyi_mmap(words * 8_u64).address
-        IyiRoots.fatal("iyi: the mark queue could not grow\n") if fresh == 0
-        moved = 0_u64
-        while moved < @@queue_len
-          IyiHeap.write64(fresh + moved * 8_u64, IyiHeap.read64(@@queue + moved * 8_u64))
-          moved = moved + 1_u64
-        end
-        __iyi_munmap(@@queue, @@queue_words * 8_u64) if @@queue != 0
-        @@queue = fresh
-        @@queue_words = words
+      def self.pool : UInt64
+        @@pool = __iyi_mmap(4096_u64).address if @@pool == 0
+        @@pool
       end
 
-      # Gray it and enqueue it, once. A base that is already gray or black has
-      # been claimed, and enqueuing it again would scan it twice and, on a
-      # cycle, never stop.
-      def self.shade(base : UInt64) : Nil
+      def self.pool_word(offset : UInt64) : Pointer(Atomic(UInt64))
+        Pointer(Atomic(UInt64)).new(pool + offset)
+      end
+
+      def self.pool_lock : Nil
+        word = pool_word(POOL_LOCK)
+        while !word.value.compare_and_set(0_u64, 1_u64)[1]
+        end
+      end
+
+      def self.pool_unlock : Nil
+        pool_word(POOL_LOCK).value.set(0_u64)
+      end
+
+      # A batch's words, from the bump region; the region is reset when a
+      # mark begins, so a collection's batches are gone with it.
+      def self.new_batch : UInt64
+        base = IyiHeap.read64(pool + POOL_REGION_BASE)
+        if base == 0
+          base = __iyi_mmap(POOL_REGION).address
+          IyiHeap.write64(pool + POOL_REGION_BASE, base)
+          IyiHeap.write64(pool + POOL_CURSOR, base)
+        end
+        cursor = IyiHeap.read64(pool + POOL_CURSOR)
+        IyiRoots.fatal("iyi: the marker's pool region is full\n") if cursor + BATCH_WORDS * 8_u64 > base + POOL_REGION
+        IyiHeap.write64(pool + POOL_CURSOR, cursor + BATCH_WORDS * 8_u64)
+        cursor
+      end
+
+      # This thread's worker page and stack, mapped on first use.
+      def self.worker : UInt64
+        w = @@worker
+        if w == 0
+          w = __iyi_mmap(4096_u64).address
+          IyiHeap.write64(w + W_STACK, __iyi_mmap(STACK_WORDS * 8_u64).address)
+          @@worker = w
+        end
+        w
+      end
+
+      # Onto this worker's stack — and, with helpers, work shared where it
+      # helps: a stack past SPILL_AT spills its top; a stack of any depth
+      # donates its *bottom* half when the pool is empty and a worker is
+      # idle, because a depth-first mark of a tree keeps a stack as deep
+      # as the tree and no deeper (the oldest entries are the widest
+      # subtrees), and a marker that only spilled a full stack never
+      # shared a tree at all — measured, fifteen helpers idle through
+      # binary trees.
+      def self.push(w : UInt64, base : UInt64) : Nil
+        len = IyiHeap.read64(w + W_LEN)
+        if @@workers > 1_u64
+          if len >= SPILL_AT
+            spill(w)
+            len = IyiHeap.read64(w + W_LEN)
+          else
+            # A donation at most every DONATE_EVERY pushes: the first cut
+            # of this gave half of an eight-entry stack on every push to
+            # fifteen idle helpers, a million nodes in eight-entry batches
+            # through one lock, and the mark took twice as long as alone.
+            since = IyiHeap.read64(w + W_SINCE) + 1_u64
+            if since >= DONATE_EVERY && len >= 2_u64 && IyiHeap.read64(pool + POOL_HEAD) == 0 && pool_word(POOL_ACTIVE).value.get < @@workers
+              donate(w)
+              len = IyiHeap.read64(w + W_LEN)
+              since = 0_u64
+            end
+            IyiHeap.write64(w + W_SINCE, since)
+          end
+        end
+        IyiRoots.fatal("iyi: a mark worker's stack overflowed\n") if len >= STACK_WORDS
+        IyiHeap.write64(IyiHeap.read64(w + W_STACK) + len * 8_u64, base)
+        IyiHeap.write64(w + W_LEN, len + 1_u64)
+      end
+
+      DONATE_EVERY = 256_u64
+
+      # BATCH entries off the top of this stack into the pool.
+      def self.spill(w : UInt64) : Nil
+        stack = IyiHeap.read64(w + W_STACK)
+        len = IyiHeap.read64(w + W_LEN) - BATCH
+        publish(stack + len * 8_u64, BATCH)
+        IyiHeap.write64(w + W_LEN, len)
+      end
+
+      # The bottom half of this stack into the pool, the rest shifted down.
+      def self.donate(w : UInt64) : Nil
+        stack = IyiHeap.read64(w + W_STACK)
+        len = IyiHeap.read64(w + W_LEN)
+        give = len.unsafe_div(2_u64)
+        give = BATCH if give > BATCH
+        publish(stack, give)
+        rest = len - give
+        index = 0_u64
+        while index < rest
+          IyiHeap.write64(stack + index * 8_u64, IyiHeap.read64(stack + (give + index) * 8_u64))
+          index = index + 1_u64
+        end
+        IyiHeap.write64(w + W_LEN, rest)
+      end
+
+      # `count` entries from `from` as one batch on the pool. A batch's
+      # first word links it, its second says how many it holds.
+      def self.publish(from : UInt64, count : UInt64) : Nil
+        pool_lock
+        batch = new_batch
+        IyiHeap.write64(batch + 8_u64, count)
+        index = 0_u64
+        while index < count
+          IyiHeap.write64(batch + 16_u64 + index * 8_u64, IyiHeap.read64(from + index * 8_u64))
+          index = index + 1_u64
+        end
+        IyiHeap.write64(batch, IyiHeap.read64(pool + POOL_HEAD))
+        IyiHeap.write64(pool + POOL_HEAD, batch)
+        pool_unlock
+      end
+
+      # A batch from the pool onto this stack; false when the pool is empty.
+      def self.take_batch(w : UInt64) : Bool
+        return false if IyiHeap.read64(pool + POOL_HEAD) == 0
+        pool_lock
+        batch = IyiHeap.read64(pool + POOL_HEAD)
+        if batch == 0
+          pool_unlock
+          return false
+        end
+        IyiHeap.write64(pool + POOL_HEAD, IyiHeap.read64(batch))
+        pool_unlock
+        stack = IyiHeap.read64(w + W_STACK)
+        len = IyiHeap.read64(w + W_LEN)
+        count = IyiHeap.read64(batch + 8_u64)
+        index = 0_u64
+        while index < count
+          IyiHeap.write64(stack + (len + index) * 8_u64, IyiHeap.read64(batch + 16_u64 + index * 8_u64))
+          index = index + 1_u64
+        end
+        IyiHeap.write64(w + W_LEN, len + count)
+        true
+      end
+
+      # Gray, if it was white, and onto this worker's stack. Alone, a plain
+      # store; with helpers, one compare-and-swap on the colour bits so two
+      # workers that reach an object from two parents agree on who queues
+      # it. Everything above the colour rides along unchanged.
+      def self.shade(w : UInt64, base : UInt64) : Nil
         return if base == 0
-        return if colour(base) != WHITE
-        recolour(base, GRAY)
-        queue_reserve
-        IyiHeap.write64(@@queue + @@queue_len * 8_u64, base)
-        @@queue_len = @@queue_len + 1_u64
+        word = IyiHeap.read64(base - 8_u64)
+        return if word & COLOUR != WHITE
+        if @@workers > 1_u64
+          word_pointer = Pointer(Atomic(UInt64)).new(base - 8_u64)
+          while !word_pointer.value.compare_and_set(word, word | GRAY)[1]
+            word = word_pointer.value.get
+            return if word & COLOUR != WHITE
+          end
+        else
+          IyiHeap.write64(base - 8_u64, word | GRAY)
+        end
+        push(w, base)
+      end
+
+      # The root visitor's shade: onto the collecting thread's stack.
+      def self.shade(base : UInt64) : Nil
+        shade(@@collector_worker, base)
       end
 
       # The table's address, read from the symbol once. Zero after the read
@@ -2209,8 +2403,16 @@ require "./file"
       # The entry's address for a type id, or zero: zero id, no table, and
       # an id the table does not carry all answer zero, and every zero means
       # the same thing to `scan` — word-scan conservatively.
-      def self.layout_entry(type_id : UInt64) : UInt64
+      def self.layout_entry(w : UInt64, type_id : UInt64) : UInt64
         return 0_u64 if type_id == 0
+        return IyiHeap.read64(w + W_LAST_ENTRY) if type_id == IyiHeap.read64(w + W_LAST_TYPE)
+        entry = layout_search(type_id)
+        IyiHeap.write64(w + W_LAST_TYPE, type_id)
+        IyiHeap.write64(w + W_LAST_ENTRY, entry)
+        entry
+      end
+
+      def self.layout_search(type_id : UInt64) : UInt64
         table = layouts_table
         return 0_u64 if table == 0
         low = 0_u64
@@ -2241,16 +2443,16 @@ require "./file"
       # size rather than the chunk's: the bytes past the request belong to
       # the caller only through a later realloc, and scanning them would
       # read whatever the last owner left.
-      def self.scan(base : UInt64) : Nil
+      def self.scan(w : UInt64, base : UInt64) : Nil
         type_id = IyiHeap.read64(base - 16_u64) & 0xFFFFFFFF_u64
-        entry = layout_entry(type_id)
+        entry = layout_entry(w, type_id)
         if entry == 0
           unless IyiHeap.read64(base - 8_u64) & IyiHeap::ATOMIC_FLAG != 0
             size = IyiHeap.read64(base - IyiHeap::HEADER)
             cursor = base
             limit = base + size
             while cursor + 8_u64 <= limit
-              shade(IyiRoots.base_of(IyiHeap.read64(cursor)))
+              shade(w, IyiRoots.base_of(IyiHeap.read64(cursor)))
               cursor = cursor + 8_u64
             end
           end
@@ -2261,36 +2463,258 @@ require "./file"
           index = 0_u64
           while index < remaining
             offset = IyiHeap.read64(offsets + index * 8_u64)
-            shade(IyiRoots.base_of(IyiHeap.read64(base + offset)))
+            shade(w, IyiRoots.base_of(IyiHeap.read64(base + offset)))
             index = index + 1_u64
           end
         end
-        recolour(base, BLACK)
-        IyiHeap.count_live(base)
+        # Black, by a plain store: only the worker that grayed it holds it,
+        # and every other worker's write to this word is a compare-and-swap
+        # that fails on anything but white.
+        word = IyiHeap.read64(base - 8_u64)
+        IyiHeap.write64(base - 8_u64, (word - (word & COLOUR)) | BLACK)
+        IyiHeap.write64(w + W_BYTES, IyiHeap.read64(w + W_BYTES) + IyiHeap.read64(base - IyiHeap::HEADER))
+        count_live(w, base)
+      end
+
+      # One more live object in its arena, folded per worker: consecutive
+      # objects are mostly one arena's, so the shared add happens on the
+      # arena change rather than per object.
+      def self.count_live(w : UInt64, base : UInt64) : Nil
+        arena = IyiHeap.arena_of(base)
+        return if arena == 0
+        if arena != IyiHeap.read64(w + W_LIVE_ARENA)
+          flush_live(w)
+          IyiHeap.write64(w + W_LIVE_ARENA, arena)
+        end
+        IyiHeap.write64(w + W_LIVE_PENDING, IyiHeap.read64(w + W_LIVE_PENDING) + 1_u64)
+      end
+
+      def self.flush_live(w : UInt64) : Nil
+        arena = IyiHeap.read64(w + W_LIVE_ARENA)
+        pending = IyiHeap.read64(w + W_LIVE_PENDING)
+        if arena != 0 && pending != 0
+          Pointer(Atomic(UInt64)).new(arena + IyiHeap::OFF_LIVE).value.add(pending)
+        end
+        IyiHeap.write64(w + W_LIVE_PENDING, 0_u64)
+        IyiHeap.write64(w + W_LIVE_ARENA, 0_u64)
       end
 
       # One mark phase. Returns how many objects came out black, which is the
       # live count the exercise checks and the number Stage 6 will sweep
       # against.
+      # One mark phase, on the collecting thread and, when the last mark
+      # found more than PARALLEL_FROM live, on the helpers too. Roots go
+      # gray on this thread's stack; the drain is every worker's. Returns
+      # how many objects this thread blackened, the number the exercises
+      # check when they run alone.
       def self.mark : UInt64
-        @@queue_len = 0_u64
+        w = worker
+        @@collector_worker = w
+        IyiHeap.write64(w + W_LEN, 0_u64)
+        IyiHeap.write64(w + W_BYTES, 0_u64)
         @@bytes_marked = 0_u64
         arena = IyiHeap.first_arena
         while arena != 0
           IyiHeap.arena_live_reset(arena)
           arena = IyiHeap.arena_next(arena)
         end
-        IyiRoots.each_root(->(base : UInt64) { shade(base) })
-        black = 0_u64
-        while @@queue_len > 0_u64
-          @@queue_len = @@queue_len - 1_u64
-          base = IyiHeap.read64(@@queue + @@queue_len * 8_u64)
-          scan(base)
-          @@bytes_marked = @@bytes_marked + IyiHeap.read64(base - IyiHeap::HEADER)
-          black = black + 1_u64
+        IyiHeap.write64(pool + POOL_HEAD, 0_u64)
+        IyiHeap.write64(pool + POOL_CURSOR, IyiHeap.read64(pool + POOL_REGION_BASE))
+        # Helpers by the work: one per MiB the last mark found live, up to
+        # the number wanted — fifteen helpers on a three-MiB heap spent
+        # the mark waking, contending for the pool and detecting the end
+        # (94 ms across binary trees against 47 with three), and a large
+        # live set is where they pay.
+        helpers = @@last_marked.unsafe_div(PARALLEL_FROM)
+        helpers = @@helpers_wanted if helpers > @@helpers_wanted
+        if helpers > 0_u64
+          start_helpers(helpers)
+          helpers = @@helpers if @@helpers < helpers
         end
+        @@workers = helpers + 1_u64
+        IyiHeap.write64(pool + POOL_ASKED, helpers)
+        @@helper_black = 0_u64
+        pool_word(POOL_ACTIVE).value.set(@@workers)
+        pool_word(POOL_HELPERS_DONE).value.set(0_u64)
+        IyiRoots.each_root(->(base : UInt64) { shade(base) })
+        # The helpers wake on the generation; from here every worker runs
+        # the same drain, this thread included.
+        if helpers > 0_u64
+          pool_word(POOL_GENERATION).value.add(1_u64)
+          wake_helpers
+        end
+        black = drain(w)
+        # Every helper that exists has answered the generation — the asked
+        # ones having left the drain and folded their accounts — before
+        # this thread reads them or turns the generation again.
+        while pool_word(POOL_HELPERS_DONE).value.get < (helpers > 0_u64 ? @@helpers : 0_u64)
+          spin_pause
+        end
+        @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
+        @@last_marked = @@bytes_marked
+        @@workers = 0_u64
         black
       end
+
+      # The drain: pop and scan until this stack and the pool are both empty
+      # and no worker holds work. A worker counts itself out of ACTIVE when
+      # it has nothing, back in when the pool has something, and the mark
+      # is over at zero with an empty pool — a batch is always published
+      # before its publisher could count out, so a spinner that sees zero
+      # and an empty pool has seen every batch there will be.
+      def self.drain(w : UInt64) : UInt64
+        black = 0_u64
+        stack = IyiHeap.read64(w + W_STACK)
+        active = pool_word(POOL_ACTIVE)
+        while true
+          while (len = IyiHeap.read64(w + W_LEN)) > 0_u64
+            len = len - 1_u64
+            IyiHeap.write64(w + W_LEN, len)
+            scan(w, IyiHeap.read64(stack + len * 8_u64))
+            black = black + 1_u64
+          end
+          next if take_batch(w)
+          active.value.sub(1_u64)
+          while true
+            if IyiHeap.read64(pool + POOL_HEAD) != 0
+              active.value.add(1_u64)
+              break
+            end
+            if active.value.get == 0_u64
+              flush_live(w)
+              return black
+            end
+            spin_pause
+          end
+        end
+      end
+
+      # ── Helpers ─────────────────────────────────────────────────────────
+
+      # How many helpers a mark may use. Set before the first collection;
+      # the default is the core count less one, capped at fifteen, and 0
+      # marks alone.
+      def self.workers=(count : UInt64) : Nil
+        @@helpers_wanted = count
+        @@workers_set = true
+      end
+
+      def self.workers : UInt64
+        @@helpers_wanted
+      end
+
+      # A spin's breath: the CPU's pause hint, no syscall.
+      def self.spin_pause : Nil
+        {% if flag?(:x86_64) %}
+          asm("pause" :::: "volatile")
+        {% else %}
+          asm("yield" :::: "volatile")
+        {% end %}
+      end
+
+      {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+      def self.default_helpers : UInt64
+        cores = IyiThread.core_count
+        cores = 16_u64 if cores > 16_u64
+        cores > 1_u64 ? cores - 1_u64 : 0_u64
+      end
+
+      # Helpers up to `count`, and every one of them at its park before
+      # this returns: a helper that read the generation after it turned
+      # would sleep through the mark, and the collector waits for every
+      # helper to answer a generation it turned.
+      def self.start_helpers(count : UInt64) : Nil
+        while @@helpers < count
+          IyiThread.start_helper(helper_entry, @@helpers)
+          @@helpers = @@helpers + 1_u64
+        end
+        while pool_word(POOL_READY).value.get < @@helpers
+          spin_pause
+        end
+      end
+
+      def self.helper_entry : UInt64
+        proc = ->(index : UInt64) { IyiMark.helper_main(index) }
+        Pointer(UInt64).new(pointerof(proc).address).value
+      end
+
+      # A helper's whole life: park on the generation, drain, fold its
+      # accounts, count itself done, park again.
+      def self.helper_main(index : UInt64) : Nil
+        w = worker
+        seen = pool_word(POOL_GENERATION).value.get
+        pool_word(POOL_READY).value.add(1_u64)
+        while true
+          seen = wait_generation(seen)
+          # Not every helper is asked every time: one whose index is past
+          # this mark's count counts itself done and parks again.
+          if index < IyiHeap.read64(pool + POOL_ASKED)
+            IyiHeap.write64(w + W_LEN, 0_u64)
+            IyiHeap.write64(w + W_BYTES, 0_u64)
+            IyiHeap.write64(w + W_BLACK, drain(w))
+            fold_helper(w)
+          end
+          pool_word(POOL_HELPERS_DONE).value.add(1_u64)
+        end
+      end
+
+      # A helper's bytes into the collection's, under the pool lock; its
+      # per-arena counts were flushed by the drain.
+      def self.fold_helper(w : UInt64) : Nil
+        pool_lock
+        @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
+        @@helper_black = @@helper_black + IyiHeap.read64(w + W_BLACK)
+        pool_unlock
+      end
+
+      # Objects the helpers blackened in the last mark: zero means the
+      # helpers were woken and found nothing to share, which
+      # `bench/parallel_mark.sh` refuses.
+      def self.helper_black : UInt64
+        @@helper_black
+      end
+
+      @@helper_black : UInt64 = 0_u64
+
+      {% if flag?(:linux) %}
+        def self.wait_generation(seen : UInt64) : UInt64
+          word = pool_word(POOL_GENERATION)
+          while (now = word.value.get) == seen
+            __iyi_conc_syscall6(IYI_SYS_FUTEX, (pool + POOL_GENERATION).to_i64, IYI_FUTEX_WAIT, seen.to_i64, 0_i64, 0_i64, 0_i64)
+          end
+          now
+        end
+
+        def self.wake_helpers : Nil
+          __iyi_conc_syscall6(IYI_SYS_FUTEX, (pool + POOL_GENERATION).to_i64, IYI_FUTEX_WAKE, 1000000_i64, 0_i64, 0_i64, 0_i64)
+        end
+      {% else %}
+        # darwin has no futex: a helper spins on the generation with a
+        # yield between reads, which costs no name on the floor.
+        def self.wait_generation(seen : UInt64) : UInt64
+          word = pool_word(POOL_GENERATION)
+          while (now = word.value.get) == seen
+            IyiThread.yield_cpu
+          end
+          now
+        end
+
+        def self.wake_helpers : Nil
+        end
+      {% end %}
+      {% else %}
+        # No kernel thread on this target (x86_64 darwin): the mark runs
+        # alone and asks for no helper.
+        def self.default_helpers : UInt64
+          0_u64
+        end
+
+        def self.start_helpers(count : UInt64) : Nil
+        end
+
+        def self.wake_helpers : Nil
+        end
+      {% end %}
 
       # Put every live object back to white, so a second phase starts from
       # where the first one did. Stage 6 does this as it sweeps, one walk
@@ -2603,6 +3027,10 @@ require "./file"
       end
 
       def self.collect_locked(eager : Bool) : Nil
+        if !@@helpers_decided
+          @@helpers_decided = true
+          @@helpers_wanted = default_helpers unless @@workers_set
+        end
         started = now_ns
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
           others = IyiThread.stop_others

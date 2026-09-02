@@ -102,6 +102,7 @@
       IYI_SYS_TGKILL       = 234_i64
       IYI_SYS_RT_SIGACTION =  13_i64
       IYI_SYS_SCHED_YIELD  =  24_i64
+      IYI_SYS_GETAFFINITY  = 204_i64
       # SA_SIGINFO | SA_RESTORER | SA_RESTART: x86_64 has no vdso
       # trampoline the kernel will pick for a handler's return, so the
       # restorer is named; RESTART so a read a stop interrupts resumes
@@ -123,6 +124,7 @@
       IYI_SYS_TGKILL       = 131_i64
       IYI_SYS_RT_SIGACTION = 134_i64
       IYI_SYS_SCHED_YIELD  = 124_i64
+      IYI_SYS_GETAFFINITY  = 123_i64
       # SA_SIGINFO | SA_RESTART; the vdso supplies the return.
       IYI_SA_FLAGS = 0x10000004_u64
       # uc_flags, uc_link, uc_stack, a sigmask padded to 128, sigcontext
@@ -311,6 +313,7 @@
       fun pipe(fds : Int32*) : Int32
       fun read(fd : Int32, buffer : Void*, count : UInt64) : Int64
       fun write(fd : Int32, buffer : Void*, count : UInt64) : Int64
+      fun sysctlbyname(name : UInt8*, old : Void*, old_size : UInt64*, new : Void*, new_size : UInt64) : Int32
     end
 
     IYI_SIGSTOP_THE_WORLD = 30_i32
@@ -539,6 +542,27 @@
       thread
     end
 
+    # A helper: a kernel thread the collector owns and the stop never
+    # names — a mark worker. No line, no `IyiThread` object, no cache: it
+    # allocates nothing from the heap, runs `entry` with `argument` for
+    # its whole life, and is never joined. Its thread-locals are its own
+    # (a TLS block on Linux, dyld's on darwin), which is what lets the
+    # marker keep per-worker state in `@[ThreadLocal]` variables.
+    def self.start_helper(entry : UInt64, argument : UInt64) : Nil
+      {% if flag?(:linux) %}
+        stack = __iyi_mmap(IYI_THREAD_STACK).address
+        __iyi_conc_syscall3(IYI_SYS_MPROTECT, stack.to_i64, 4096_i64, 0_i64)
+        # The tid word is the stack's guard-side scratch: nobody joins.
+        scratch = __iyi_mmap(4096_u64).address
+        result = __iyi_thread_clone(stack + IYI_THREAD_STACK, entry, argument, scratch, IyiTlsImage.make)
+        raise "clone failed: #{result}" if result < 0
+      {% else %}
+        handle = Pointer(UInt64).malloc(1_u64)
+        result = LibC.pthread_create(handle, Pointer(Void).new(0_u64), Pointer(Void).new(entry), Pointer(Void).new(argument))
+        raise "pthread_create failed: #{result}" if result != 0
+      {% end %}
+    end
+
     # The child's whole life: name its line, find its body on the rooted
     # list, run it, leave the stop's list, and return into the exit the
     # clone asm (or pthread) performs.
@@ -683,6 +707,48 @@
       while word(page + IYI_TC_RESUMED).value.get < others.to_u64
         yield_cpu
       end
+    end
+
+    # The cores this process may run on: what the marker sizes its
+    # helpers by. Linux asks `sched_getaffinity` for the mask and counts
+    # its bits; darwin asks `sysctlbyname("hw.ncpu")` — no new name there,
+    # libSystem's, listed in the floor's darwin set with this as its
+    # reason. The mask lives in a mapping, not the heap: the caller is the
+    # collector, holding the runtime lock inside an allocation, and an
+    # allocation here would refill against that lock and never return.
+    def self.core_count : UInt64
+      {% if flag?(:linux) %}
+        mask = Pointer(UInt64).new(__iyi_mmap(4096_u64).address)
+        got = __iyi_conc_syscall3(IYI_SYS_GETAFFINITY, 0_i64, 128_i64, mask.address.to_i64)
+        return 1_u64 if got <= 0
+        words = got.to_u64.unsafe_div(8_u64)
+        count = 0_u64
+        index = 0_u64
+        while index < words
+          word = (mask + index.to_i64).value
+          while word != 0_u64
+            count = count + (word & 1_u64)
+            word = word.unsafe_shr(1_u64)
+          end
+          index = index + 1_u64
+        end
+        count == 0_u64 ? 1_u64 : count
+      {% else %}
+        value = 0_i64
+        size = 8_u64
+        result = LibC.sysctlbyname("hw.ncpu".to_unsafe, pointerof(value).as(Void*), pointerof(size), Pointer(Void).new(0_u64), 0_u64)
+        return 1_u64 if result != 0 || value <= 0
+        value.to_u64
+      {% end %}
+    end
+
+    # A spin's breath: the CPU's pause hint, no syscall.
+    def self.spin_pause : Nil
+      {% if flag?(:x86_64) %}
+        asm("pause" :::: "volatile")
+      {% else %}
+        asm("yield" :::: "volatile")
+      {% end %}
     end
 
     def self.yield_cpu : Nil
