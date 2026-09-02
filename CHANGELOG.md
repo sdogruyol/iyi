@@ -643,11 +643,12 @@
   names, and the identity floor found the race script calling the
   upstream compiler by its name.** `pthread_create` and `sysctlbyname`
   joined every darwin program with Stage 7 — the collector starts its
-  helpers as kernel threads sized by `hw.ncpu` — and `pipe` joins with
-  Stage 9, whose second stop registers the main thread, and a line's park
-  on darwin is a pipe; the six darwin lists carry the three, the thread
-  floor's runtime list rather than its probe's, and
-  `bench/dependency_floor.sh` says why. `bench/gc_race.py`'s docstring
+  helpers as kernel threads sized by `hw.ncpu` — and `pipe` and
+  `sigaction` join with Stage 9, whose second stop registers the main
+  thread and installs the stop's handler, and a line's park on darwin is
+  a pipe; the seven darwin lists carry the four, the thread floor's
+  runtime list rather than its probe's, and `bench/dependency_floor.sh`
+  says why. `bench/gc_race.py`'s docstring
   said the Boehm arm was what Crystal ships; it is what the upstream
   compiler ships.
 

@@ -148,21 +148,22 @@ case "$(uname -s)" in
     # is a read on a pipe, reachable from the runtime lock's spin in every
     # build the optimiser cannot fold — including the refused variants,
     # which park their own threads differently but carry the runtime's.
-    # `_pipe`, `_pthread_create` and `_sysctlbyname` are the runtime's too:
-    # the parallel marker starts its helpers as kernel threads sized by
-    # `hw.ncpu`, and the concurrent mark's second stop registers the main
-    # thread, whose park is a pipe. The refused variants carry them for the
-    # same reason, so the three sit in the runtime's list, not the probe's.
-    runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pipe _pthread_create _pthread_get_stackaddr_np _pthread_self _read _sysctlbyname _write'
-    thread='__tlv_bootstrap _pthread_join _pthread_kill _pthread_threadid_np _sigaction'
+    # `_pipe`, `_pthread_create`, `_sigaction` and `_sysctlbyname` are the
+    # runtime's too: the parallel marker starts its helpers as kernel
+    # threads sized by `hw.ncpu`, and the concurrent mark's second stop
+    # registers the main thread, whose park is a pipe, installing the
+    # stop's handler. The refused variants carry them for the same reason,
+    # so the four sit in the runtime's list, not the probe's.
+    runtime='___error __dyld_get_image_header __dyld_get_image_vmaddr_slide _clock_gettime_nsec_np _exit _kevent _kqueue _mmap _munmap _pipe _pthread_create _pthread_get_stackaddr_np _pthread_self _read _sigaction _sysctlbyname _write'
+    thread='__tlv_bootstrap _pthread_join _pthread_kill _pthread_threadid_np'
     # The refused parks: the lock's two calls in place of `pipe` and `read`,
     # and `sigsuspend` alone in their place. The Mach stop swaps the stop
     # and park names for four of its own:
     #   pthread_mach_thread_np                       the thread's port
     #   thread_suspend, thread_resume                the stop
     #   thread_get_state                             the registers, read held
-    park_lock='__tlv_bootstrap _os_unfair_lock_lock _os_unfair_lock_unlock _pthread_join _pthread_kill _pthread_threadid_np _sigaction'
-    park_sigsuspend='__tlv_bootstrap _pthread_join _pthread_kill _pthread_threadid_np _sigaction _sigsuspend'
+    park_lock='__tlv_bootstrap _os_unfair_lock_lock _os_unfair_lock_unlock _pthread_join _pthread_kill _pthread_threadid_np'
+    park_sigsuspend='__tlv_bootstrap _pthread_join _pthread_kill _pthread_threadid_np _sigsuspend'
     mach='__tlv_bootstrap _pthread_join _pthread_mach_thread_np _pthread_threadid_np _thread_get_state _thread_resume _thread_suspend'
     printf '%s\n' $runtime $thread | LC_ALL=C sort > expected-floor.txt
     printf '%s\n' $runtime $thread | LC_ALL=C sort > expected-floor-release.txt
