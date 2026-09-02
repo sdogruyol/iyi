@@ -234,10 +234,28 @@ own copy and its own tid in its own slot for the whole run, the main
 thread's slot survived them all, and dropping the one flag bit — the
 driver's failure proof — makes every thread share the main thread's
 block and the program name the clash. So a thread-local class variable
-is the mechanism, and the runtime's cutover is a spelling: the
-scheduler's current fiber, run queue and poller become `@[ThreadLocal]`
-per scheduler thread, and the allocator's fast path becomes per-thread
-state with the shared arena list behind the atomics. The other absence
+is the mechanism, and the runtime's cutover is a spelling — but not the
+one this paragraph first wrote. Every scheduler field its own
+`@[ThreadLocal]` costs a `noinline` accessor call per field per entry
+(the touch line above: three times a class variable's), and it puts the
+run queue's head in a TLS block the root walk cannot see. **The
+scheduler is cut over now, the other way:** every field lives on one
+`IyiSchedulerState` — the running fiber, the run queue, the sleep and io
+lists, the poller and its buffer — and one `@[ThreadLocal]` pointer
+names the thread's own, Go's `g`. An entry pays one accessor, then
+plain loads; the object roots itself the way the fibers do, on a global
+list every state is linked to when it is made, so the walk that scans
+the image's data reaches it and the thread-local is a cache of a
+pointer the globals already hold. `bench/collect_trigger.sh` holds
+that: the state lives through 64 triggered collections with nothing on
+the stack naming it, and the proof unlinks the list and reads the
+sweep's own free flag off the chunk. The price, measured by
+`bench/defer_cost.sh` (a `defer` reaches `IyiScheduler.current` twice):
+about 8 ns per defer against about 5, the accessor's two calls, and
+one `mrs TPIDR_EL0`/`%fs:` load in the whole scheduler where there were
+none. The allocator's fast path is the half not yet cut over: it becomes
+per-thread state with the shared arena list behind the atomics, and it
+waits for the thread that will contend for it. The other absence
 is closed: the prelude has `Atomic(T)` now (`src/iyi/atomic.iyi`, SPEC.md
 III.4.10), built for the probe as its first caller and gated by it —
 `get`, `set`, `add`, `sub`, `swap`, `compare_and_set` on the four

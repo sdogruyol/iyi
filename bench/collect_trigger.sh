@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The allocation-pressure trigger, driven. Runs the trigger exercise plain
 # and optimised, checks it reached its last line, and proves the checks fail
-# in the two directions that matter: a heap where nothing triggers, and a
-# budget that never grows with the live set.
+# in the directions that matter: a heap where nothing triggers, a budget
+# that never grows with the live set, mappings that never go back, and a
+# scheduler state left off the list that roots it.
 #
 #   bash bench/collect_trigger.sh
 #
@@ -87,10 +88,11 @@ fi
 echo
 echo "== the checks fail when the trigger is broken"
 prove_fails() {
-  local label="$1" dir="$2" phrase="$3" script="$4"
+  # $5 names the prelude file the awk program rewrites; prelude.iyi unless said.
+  local label="$1" dir="$2" phrase="$3" script="$4" file="${5:-prelude.iyi}"
   mkdir -p "$WORK/$dir/iyi"
   cp -R "$REPO/src/iyi/." "$WORK/$dir/iyi/"
-  awk "$script" "$REPO/src/iyi/prelude.iyi" > "$WORK/$dir/iyi/prelude.iyi"
+  awk "$script" "$REPO/src/iyi/$file" > "$WORK/$dir/iyi/$file"
   if ! IYI_PATH="$WORK/$dir:$REPO/src" "$IYI" build \
        -o "$WORK/$dir/program" "$REPO/bench/collect_trigger.iyi" \
        >"$WORK/$dir/build.log" 2>&1; then
@@ -130,6 +132,12 @@ prove_fails "budget never grows" nogrow "budget:" \
 # back, and the heap is high-water — the check names it.
 prove_fails "mappings never return" noscavenge "scavenge:" \
   '{ sub(/live == 0 && IyiHeap\.release_arena\(previous, arena\)/, "false"); print }'
+
+# The scheduler's state left off the global list: the thread-local still
+# names it, nothing the walk scans does, the churn's own size class takes
+# the chunk back, and the check names what came back in its place.
+prove_fails "scheduler state unrooted" unrooted "scheduler state:" \
+  '{ sub(/@@states_head = state/, "@@states_head = nil"); print }' concurrency.iyi
 
 echo
 if [ "$status" -eq 0 ]; then

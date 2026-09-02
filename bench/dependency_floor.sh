@@ -73,7 +73,12 @@ trap 'rm -rf "$WORK"' EXIT
 # demanded: the arena clears reused chunks with its own clear_block, so no
 # darwin sample references libSystem's memset any more, and an allowlist
 # entry nothing uses is a check without teeth.
-ALLOWED_SYMBOLS_DARWIN="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
+# `_tlv_bootstrap` joined when the scheduler's state moved behind one
+# `@[ThreadLocal]` pointer (concurrency.iyi, GC_DESIGN.md's thread cutover):
+# Mach-O has no local-exec, so every thread-local descriptor names dyld's
+# thunk, and every darwin program reaches the scheduler. Linux pays no name
+# for the same variable, which is the thread floor's finding.
+ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
 ALLOWED_SYMBOLS_LINUX="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
 
 # What a program may link. The platform libc only.

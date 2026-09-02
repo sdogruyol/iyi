@@ -526,29 +526,68 @@ end
 # ── The scheduler ──────────────────────────────────────────────────────
 #
 # One run queue, one sleep list, one io list, one poller fd (an epoll on
-# Linux, a kqueue on darwin); every field a
-# class variable with a literal initializer, which is the only global
-# state the language grants (the allocator's own comment says why), and
-# zero meaning "not created yet" throughout.
+# Linux, a kqueue on darwin) — per scheduler thread, and the shape that
+# makes it so is decided here before the second thread exists, because
+# it is a shape the thread floor priced (GC_DESIGN.md). Every field lives
+# on one `IyiSchedulerState`, and one `@[ThreadLocal]` pointer names the
+# thread's own: Go's `g`. The other spelling — every field its own
+# thread-local — costs a `noinline` accessor call per field per entry
+# (the floor measured a thread-local touch at three times a class
+# variable's), and it puts the run queue's head in a TLS block the
+# collector's root walk cannot see. This spelling pays one accessor per
+# entry, and roots itself the way the fibers do: every state ever made is
+# on `@@states_head`, a class variable in the image's data, so the walk
+# that scans the globals reaches it and every fiber it links, and the
+# thread-local is a cache of a pointer the globals already hold. Zero
+# means "not created yet" throughout, as before.
+class IyiSchedulerState
+  property current : IyiFiber?
+  property run_head : IyiFiber?
+  property run_tail : IyiFiber?
+  property sleep_head : IyiFiber?
+  property io_head : IyiFiber?
+  property pollfd : Int64
+  property events : UInt64
+  property next_state : IyiSchedulerState?
+
+  def initialize
+    @pollfd = 0_i64
+    @events = 0_u64
+  end
+end
+
 class IyiScheduler
-  @@current : IyiFiber?
-  @@run_head : IyiFiber?
-  @@run_tail : IyiFiber?
-  @@sleep_head : IyiFiber?
-  @@io_head : IyiFiber?
-  @@pollfd : Int64 = 0_i64
-  @@events : UInt64 = 0_u64
+  @[ThreadLocal]
+  @@state : IyiSchedulerState?
+  @@states_head : IyiSchedulerState?
 
   # How many ready events one poll asks for; the per-event stride is the
   # top-level IYI_POLL_EVENT_BYTES — a 32-byte kevent on darwin, an
   # epoll_event the kernel packs on x86_64 and pads on aarch64.
   EVENTS = 16_i64
 
+  # This thread's state, made on first touch and linked for the roots
+  # before the thread-local names it.
+  def self.state : IyiSchedulerState
+    state = @@state
+    return state if state.is_a?(IyiSchedulerState)
+    state = IyiSchedulerState.new
+    state.next_state = @@states_head
+    @@states_head = state
+    @@state = state
+    state
+  end
+
+  def self.first_state : IyiSchedulerState?
+    @@states_head
+  end
+
   def self.current : IyiFiber
-    fiber = @@current
+    state = self.state
+    fiber = state.current
     return fiber if fiber.is_a?(IyiFiber)
     main = IyiFiber.main
-    @@current = main
+    state.current = main
     register(main)
     main
   end
@@ -572,10 +611,12 @@ class IyiScheduler
   end
 
   # The running fiber's stack top, 0 when it is the main fiber (or no
-  # fiber exists yet): the thread stack's base is the root walk's own
-  # discovery, not this file's.
+  # fiber has run yet). Read without making anything: the collector asks
+  # this from inside a collection.
   def self.current_stack_top : UInt64
-    fiber = @@current
+    state = @@state
+    return 0_u64 if state.is_a?(Nil)
+    fiber = state.current
     return 0_u64 if fiber.is_a?(Nil)
     fiber.stack_top
   end
@@ -594,20 +635,22 @@ class IyiScheduler
   def self.enqueue(fiber : IyiFiber) : Nil
     fiber.state = 1
     fiber.next_run = nil
-    tail = @@run_tail
+    state = self.state
+    tail = state.run_tail
     if tail.is_a?(IyiFiber)
       tail.next_run = fiber
     else
-      @@run_head = fiber
+      state.run_head = fiber
     end
-    @@run_tail = fiber
+    state.run_tail = fiber
   end
 
   def self.dequeue : IyiFiber?
-    head = @@run_head
+    state = self.state
+    head = state.run_head
     return nil unless head.is_a?(IyiFiber)
-    @@run_head = head.next_run
-    @@run_tail = nil if @@run_head.is_a?(Nil)
+    state.run_head = head.next_run
+    state.run_tail = nil if state.run_head.is_a?(Nil)
     head.next_run = nil
     head
   end
@@ -631,7 +674,7 @@ class IyiScheduler
     previous = current
     fiber.state = 0
     return if fiber.sp_slot.address == previous.sp_slot.address
-    @@current = fiber
+    state.current = fiber
     __iyi_ctx_swap(previous.sp_slot, fiber.sp_slot)
   end
 
@@ -673,7 +716,7 @@ class IyiScheduler
     # One waiter per fd: the poller keys the wakeup by fd, so a second
     # fiber on the same fd would take the first one's event. Refused
     # loudly rather than raced quietly.
-    scan = @@io_head
+    scan = state.io_head
     while scan.is_a?(IyiFiber)
       raise "two fibers waiting on one fd" if scan.wait_fd == fd
       scan = scan.next_io
@@ -706,8 +749,8 @@ class IyiScheduler
 
     fiber.wait_fd = fd
     fiber.state = 3
-    fiber.next_io = @@io_head
-    @@io_head = fiber
+    fiber.next_io = state.io_head
+    state.io_head = fiber
     reschedule
     return Cancelled.new if fiber.cancelled
     nil
@@ -750,8 +793,8 @@ class IyiScheduler
   # ── The poller ───────────────────────────────────────────────────────
 
   def self.wait_for_events : Nil
-    sleep_head = @@sleep_head
-    if @@io_head.is_a?(Nil) && sleep_head.is_a?(Nil)
+    sleep_head = state.sleep_head
+    if state.io_head.is_a?(Nil) && sleep_head.is_a?(Nil)
       raise "deadlock: every fiber is blocked and nothing can wake one"
     end
 
@@ -808,10 +851,10 @@ class IyiScheduler
   def self.wake_expired_sleepers : Nil
     now = __iyi_monotonic_ns
     while true
-      head = @@sleep_head
+      head = state.sleep_head
       return unless head.is_a?(IyiFiber)
       return if head.deadline > now
-      @@sleep_head = head.next_sleep
+      state.sleep_head = head.next_sleep
       head.next_sleep = nil
       enqueue(head)
     end
@@ -820,10 +863,10 @@ class IyiScheduler
   # ── Lists ────────────────────────────────────────────────────────────
 
   def self.sleep_insert(fiber : IyiFiber) : Nil
-    head = @@sleep_head
+    head = state.sleep_head
     if head.is_a?(Nil) || head.deadline > fiber.deadline
       fiber.next_sleep = head
-      @@sleep_head = fiber
+      state.sleep_head = fiber
       return
     end
     cursor = head
@@ -839,10 +882,10 @@ class IyiScheduler
   end
 
   def self.sleep_remove(fiber : IyiFiber) : Nil
-    head = @@sleep_head
+    head = state.sleep_head
     return unless head.is_a?(IyiFiber)
     if head.sp_slot.address == fiber.sp_slot.address
-      @@sleep_head = head.next_sleep
+      state.sleep_head = head.next_sleep
       fiber.next_sleep = nil
       return
     end
@@ -860,10 +903,10 @@ class IyiScheduler
   end
 
   def self.io_take(fd : Int32) : IyiFiber?
-    head = @@io_head
+    head = state.io_head
     return nil unless head.is_a?(IyiFiber)
     if head.wait_fd == fd
-      @@io_head = head.next_io
+      state.io_head = head.next_io
       io_forget(head)
       return head
     end
@@ -903,7 +946,7 @@ class IyiScheduler
   # ── The poller's fd, lazily ──────────────────────────────────────────
 
   def self.pollfd : Int64
-    fd = @@pollfd
+    fd = state.pollfd
     return fd if fd > 0
     {% if flag?(:darwin) %}
       fd = LibC.kqueue.to_i64
@@ -912,15 +955,15 @@ class IyiScheduler
       fd = __iyi_conc_syscall3(IYI_SYS_EPOLL_CREATE1, 0_i64, 0_i64, 0_i64)
       raise "epoll_create1 failed" if fd < 0
     {% end %}
-    @@pollfd = fd
+    state.pollfd = fd
     fd
   end
 
   def self.events_buffer : UInt64
-    buffer = @@events
+    buffer = state.events
     return buffer if buffer > 0
     buffer = Pointer(UInt8).malloc((EVENTS * IYI_POLL_EVENT_BYTES).to_u64).address
-    @@events = buffer
+    state.events = buffer
     buffer
   end
 

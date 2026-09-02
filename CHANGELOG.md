@@ -340,6 +340,38 @@
   lowers the same instructions to plain loads and stores, so the type is
   on every target and gated on none.
 
+- **The scheduler's state is per thread now, behind one thread-local
+  pointer, and the collector still finds it.** The thread floor's
+  second finding was that the runtime's first cost of threads is the
+  scheduler, the poller and the arena being one thread's class
+  variables, and GC_DESIGN.md wrote the cutover down as a spelling:
+  every field becomes `@[ThreadLocal]`. That spelling was measured
+  before it was written and it lost — a `noinline` accessor per field
+  per entry (the floor's touch line: three times a class variable's),
+  and the run queue's head in a TLS block the root walk never scans.
+  The scheduler is cut over the other way: `IyiSchedulerState`
+  (`src/iyi/concurrency.iyi`) holds the running fiber, the run queue,
+  the sleep and io lists, the poller and its buffer, and one
+  `@[ThreadLocal]` pointer names the thread's own — Go's `g`. An entry
+  pays one accessor and then plain loads, and every state ever made is
+  linked on a class variable in the image's data, so the walk that
+  scans the globals reaches it and the thread-local is a cache of a
+  pointer the globals already hold. `bench/collect_trigger.sh` holds
+  that as its own check: the state's address and its main fiber's are
+  taken XOR'd with a key in a frame of their own, 64 MiB of churn runs
+  64 collections, and the chunk must not carry the sweep's free flag
+  — the proof unlinks the list and the flag is set after 8. The price:
+  `bench/defer_cost.sh` reads about 8 ns per defer where it read about
+  5, a `defer` being two `IyiScheduler.current` calls, and the release
+  binary of the concurrency exercise has one `%fs:`-relative load (one
+  `mrs TPIDR_EL0` on aarch64) where it had none, with no name added on
+  Linux. darwin pays a name, `_tlv_bootstrap` — Mach-O has no
+  local-exec, every thread-local descriptor names dyld's thunk, and
+  every darwin program reaches the scheduler — recorded in the five
+  gates that hold darwin's floor in this commit, by that script's own
+  rule. The allocator's fast path is the half not cut over; it waits
+  for the thread that will contend for it.
+
 ### Fixed
 
 - **The thread floor's x86_64 store clobbered its own value, and the
@@ -3156,7 +3188,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 5,843-line library and nothing else. Every other
+  written against iyi's own 5,886-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

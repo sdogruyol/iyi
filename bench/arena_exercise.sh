@@ -161,7 +161,7 @@ case "$(uname -s)" in
       exit 2
     fi
     ;;
-  *) allowed_symbols="__error _dyld_get_image_header _dyld_get_image_vmaddr_slide clock_gettime clock_gettime_nsec_np exit kevent kqueue mmap munmap pthread_get_stackaddr_np pthread_self write" ;;
+  *) allowed_symbols="__error _tlv_bootstrap _dyld_get_image_header _dyld_get_image_vmaddr_slide clock_gettime clock_gettime_nsec_np exit kevent kqueue mmap munmap pthread_get_stackaddr_np pthread_self write" ;;
 esac
 allowed_libs="libSystem libc.so ld-linux libgcc_s"
 
