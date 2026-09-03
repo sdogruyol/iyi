@@ -553,23 +553,28 @@ a walk holds; a walk that parked through a pause discards its batch as
 the old epoch's; and the scavenge leaves alone an arena that is
 claimed, or walked, or whose mapping a parked walker still names.
 
-The table, read again with all of it in:
+The table, read again with all of it in - the lock-free carve and the
+growth default of 200 included, one run of `bench/gc_race.py` on the
+day the knob landed:
 
 | program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| binary trees | 0.218 s | 29 MB | 0.16 ms | 2.3 ms | 0.171 s | 18 MB | 63 ms | 0.164 s | 17 MB | 0.17 ms | 2.1 ms |
-| live churn | 0.176 s | 171 MB | 0.08 ms | 0.3 ms | 0.148 s | 91 MB | 92 ms | 0.191 s | 115 MB | 0.11 ms | 0.4 ms |
-| churn | 0.051 s | 15 MB | 0.03 ms | 0.3 ms | 0.077 s | 15 MB | 39 ms | 0.078 s | 15 MB | 0.45 ms | 4.1 ms |
+| binary trees | 0.214 s | 30 MB | 0.10 ms | 2.3 ms | 0.164 s | 18 MB | 60 ms | 0.199 s | 17 MB | 0.19 ms | 3.5 ms |
+| live churn | 0.101 s | 216 MB | 0.09 ms | 0.3 ms | 0.145 s | 92 MB | 90 ms | 0.187 s | 130 MB | 0.12 ms | 0.3 ms |
+| churn | 0.047 s | 15 MB | 0.04 ms | 0.4 ms | 0.078 s | 15 MB | 40 ms | 0.074 s | 15 MB | 0.17 ms | 3.8 ms |
 
-Churn's footprint is Go's and Boehm's; binary trees' is within a
+Live churn's RSS moves run to run (216 to 257 MB across four runs of
+the same binary) because the budget is what the last mark found live
+times the growth, and which collection the run ends on decides the
+peak. Churn's footprint is Go's and Boehm's; binary trees' is within a
 budget of Go's (its live set doubles into the next budget the same
 way, and Go's 16-byte node is our 32-byte one, its type id ahead of
-two pointers); live churn's is a budget over Go's, which is the same
-policy applied to a 40 MB live set. The policy is a knob with Go's
-meaning: `IyiMark.growth = percent` is what the program may allocate
-before the next collection, in hundredths of the live set - Go's
-default is 100, iyi's 200, because its collections are concurrent and
-its allocation path is where it pays; at 100 binary trees traded a
+two pointers); live churn's is two budgets over Go's, which is the
+growth default applied to a 40 MB live set. The policy is a knob with
+Go's meaning: `IyiMark.growth = percent` is what the program may
+allocate before the next collection, in hundredths of the live set -
+Go's default is 100, iyi's 200, because its collections are concurrent
+and its allocation path is where it pays; at 100 binary trees traded a
 fifth of its wall time for a smaller peak. What remains is the wall
 time, which is the barrier's test on every pointer store and the
 helpers' share of the cores, and Stage 8's other half: the sweep on
