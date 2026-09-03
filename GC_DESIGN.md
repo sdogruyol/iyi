@@ -657,6 +657,25 @@ runtime lock's spin was a CAS, which takes the line for writing on
 every failed try, so fifteen helpers spinning on it slowed whoever
 held it - it reads first now, and pauses between tries.
 
+**darwin's race, for the record.** The darwin job runs the same
+`bench/gc_race.py` on GitHub's arm64 runner (an M-series machine with
+three cores the parallel mark sees, shared, not a machine to gate on),
+so darwin's numbers are in every log; the run that landed the step,
+release builds, best of five:
+
+| program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| binary trees | 0.227 s | 30 MB | 0.06 ms | 2.1 ms | 0.211 s | 17 MB | 72 ms | 0.205 s | 15 MB | 0.06 ms | 3.7 ms |
+| live churn | 0.102 s | 187 MB | 0.06 ms | 0.3 ms | 0.149 s | 101 MB | 94 ms | 0.176 s | 274 MB | 0.09 ms | 0.2 ms |
+| churn | 0.075 s | 6 MB | 0.04 ms | 1.0 ms | 0.095 s | 3 MB | 35 ms | 0.085 s | 11 MB | 0.07 ms | 5.1 ms |
+
+The same shape as Linux's with three cores in place of twenty: the
+pauses Go's or under on every program, the wall time under both on
+live churn and churn and a tenth behind on binary trees, where three
+cores give the mark one helper and the sweep round two; and live
+churn's footprint under Go's there, whose 274 MB is the same live set
+at Go's own budget on a machine with less memory to spare.
+
 **This machine's cores are not alike, and the race's numbers move
 with placement.** The Ryzen AI 9 465 has four Zen 5 cores and six Zen
 5c: binary trees pinned to one of the first runs 241 ms, to one of the
