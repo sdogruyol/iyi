@@ -876,6 +876,9 @@ jobs:
       # collector, Boehm and Go on this runner, so darwin's numbers are in
       # every log the way Linux's are in GC_DESIGN.md. A shared runner is
       # not a machine to gate on, and this step asserts nothing.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
       - name: The race, for the record (bench/gc_race.py)
         run: python3 bench/gc_race.py
 
