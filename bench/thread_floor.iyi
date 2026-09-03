@@ -686,6 +686,13 @@
     # `sa_mask` (a 32-bit set) and `sa_flags` packed into the second word.
     # SA_SIGINFO is 0x40, in the high half.
     TF_SA_WORD = 0x0000004000000000_u64
+    # The stop handler's word under `-Dtf_park_sigsuspend`: the same, with
+    # SIGUSR2 in `sa_mask` (bit 30 of the low half), so a resume sent
+    # between the handler's count-in and its `sigsuspend` stays pending
+    # until the `sigsuspend` unblocks it, rather than running the empty
+    # resume handler first and leaving the thread parked for good - the
+    # lost wakeup that hung this variant on CI one run in ten.
+    TF_SA_STOP_WORD = 0x0000004040000000_u64
     # The thread's park word on its own line at this offset: the pipe's two
     # descriptors, read end low, write end high; or under -Dtf_park_lock an
     # `os_unfair_lock` (OS_UNFAIR_LOCK_INIT is zero).
@@ -1083,7 +1090,11 @@
       def install_stop_handler : Nil
         action = Pointer(UInt64).malloc(2_u64)
         action[0] = __tf_stop_handler_address
-        action[1] = TF_SA_WORD
+        {% if flag?(:tf_park_sigsuspend) %}
+          action[1] = TF_SA_STOP_WORD
+        {% else %}
+          action[1] = TF_SA_WORD
+        {% end %}
         result = LibC.sigaction(TF_SIGUSR1, action.as(Void*), Pointer(Void).new(0_u64))
         fail("sigaction failed: #{result}") if result != 0
         install_parks(Threads.count)

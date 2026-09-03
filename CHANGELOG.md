@@ -729,6 +729,15 @@
 
 ### Fixed
 
+- **The thread floor's `sigsuspend` variant lost a wakeup on darwin,
+  one CI run in ten.** The stop handler's `sa_mask` was empty, so a
+  resume signal that landed between the handler's count-in and its
+  `sigsuspend` ran the empty resume handler and left the thread parked
+  for good. The variant's stop handler blocks SIGUSR2 now, so the
+  resume stays pending until the `sigsuspend` unblocks it. The variant
+  is still refused - the race was the reason - and now it is refused
+  by measurement rather than by a hang.
+
 - **The pause clock's stamp was one page for every caller.** Linux's
   `now_ns` wrote `clock_gettime`'s timespec into a page of the
   collector's own, shared, and two threads reading the clock at once
