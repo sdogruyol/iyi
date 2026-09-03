@@ -3700,6 +3700,31 @@ require "./file"
       @@collecting : Bool = false
       @@auto : Bool = true
 
+      # The next budget as a percentage of what survived - Go's GOGC,
+      # with the same meaning: what the program may allocate before the
+      # next collection, in hundredths of the live set. Go's default is
+      # 100, a heap twice the live set at its peak; iyi's is 200, a heap
+      # three times it, because its collections are concurrent and its
+      # allocation path is where it pays - at 100, binary trees was 35 MB
+      # resident to 30 for a fifth more wall time. A program sets it
+      # once, the way it sets `workers`.
+      @@growth : UInt64 = 200_u64
+
+      def self.growth=(percent : UInt64) : Nil
+        @@growth = percent
+      end
+
+      def self.growth : UInt64
+        @@growth
+      end
+
+      # The survivors grown by the percentage, floored at MIN_BUDGET so a
+      # small program pays nothing.
+      def self.next_budget(survived : UInt64) : UInt64
+        grown = survived.unsafe_div(100_u64) * @@growth
+        grown < MIN_BUDGET ? MIN_BUDGET : grown
+      end
+
       def self.auto=(value : Bool) : Nil
         @@auto = value
       end
@@ -3826,8 +3851,7 @@ require "./file"
         # knows the live bytes — it added each object's size as it
         # blackened it — which is what lets the sweep be lazy: the budget
         # no longer waits on a sweep to count.
-        doubled = @@bytes_marked * 2_u64
-        @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
+        @@budget = next_budget(@@bytes_marked)
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
           IyiThread.resume_others(others)
         {% end %}
@@ -4021,8 +4045,7 @@ require "./file"
             end
             survived = @@bytes_marked
             IyiHeap.allocated_word.value.set(born)
-            doubled = survived * 2_u64
-            @@budget = doubled < MIN_BUDGET ? MIN_BUDGET : doubled
+            @@budget = next_budget(survived)
             IyiThread.resume_others(others)
             pause = now_ns - started
             IyiHeap.unmap_released

@@ -126,7 +126,7 @@ prove_fails "nothing triggers" notrigger "trigger:" \
 # The budget pinned at the floor: the live set stops mattering, and the same
 # churn buys the same collections either way.
 prove_fails "budget never grows" nogrow "budget:" \
-  '{ sub(/@@budget = doubled < MIN_BUDGET \? MIN_BUDGET : doubled/, "@@budget = MIN_BUDGET"); print }'
+  '{ sub(/@@budget = next_budget\(.*\)/, "@@budget = MIN_BUDGET"); print }'
 
 # The scavenge disabled: sweeps keep reclaiming chunks, mappings never go
 # back, and the heap is high-water — the check names it.

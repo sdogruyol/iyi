@@ -677,7 +677,10 @@
   exercise's price, release: 26 ns an allocation with one thread, 63
   with four, 162 with eight (22, 58, 139 before the pages).
   `IyiHeap.size_of` answers what the header's size word did;
-  `IyiMark.settle` waits out a collection in flight; the arena
+  `IyiMark.settle` waits out a collection in flight; `IyiMark.growth =`
+  is Go's GOGC with Go's meaning, defaulting to 200 where Go's is 100
+  (at 100 binary trees traded a fifth of its wall time for a smaller
+  peak); the arena
   exercise's size-class and header checks say the new shapes. And the
   allocation path lost what it did twice or checked for nothing: codegen
   no longer zeroes an aggregate the clearing entry handed back zeroed,
@@ -3589,7 +3592,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 8,855-line library and nothing else. Every other
+  written against iyi's own 8,878-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

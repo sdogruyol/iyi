@@ -565,9 +565,19 @@ Churn's footprint is Go's and Boehm's; binary trees' is within a
 budget of Go's (its live set doubles into the next budget the same
 way, and Go's 16-byte node is our 32-byte one, its type id ahead of
 two pointers); live churn's is a budget over Go's, which is the same
-policy applied to a 40 MB live set. What remains is the wall time,
-which is the barrier's test on every pointer store and the helpers'
-share of the cores, and Stage 8's other half.
+policy applied to a 40 MB live set. The policy is a knob with Go's
+meaning: `IyiMark.growth = percent` is what the program may allocate
+before the next collection, in hundredths of the live set - Go's
+default is 100, iyi's 200, because its collections are concurrent and
+its allocation path is where it pays; at 100 binary trees traded a
+fifth of its wall time for a smaller peak. What remains is the wall
+time, which is the barrier's test on every pointer store and the
+helpers' share of the cores, and Stage 8's other half: the sweep on
+the helpers rather than the allocating thread, which a first cut found
+wants the mark to tolerate a half-swept arena (the epoch parity in
+every mark word says which colours are stale) - built as a wait for
+walks in flight before the stop, it cost the trigger thread a walk per
+collection and gave nothing back, and was taken out.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are
