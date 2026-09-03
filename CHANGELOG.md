@@ -4,6 +4,39 @@
 
 ### Added
 
+- **The sweep runs beside the program, in slices (GC_DESIGN.md Stage
+  8).** Two measurements decided it, both on release builds: the
+  write barrier, removed by renaming its entry point so codegen emits
+  none, was one percent of binary trees' wall time under a
+  stop-the-world mark - not the gap; the sweep on the allocating
+  thread, timed with `rdtsc` around the allocator's own walks, was a
+  fifth of it (41 ms of 214, with 15 ms the whole gap to Go), a third
+  of live churn's, a fifth of churn's. A sweep is a walk of every chunk
+  header in the heap at memory's speed, once per collection, and the
+  thread that allocates was walking it. Now an arena is swept in 64 KB
+  slices from a cursor it carries: an allocating thread that finds
+  nothing swept for its class takes one slice of an arena of that
+  class, microseconds, and allocates from it; after every collection
+  three of the mark's helpers take slice after slice until nothing is
+  left, handing each slice's batch to the centre as they go. The walk
+  claim is held for a slice, so three helpers share one arena; the
+  cursor is written before anything can stop the writer, so a pause
+  finishes whatever is left from the cursors, and the triggering
+  thread does the same before it stops anything - a half-swept arena
+  wears two epochs' colours, and the mark reads one. Pinned to the
+  fast cores and interleaved, minimum of ten: binary trees 222 ms to
+  199, live churn 102 to 101, churn 52 to 40; the pauses unchanged;
+  the thread exercise's allocation under four threads 99 ns to 104,
+  under thirty-two 19 µs to 10. What the first cut got wrong is
+  recorded with the design: whole arenas on the helpers made the
+  allocating thread wait an arena or carve, helpers woken inside the
+  stop preempted the waker and made a 90 µs pause 1.6 ms, fifteen
+  helpers sweeping cost the allocating thread its core's other half,
+  and a lock on every refill of a class with nothing left made eight
+  threads' allocation 8 µs. `IyiMark.swept_by_helpers` counts the
+  arenas the helpers began; the trigger gate's lazy proof counts them
+  with the allocator's, and its failure proof removes both.
+
 - **The tarball went on the diet its own Learned entry prescribed.** The
   Linux release package used to carry libLLVM and everything libLLVM asks
   for — libedit, libxml2, libicu (icudata above all), libncursesw, libzstd,
@@ -695,6 +728,20 @@
   The exercise names its phases as it runs them now.
 
 ### Fixed
+
+- **The pause clock's stamp was one page for every caller.** Linux's
+  `now_ns` wrote `clock_gettime`'s timespec into a page of the
+  collector's own, shared, and two threads reading the clock at once
+  tore it: a probe that timed the allocator's sweeps from an allocation
+  while helper 0 read the clock under the lock saw time go backwards
+  and died of the subtraction. The runtime's own calls were all under
+  the lock, so no shipped program hit it; the stamp is a struct on the
+  caller's stack now, and the page is gone.
+
+- **The runtime lock's spin was a CAS, and fifteen spinners slowed the
+  holder.** A failed `compare_and_set` still takes the line for
+  writing; the lock reads the word first and pauses between tries, and
+  a `try_lock` exists for a walk that must not park where it stands.
 
 - **A thread carving fresh chunks took the runtime lock on every
   allocation, for nothing to sweep.** With every list dropped at the
@@ -3592,7 +3639,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 8,878-line library and nothing else. Every other
+  written against iyi's own 9,248-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

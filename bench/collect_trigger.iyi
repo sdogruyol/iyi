@@ -178,18 +178,21 @@
     puts "    scheduler's state: the object its thread-local names lived through #{count(state_wave + 1_u64)} collections, rooted by the global list"
   {% end %}
 
-  # 3c. The sweep is the allocator's, not the pause's. Every triggered
-  # collection above marked and returned; the arenas it left behind were
-  # swept by the allocations that needed their chunks. What a pause still
-  # sweeps is the debt an idle class's arena carries into the next one,
-  # and both numbers are printed; the allocator must have swept at least
-  # one arena per collection, or the sweep is not lazy at all — the
-  # driver's proof removes the allocator's sweep and this check names it.
+  # 3c. The sweep is the allocator's and the helpers', not the pause's.
+  # Every triggered collection above marked and returned; the arenas it
+  # left behind were swept by the allocations that needed their chunks,
+  # or by the helpers' round beside them (GC_DESIGN.md Stage 8). What a
+  # pause still sweeps is what neither got to before the next trigger,
+  # and all three numbers are printed; the program's own time must have
+  # begun at least one arena per collection, or the sweep is not lazy at
+  # all — the driver's proof removes the allocator's sweep and this
+  # check names it.
   IyiMark.settle
   swept_lazily = IyiMark.swept_by_allocator
+  swept_beside = IyiMark.swept_by_helpers
   in_pauses = IyiMark.debt_paid_in_pause
-  raise "lazy: #{count(IyiMark.collections)} collections and the allocator swept #{count(swept_lazily)} arenas, so the sweep is not lazy" if swept_lazily < IyiMark.collections
-  puts "    lazy: the allocator swept #{count(swept_lazily)} arenas on its own time, pauses swept #{count(in_pauses)} left over, across #{count(IyiMark.collections)} collections"
+  raise "lazy: #{count(IyiMark.collections)} collections and the allocator swept #{count(swept_lazily)} arenas, the helpers #{count(swept_beside)}, so the sweep is not lazy" if swept_lazily + swept_beside < IyiMark.collections
+  puts "    lazy: the allocator began #{count(swept_lazily)} arenas on its own time, the helpers #{count(swept_beside)} beside it, pauses finished #{count(in_pauses)} left over, across #{count(IyiMark.collections)} collections"
 
   # 4. Pressure on a program that spawns. A fiber holds the only reference
   # to an allocation in its own parked frame while the main fiber's churn

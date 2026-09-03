@@ -13,10 +13,10 @@ after Stage 4's). The heap's footprint follows the live set: a one-word
 header, size classes eight bytes apart, pages handed back to the kernel
 by the sweep and taken up again by the carve, and Go's two answers to
 a mutator outrunning the mark - allocate black, and assist (the section
-after Stage 9's). Stage 8, the sweep beside the program, is half built:
-the allocator's sweeps run outside the runtime lock, in parallel; what
-remains in a stop is the last epoch's debt, paid by the triggering
-thread before its first stop. Stage 10 is design.
+after Stage 9's). Stage 8 is the sweep beside the program: in slices,
+by the helpers after every collection and by an allocating thread only
+for the slice it needs (the section after the footprint's). Stage 10
+is design.
 
 Stage 6: the sweep. One walk over every carved chunk, a white object's chunk
 goes back on its class's free list, a black one survives and is repainted white
@@ -127,8 +127,8 @@ What it does not do yet: Windows and wasm32 keep their existing
 allocators — the first's memory diagnosis now has
 a fixed suspect (the prelude memset's stride) and CI's watch is what retires
 it, the second has no mmap and its watermark arena is a separate design.
-Threads, and with them Stages 4, 7, 8 and 9, wait where the section below
-says they wait.
+Threads, and with them Stages 4, 7, 8 and 9, were waiting when this was
+written; the sections after the next one are their account.
 
 ## What the staging above got wrong, and what the rebase onto 0.6.0 corrected
 
@@ -553,15 +553,19 @@ a walk holds; a walk that parked through a pause discards its batch as
 the old epoch's; and the scavenge leaves alone an arena that is
 claimed, or walked, or whose mapping a parked walker still names.
 
-The table, read again with all of it in - the lock-free carve and the
-growth default of 200 included, one run of `bench/gc_race.py` on the
-day the knob landed:
+The table, read again with all of it in - the lock-free carve, the
+growth default of 200 and Stage 8's slices (the section after this
+one) included, one run of `bench/gc_race.py` on the day the slices
+landed:
 
 | program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| binary trees | 0.214 s | 30 MB | 0.10 ms | 2.3 ms | 0.164 s | 18 MB | 60 ms | 0.199 s | 17 MB | 0.19 ms | 3.5 ms |
-| live churn | 0.101 s | 216 MB | 0.09 ms | 0.3 ms | 0.145 s | 92 MB | 90 ms | 0.187 s | 130 MB | 0.12 ms | 0.3 ms |
-| churn | 0.047 s | 15 MB | 0.04 ms | 0.4 ms | 0.078 s | 15 MB | 40 ms | 0.074 s | 15 MB | 0.17 ms | 3.8 ms |
+| binary trees | 0.202 s | 29 MB | 0.09 ms | 2.1 ms | 0.179 s | 18 MB | 65 ms | 0.214 s | 18 MB | 0.18 ms | 3.3 ms |
+| live churn | 0.131 s | 249 MB | 0.09 ms | 0.4 ms | 0.150 s | 91 MB | 94 ms | 0.204 s | 136 MB | 0.16 ms | 0.5 ms |
+| churn | 0.041 s | 15 MB | 0.03 ms | 0.4 ms | 0.080 s | 15 MB | 40 ms | 0.077 s | 15 MB | 0.17 ms | 3.5 ms |
+
+The wall time is under Go's on all three now and under Boehm's on two;
+the pauses are Go's or under on every program.
 
 Live churn's RSS moves run to run (216 to 257 MB across four runs of
 the same binary) because the budget is what the last mark found live
@@ -575,14 +579,88 @@ Go's meaning: `IyiMark.growth = percent` is what the program may
 allocate before the next collection, in hundredths of the live set -
 Go's default is 100, iyi's 200, because its collections are concurrent
 and its allocation path is where it pays; at 100 binary trees traded a
-fifth of its wall time for a smaller peak. What remains is the wall
-time, which is the barrier's test on every pointer store and the
-helpers' share of the cores, and Stage 8's other half: the sweep on
-the helpers rather than the allocating thread, which a first cut found
-wants the mark to tolerate a half-swept arena (the epoch parity in
-every mark word says which colours are stale) - built as a wait for
-walks in flight before the stop, it cost the trigger thread a walk per
-collection and gave nothing back, and was taken out.
+fifth of its wall time for a smaller peak. What remained was the wall
+time, and the next section measures where it went.
+
+**Stage 8: the sweep beside the program, in slices.** Two
+measurements first, both on this tree's release builds. The barrier:
+a prelude with `__iyi_write_barrier_begin` renamed makes codegen emit
+no barrier at all (binary trees' object carries 26 loads of
+`__iyi_marking`, then 5, the runtime's own), and under a stop-the-world
+mark, where the barrier is only its load and branch, binary trees ran
+239 ms without it against 242 with, live churn 134 against 136, churn
+64 against 63: one percent, not the gap. The sweep on the allocating
+thread, timed with `rdtsc` around the allocator's own walks: 41 ms of
+binary trees' 214 (a fifth), a third of live churn's, a fifth of
+churn's - and binary trees' whole gap to Go was 15 ms. A sweep is a
+walk of every chunk header in the heap, at memory's speed, 1.6 ns a
+chunk; a heap three times the live set is walked once per collection,
+and the thread that allocates was walking it.
+
+The first cut, recorded above as taken out, put whole arenas on the
+helpers and made the allocating thread wait for the first arena's
+batch or carve fresh chunks: it waited a whole arena, or carved, and a
+page faulted in costs what sweeping a hundred chunks does. The shape
+that works sweeps in *slices*: 64 KB of arena from a cursor the arena
+carries (`OFF_SWEEP_CURSOR`, `SWEEP_DONE` past the high water), by
+whoever needs the chunks or has the time. An allocating thread that
+finds nothing swept for its class takes one slice of an arena of that
+class - a few microseconds - and allocates from it; the helpers, after
+every collection, take slice after slice until nothing is left, and
+hand each slice's batch to the centre as they go. The walk claim
+(`OFF_SWEEPING`) is held for one slice, so three helpers are on one
+arena at once and the arena a program churns through is swept three
+times faster; a thread that finds every arena of its class inside
+another's slice spins off the lock for the batch that is microseconds
+away. The cursor is written before anything can stop the writer - a
+mutator is inside the allocator, a helper is counted in - so it is
+accurate whenever no slice is in flight, and a pause takes no claim:
+every thread is stopped where no slice is, and it finishes whatever is
+left from the cursors. The triggering thread does the same before it
+stops anything, under a claim with the lock released for the walk,
+because a half-swept arena wears two epochs' colours and the mark
+reads one; what a thread was inside a slice of at that moment is
+finished under the stop, a slice per thread at most.
+
+The round: opened at a collection's end before the stopped threads are
+released (opened after, the first refill found no round and swept the
+arena it wanted, the largest, itself), woken after the lock is
+released (seven helpers woken inside the stop preempted the waker and
+made a 90 µs pause 1.6 ms - the first cut's other failure), and taken
+by `SWEEP_HELPERS` = 3 of the helpers through permits and a futex wake
+of that many: a sweep outruns an allocating thread's consumption
+tenfold, and fifteen helpers beside binary trees cost it its core's
+other half and ran slower than none. The next collection closes the
+round under the lock and waits out the slices in flight with the lock
+released, since a slice's end wants it. A per-class count of arenas
+with sweeping left, on the centre's page, is the allocator's answer
+without the lock: the first cut of the slices took the lock on every
+refill of a class with nothing left and made eight threads' 269 ns
+allocation 8 µs.
+
+The numbers, release builds, pinned to this machine's four fast cores
+and interleaved, minimum and median of ten: binary trees 222 / 228 ms
+to 199 / 201, live churn 102 / 107 to 101 / 104, churn 52 / 53 to 40
+/ 40. The pauses did not move (binary trees' longest 72 to 105 µs
+with one 278, live churn's 66 to 78, churn's 15). The thread exercise's
+allocation under four threads is 104 ns to the old 99, under eight 282
+to 269, and under thirty-two 10 µs to 19. Two things found on the way:
+the pause clock wrote its timespec into one page shared by every
+caller, and a probe that read it from an allocation while helper 0
+read it under the lock saw time go backwards (the runtime's own calls
+were all under the lock; the stamp is on the stack now); and the
+runtime lock's spin was a CAS, which takes the line for writing on
+every failed try, so fifteen helpers spinning on it slowed whoever
+held it - it reads first now, and pauses between tries.
+
+**This machine's cores are not alike, and the race's numbers move
+with placement.** The Ryzen AI 9 465 has four Zen 5 cores and six Zen
+5c: binary trees pinned to one of the first runs 241 ms, to one of the
+second 358, and an unpinned run lands where the scheduler puts it - so
+do Go's and Boehm's. The tables in this document are unpinned, as a
+person runs a program; the comparisons between builds above were made
+pinned and interleaved, which is the only way two builds' difference
+was readable through it.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are
@@ -1061,7 +1139,7 @@ Each stage is independently verifiable; the tree is never left broken between th
    - After mark phase (all workers idle), start a dedicated sweep thread.
    - Sweep iterates over arenas and chunks; does not hold a lock (or minimal locking).
    - Mutators can allocate from un-swept arenas (using a different free list or bitmap).
-   - Deferred to Stage 8; for now, sweep is brief and happens in the final STW pause.
+   - Built, not as planned: no dedicated thread, but slices of an arena from a cursor, taken by the mark's helpers after every collection and by an allocating thread for the slice it needs (the footprint section's account of Stage 8).
 
 2. **Finalizer Thread:**
    - Finalizers run in a dedicated thread (not in the marking threads, not in mutator threads).

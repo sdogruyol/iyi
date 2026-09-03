@@ -61,11 +61,26 @@ class IyiRuntimeLock
 
   def self.lock : Nil
     word = self.word
-    while !word.value.compare_and_set(0_u64, 1_u64)[1]
+    # Read before the CAS: a failed CAS still takes the line for writing,
+    # and fifteen helpers spinning on one while a collection held it
+    # slowed the holder; a read spins on a shared line.
+    while word.value.get != 0_u64 || !word.value.compare_and_set(0_u64, 1_u64)[1]
       {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
         IyiThread.park_if_requested
       {% end %}
+      {% if flag?(:x86_64) %}
+        asm("pause" :::: "volatile")
+      {% elsif flag?(:aarch64) %}
+        asm("yield" :::: "volatile")
+      {% end %}
     end
+  end
+
+  # One try, no wait and no park: for a walk that must not park where it
+  # stands and has somewhere else to be.
+  def self.try_lock : Bool
+    word = self.word
+    word.value.get == 0_u64 && word.value.compare_and_set(0_u64, 1_u64)[1]
   end
 
   def self.unlock : Nil
@@ -878,6 +893,13 @@ require "./file"
       # walk reads the region's bounds as two words and a pair from two
       # regions could name an uncarved chunk as carved.
       OFF_SWEEPING = 96_u64
+      # Where this epoch's sweep of the arena got to: the next chunk head
+      # to look at, SWEEP_DONE once it reached the high water, accurate
+      # whenever no slice of the arena is in flight.
+      OFF_SWEEP_CURSOR = 104_u64
+      SWEEP_DONE = 0xFFFFFFFFFFFFFFFF_u64
+      # The epoch whose finished sweep of this arena has been counted out.
+      OFF_SWEEP_COUNTED = 112_u64
       OFF_PAGES = 128_u64
       # The frontier is carved a slab at a time, so that a run of pages
       # handed back below it is taken up before the slab after it: the
@@ -1051,6 +1073,23 @@ require "./file"
         Pointer(UInt64).new(@@central)
       end
 
+      # How many arenas of a class have sweeping left this epoch, on the
+      # centre's page past the lists: the allocator's answer without the
+      # lock to whether a slice of the class is worth taking. Written
+      # under the lock, read without it - a stale nonzero takes the lock
+      # and finds nothing, a stale zero carves a chunk a sweep would have
+      # handed back later.
+      SWEEP_LEFT_AT = 256
+
+      def self.sweep_left_of(index : Int32) : UInt64
+        central[SWEEP_LEFT_AT + index]
+      end
+
+      def self.sweep_left_add(index : Int32, delta : Int64) : Nil
+        centre = central
+        centre[SWEEP_LEFT_AT + index] = (centre[SWEEP_LEFT_AT + index].to_i64 + delta).to_u64
+      end
+
       def self.allocated_word : Pointer(Atomic(UInt64))
         Pointer(Atomic(UInt64)).new(central.address + CENTRAL_ALLOCATED)
       end
@@ -1197,11 +1236,30 @@ require "./file"
       def self.refill(table : Pointer(UInt64), index : Int32) : UInt64
         centre = central
         if centre[index] == 0
-          # Nothing swept for this class yet: pay sweep debt, one arena at
-          # a time, until a batch of this class appears or the debt is
-          # gone — the sweep's cost lands on the allocations that need
-          # its chunks rather than inside the pause (GC_DESIGN.md).
-          while centre[index] == 0 && IyiMark.sweep_one
+          # Nothing swept for this class yet: a slice of an arena of the
+          # class, and another, until a batch of the class appears or the
+          # class has nothing left to sweep - the sweep's cost lands on
+          # the allocations that need its chunks rather than inside the
+          # pause (GC_DESIGN.md), and a chunk swept is cheaper than one
+          # carved, a page faulted in costing what a hundred sweep. A
+          # helper inside a slice of the only arena of the class answers
+          # busy: its batch is microseconds away, and the wait is for
+          # that. With helpers at a round the class is named for them.
+          IyiMark.sweep_wanted(index) if IyiMark.helpers_sweeping?
+          chunk = payload(index) + HEADER
+          while centre[index] == 0 && sweep_left_of(index) != 0_u64
+            answer = IyiMark.sweep_one(chunk)
+            break if answer == 0_u64
+            if answer == 2_u64
+              # Every arena of the class is inside another thread's
+              # slice: its batch lands within the slice, microseconds,
+              # and the wait for it is off the lock.
+              spins = 0
+              while centre[index] == 0 && spins < 256
+                IyiMark.spin_pause
+                spins = spins + 1
+              end
+            end
           end
           return 0_u64 if centre[index] == 0
         end
@@ -1243,7 +1301,7 @@ require "./file"
       # A collector that frees chunks but never pages has a resident size
       # that is its high-water mark: binary trees held 6 MB live in 55 MB
       # resident. The sweep hands runs of dead pages back to the kernel
-      # (`sweep_arena` below), and here the carve takes a run up again as
+      # (`sweep_slice` below), and here the carve takes a run up again as
       # its bump region before it maps anything new. A chunk is on a
       # released page when its head is: such a chunk is on no list and is
       # no object, it reads as zero, and the mark, the sweep and the root
@@ -1494,6 +1552,9 @@ require "./file"
         # that followed counted nothing alive in it. The scavenge then
         # handed a mapping full of live objects back to the kernel.
         write64(base + OFF_EPOCH, IyiMark.epoch)
+        # And nothing of it left to sweep: everything carved from it
+        # wears the epoch's parity.
+        write64(base + OFF_SWEEP_CURSOR, SWEEP_DONE)
         write64(base + OFF_NEXT, @@arenas)
         @@arenas = base
         # The directory byte last, after the header and the link: a reader
@@ -2519,6 +2580,15 @@ require "./file"
       POOL_HELPERS_DONE = 384_u64
       POOL_ASKED = 448_u64
       POOL_READY = 512_u64
+      # The sweep round (GC_DESIGN.md Stage 8): open after a collection
+      # while helpers may claim arenas, closed by the next collection
+      # before it stops anything; and how many helper walks are in flight.
+      POOL_SWEEP = 576_u64
+      POOL_SWEEPERS = 640_u64
+      POOL_SWEEP_PERMITS = 704_u64
+      # The class an allocating thread is waiting on, plus one; 0 is none.
+      # A helper's claim takes an arena of that class first.
+      POOL_SWEEP_WANTED = 768_u64
 
       # Helpers: how many the collector may use besides itself, how many
       # exist, and the threshold under which a mark runs alone — waking
@@ -2549,31 +2619,40 @@ require "./file"
       @@pause_total : UInt64 = 0_u64
 
       # The pause clock. Linux asks the kernel directly — clock_gettime,
-      # CLOCK_MONOTONIC — writing the timespec into a page of this module's
-      # own, because a collector must not allocate from the heap it is
-      # collecting, not even sixteen bytes for a stamp. darwin asks
-      # libSystem's clock_gettime_nsec_np for CLOCK_MONOTONIC_RAW, the
-      # scheduler's own clock and for its reason: a pause is microseconds,
-      # and 6 would report it in whole ones.
-      @@stamp : UInt64 = 0_u64
+      # CLOCK_MONOTONIC — writing the timespec into the caller's frame,
+      # because a collector must not allocate from the heap it is
+      # collecting, not even sixteen bytes for a stamp, and a page shared
+      # between callers is a stamp two threads tear: the runtime's own
+      # calls are all under its lock, but a probe that read the clock from
+      # an allocation while helper 0 read it under the lock saw time go
+      # backwards. darwin asks libSystem's clock_gettime_nsec_np for
+      # CLOCK_MONOTONIC_RAW, the scheduler's own clock and for its reason:
+      # a pause is microseconds, and 6 would report it in whole ones.
+      {% if flag?(:linux) %}
+        lib LibIyiClock
+          struct Timespec
+            sec : Int64
+            nsec : Int64
+          end
+        end
+      {% end %}
 
       def self.now_ns : UInt64
         {% if flag?(:linux) %}
-          @@stamp = __iyi_mmap(4096_u64).address if @@stamp == 0
-          stamp = @@stamp
+          stamp = uninitialized LibIyiClock::Timespec
           result = uninitialized Int64
           {% if flag?(:x86_64) %}
             asm("syscall" : "={rax}"(result)
-                          : "{rax}"(228_i64), "{rdi}"(1_i64), "{rsi}"(Pointer(Void).new(stamp))
+                          : "{rax}"(228_i64), "{rdi}"(1_i64), "{rsi}"(pointerof(stamp))
                           : "rcx", "r11", "memory"
                           : "volatile")
           {% else %}
             asm("svc #0" : "={x0}"(result)
-                         : "{x8}"(113_i64), "{x0}"(1_i64), "{x1}"(Pointer(Void).new(stamp))
+                         : "{x8}"(113_i64), "{x0}"(1_i64), "{x1}"(pointerof(stamp))
                          : "memory"
                          : "volatile")
           {% end %}
-          IyiHeap.read64(stamp) * 1000000000_u64 + IyiHeap.read64(stamp + 8_u64)
+          stamp.sec.to_u64 * 1000000000_u64 + stamp.nsec.to_u64
         {% else %}
           LibC.clock_gettime_nsec_np(4)
         {% end %}
@@ -3201,9 +3280,28 @@ require "./file"
               spin_pause
             end
             # The finish turns the generation once more, for the
-            # remainder; that is the one this helper waits past next.
+            # remainder, and again for the sweep round; that is the one
+            # this helper waits past next.
             seen = finish_concurrent
           end
+          # The round, if one is open and a permit is left: arenas until
+          # none is left or a collection closes it.
+          if take_sweep_permit
+            while sweep_one_helper
+            end
+          end
+        end
+      end
+
+      # A round's permits are SWEEP_HELPERS; on Linux that many helpers
+      # are woken and each takes one, on darwin every helper spins awake
+      # and the first that many do.
+      def self.take_sweep_permit : Bool
+        word = pool_word(POOL_SWEEP_PERMITS)
+        while true
+          left = word.value.get
+          return false if left == 0_u64
+          return true if word.value.compare_and_set(left, left - 1_u64)[1]
         end
       end
 
@@ -3241,6 +3339,12 @@ require "./file"
         def self.wake_helpers : Nil
           __iyi_conc_syscall6(IYI_SYS_FUTEX, (pool + POOL_GENERATION).to_i64, IYI_FUTEX_WAKE, 1000000_i64, 0_i64, 0_i64, 0_i64)
         end
+
+        # That many of the parked helpers, whichever the kernel picks;
+        # the rest sleep through this generation and wake at the next.
+        def self.wake_some_helpers(count : UInt64) : Nil
+          __iyi_conc_syscall6(IYI_SYS_FUTEX, (pool + POOL_GENERATION).to_i64, IYI_FUTEX_WAKE, count.to_i64, 0_i64, 0_i64, 0_i64)
+        end
       {% else %}
         # darwin has no futex: a helper spins on the generation with a
         # yield between reads, which costs no name on the floor.
@@ -3253,6 +3357,9 @@ require "./file"
         end
 
         def self.wake_helpers : Nil
+        end
+
+        def self.wake_some_helpers(count : UInt64) : Nil
         end
       {% end %}
       {% else %}
@@ -3335,18 +3442,50 @@ require "./file"
         sweep_large
       end
 
-      # One arena behind the epoch swept, its white chunks batched to the
-      # centre or its mapping handed back. Answers whether there was one.
-      # Under the runtime lock for the list edits; the walk itself reads
-      # colours no mutator writes.
-      # The arena is claimed under the lock and walked outside it: with
-      # every free list dropped at the pause, every allocating thread
-      # refills at once after a collection, and thirty-two threads
-      # sweeping one arena each in turn under one lock were a convoy the
-      # thread exercise measured as a hang. The walk touches the arena's
-      # own words and the chunks below its frontier; the batch goes to
-      # the centre under the lock at the end.
-      def self.sweep_one : Bool
+      # ── The sweep, in slices, and beside the program — GC_DESIGN.md
+      # Stage 8 ──────────────────────────────────────────────────────────
+      #
+      # An arena is swept in slices of SWEEP_SPAN bytes, from a cursor it
+      # carries, by whoever needs its chunks or has time: an allocating
+      # thread that finds nothing swept for its class takes one slice of
+      # an arena of that class and goes on allocating from it, some
+      # microseconds; the helpers, after a collection, take whole arenas
+      # slice after slice and hand each slice's batch over as they go.
+      # The sweep is a walk of every chunk header in the heap - binary
+      # trees paid a fifth of its wall time walking, on the thread that
+      # allocates - and the slices are what let it leave that thread
+      # without a wait: a helper mid-arena is mid-slice for microseconds,
+      # and the thread that wants the arena's next slice waits for that,
+      # not for the arena.
+      #
+      # The words: an arena's epoch says whether its sweep for this
+      # epoch has begun; its cursor says how far it got, accurate whenever
+      # nobody is inside a slice of it, because a slicer writes it back
+      # before it lets anything stop it; and OFF_SWEEPING is the walk
+      # claim, held across one slice, so two walkers never share one. A
+      # pause takes no claim: every thread is stopped where no slice is,
+      # and it finishes every arena from its cursor - and so does the
+      # thread that triggers a collection, before it stops anything and
+      # on its own clock, the way the concurrent mark's first stop
+      # already paid the debt: a half-swept arena wears two epochs'
+      # colours, and the mark reads one.
+      #
+      # A round is open from a collection's end to the next collection's
+      # start. SWEEP_HELPERS helpers take it - a sweep walks at memory's
+      # speed, one helper outruns an allocating thread's consumption
+      # tenfold, and fifteen of them beside binary trees cost it its
+      # core's other half. The next collection closes the round, so no
+      # slice starts after, and waits out the slices in flight - a
+      # half-swept slice wears two epochs' colours, and the mark reads
+      # one - with the lock released, since a slice's end wants it.
+      SWEEP_SPAN = 65536_u64
+      SWEEP_HELPERS = 3_u64
+
+      # A slice of an arena of `wanted`'s class, or any if the class has
+      # none left, by an allocating thread. Answers 1 for a slice swept,
+      # 2 for a slice of the class that a helper is inside - the caller
+      # spins, its batch is microseconds away - and 0 for nothing left.
+      def self.sweep_one(wanted : UInt64) : UInt64
         # No debt, no lock: with every list dropped at the pause, a thread
         # carving fresh chunks refills on every allocation, and each refill
         # came here - a lock and a walk of the arena list, 39 ns of a
@@ -3354,67 +3493,241 @@ require "./file"
         # darwin, for nothing to sweep. The count is read without the
         # lock; a stale nonzero takes the lock and finds nothing, a stale
         # zero carves a chunk that a sweep would have handed back later.
-        return false if @@debt == 0_u64
         IyiRuntimeLock.lock
-        arena = IyiHeap.first_arena
-        while arena != 0 && (IyiHeap.arena_epoch(arena) == @@epoch || IyiHeap.read64(arena + IyiHeap::OFF_SWEEPING) == @@epoch)
-          arena = IyiHeap.arena_next(arena)
-        end
-        if arena == 0
-          IyiRuntimeLock.unlock
-          return false
-        end
-        epoch = @@epoch
-        IyiHeap.arena_epoch_set(arena, epoch)
-        # The claim is the epoch. A walk in flight is this epoch's - the
-        # epoch turns only at a pause, and a walker is inside the
-        # allocator, stopped at its walk's end - so a claim of an older
-        # epoch is a finished walk parked through the pause, whose batch
-        # is discarded below, and the arena is this epoch's to sweep; the
-        # old walker must not clear the new claim, and release must wait
-        # for the old claim to clear.
-        IyiHeap.write64(arena + IyiHeap::OFF_SWEEPING, epoch)
-        @@debt = @@debt - 1_u64 if @@debt > 0_u64
-        @@swept_by_allocator = @@swept_by_allocator + 1_u64
+        arena = claim_slice(wanted, false)
         IyiRuntimeLock.unlock
-        batch = sweep_arena(arena)
+        return arena if arena < 4_u64
+        epoch = @@epoch
+        batch = sweep_slice(arena, SWEEP_SPAN)
         IyiRuntimeLock.lock
-        # The claim cleared only if it is still this walk's; a newer
-        # walker's claim stays until that walker clears it. A pause's own
-        # sweep takes no claim, and the release it refuses while one
-        # stands is the next pause's.
-        # And only if the arena is still an arena: a newer walker's claim
-        # cleared, a pause's scavenge may have handed the mapping back
-        # while this walk was parked at this very lock.
+        release_claim(arena, epoch)
+        arena_done(arena, epoch)
+        # A collection may have come and gone while this thread waited
+        # for the lock - it was inside the allocator, so it was stopped
+        # after its slice and after the cursor was written, and the pause
+        # went on from there - and the pause dropped every list. A batch
+        # from the old epoch is left to the new one's sweep, which finds
+        # its chunks by their flag; handed over, the same chunk would be
+        # on two lists.
+        IyiHeap.free_batch(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), batch) if batch != 0 && @@epoch == epoch
+        IyiRuntimeLock.unlock
+        1_u64
+      end
+
+      # Under the lock: an arena with sweeping left, its walk claim taken.
+      # `wanted` is a chunk size to take first, 0 any; `helper` says a
+      # helper asks, which takes any class when the wanted one has none
+      # left, where an allocating thread answers 2 (busy) if the wanted
+      # class has arenas but every one is inside a helper's slice, and
+      # 0 only when the class has nothing left to sweep at all. An arena
+      # not yet begun this epoch is begun here: its cursor set to its
+      # first chunk, the count of unbegun arenas down by one.
+      def self.claim_slice(wanted : UInt64, helper : Bool) : UInt64
+        epoch = @@epoch
+        busy = false
+        pass = 0
+        while pass < 2
+          chunk = pass == 0 ? wanted : 0_u64
+          if chunk != 0 || pass == 1
+            arena = IyiHeap.first_arena
+            while arena != 0
+              if (chunk == 0 || IyiHeap.arena_chunk(arena) == chunk) && sweep_left?(arena, epoch)
+                if IyiHeap.read64(arena + IyiHeap::OFF_SWEEPING) == epoch
+                  busy = true
+                else
+                  begin_arena(arena, epoch, helper ? 2 : 1) if IyiHeap.arena_epoch(arena) != epoch
+                  IyiHeap.write64(arena + IyiHeap::OFF_SWEEPING, epoch)
+                  return arena
+                end
+              end
+              arena = IyiHeap.arena_next(arena)
+            end
+          end
+          # An allocating thread wants its class: busy is an answer, and
+          # so is nothing of the class; a helper goes on to any.
+          return 2_u64 if !helper && busy
+          return 0_u64 if !helper && wanted != 0
+          pass = pass + 1
+        end
+        0_u64
+      end
+
+      def self.sweep_left?(arena : UInt64, epoch : UInt64) : Bool
+        IyiHeap.arena_epoch(arena) != epoch || IyiHeap.read64(arena + IyiHeap::OFF_SWEEP_CURSOR) != IyiHeap::SWEEP_DONE
+      end
+
+      # Under the lock: an arena's sweep for this epoch begun, by a
+      # helper (2), an allocating thread (1) or a pause (0).
+      def self.begin_arena(arena : UInt64, epoch : UInt64, who : Int32) : Nil
+        IyiHeap.arena_epoch_set(arena, epoch)
+        IyiHeap.write64(arena + IyiHeap::OFF_SWEEP_CURSOR, arena + IyiHeap::HEAD)
+        @@unswept = @@unswept - 1_u64 if @@unswept > 0_u64
+        @@swept_by_helpers = @@swept_by_helpers + 1_u64 if who == 2
+        @@swept_by_allocator = @@swept_by_allocator + 1_u64 if who == 1
+      end
+
+      # Under the lock, after a slice: the arena counted out if the slice
+      # reached its end, in the epoch the slice ran in - a slice parked
+      # through a pause finished an arena of an epoch that is gone, and
+      # the new epoch's count is the new epoch's.
+      def self.arena_done(arena : UInt64, epoch : UInt64) : Nil
+        return unless @@epoch == epoch && IyiHeap.mapped?(arena)
+        return unless IyiHeap.read64(arena + IyiHeap::OFF_SWEEP_CURSOR) == IyiHeap::SWEEP_DONE
+        # Once: a walker parked through a pause that finished its arena
+        # comes here after the pause did.
+        return if IyiHeap.read64(arena + IyiHeap::OFF_SWEEP_COUNTED) == epoch
+        IyiHeap.write64(arena + IyiHeap::OFF_SWEEP_COUNTED, epoch)
+        @@sweep_left = @@sweep_left - 1_u64 if @@sweep_left > 0_u64
+        IyiHeap.sweep_left_add(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), -1_i64)
+      end
+
+      # Under the lock: the walk claim let go, if it is still this walk's
+      # - a claim of an older epoch stands until its walker clears it,
+      # and a newer walker's claim on the same arena is not this one's -
+      # and only if the arena is still an arena: a pause's scavenge may
+      # have handed the mapping back while this thread waited at the lock.
+      def self.release_claim(arena : UInt64, epoch : UInt64) : Nil
         if IyiHeap.mapped?(arena) && IyiHeap.read64(arena + IyiHeap::OFF_SWEEPING) == epoch
           IyiHeap.write64(arena + IyiHeap::OFF_SWEEPING, 0_u64)
         end
-        # A collection may have come and gone while the walk ran - this
-        # thread was inside the allocator, so it was stopped at the walk's
-        # end and the mark saw the arena whole - and the pause dropped
-        # every list. A batch from the old epoch is left to the new one's
-        # sweep, which finds its chunks by their flag; handed over, the
-        # same chunk would be on two lists.
-        IyiHeap.free_batch(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), batch) if batch != 0 && @@epoch == epoch
-        IyiRuntimeLock.unlock
-        true
       end
 
-      # `sweep_one` with the lock already held: the collection's own use.
-      # With every thread stopped no walk is in flight; a claim found here
-      # is a finished walk of an older epoch, parked, whose batch it will
-      # discard.
+      # The pause's own sweep, the lock held and every thread stopped: one
+      # arena with sweeping left finished from its cursor, whoever's
+      # claim stands on it - a claim stands for a walker parked at the
+      # lock after its slice, whose batch that walker will discard.
+      # Answers whether there was one.
       def self.sweep_one_held : Bool
+        epoch = @@epoch
         arena = IyiHeap.first_arena
-        while arena != 0 && IyiHeap.arena_epoch(arena) == @@epoch
+        while arena != 0 && !sweep_left?(arena, epoch)
           arena = IyiHeap.arena_next(arena)
         end
         return false if arena == 0
-        IyiHeap.arena_epoch_set(arena, @@epoch)
-        batch = sweep_arena(arena)
-        IyiHeap.free_batch(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), batch) if batch != 0
-        @@debt = @@debt - 1_u64 if @@debt > 0_u64
+        begin_arena(arena, epoch, 0) if IyiHeap.arena_epoch(arena) != epoch
+        index = IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER)
+        batch = sweep_slice(arena, IyiHeap::SWEEP_DONE)
+        IyiHeap.free_batch(index, batch) if batch != 0
+        arena_done(arena, epoch)
         true
+      end
+
+      # The triggering thread's sweep before the stop, the lock held on
+      # entry and on exit and released for the walk: one arena with
+      # sweeping left and no slice in flight, claimed and finished from
+      # its cursor while every other thread runs. An arena a thread is
+      # inside a slice of is left to the pause. Answers whether there was
+      # one.
+      def self.sweep_one_before_stop : Bool
+        epoch = @@epoch
+        arena = IyiHeap.first_arena
+        while arena != 0 && !(sweep_left?(arena, epoch) && IyiHeap.read64(arena + IyiHeap::OFF_SWEEPING) != epoch)
+          arena = IyiHeap.arena_next(arena)
+        end
+        return false if arena == 0
+        begin_arena(arena, epoch, 0) if IyiHeap.arena_epoch(arena) != epoch
+        IyiHeap.write64(arena + IyiHeap::OFF_SWEEPING, epoch)
+        IyiRuntimeLock.unlock
+        batch = sweep_slice(arena, IyiHeap::SWEEP_DONE)
+        IyiRuntimeLock.lock
+        release_claim(arena, epoch)
+        arena_done(arena, epoch)
+        IyiHeap.free_batch(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), batch) if batch != 0
+        true
+      end
+
+      # Whether helpers are at a round right now: the allocating thread
+      # spins on a class's batch only while one is coming.
+      def self.helpers_sweeping? : Bool
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          @@helpers > 0_u64 && @@sweep_left != 0_u64 && pool_word(POOL_SWEEP).value.get != 0_u64
+        {% else %}
+          false
+        {% end %}
+      end
+
+      {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+        # A helper's turn of the round: one slice, the way an allocating
+        # thread takes one - so three helpers are on one arena at once,
+        # and the arena a program churns through is swept three times
+        # faster - its batch handed over under the lock; or false when
+        # the round is closed or nothing is left. The slice is counted in
+        # while it runs, so the collection that closes the round can wait
+        # it out; a helper parked at the lock after its slice may wait
+        # through a whole collection, and its batch is then an old
+        # epoch's, discarded.
+        def self.sweep_one_helper : Bool
+          return false if pool_word(POOL_SWEEP).value.get == 0_u64
+          IyiRuntimeLock.lock
+          arena = 0_u64
+          if pool_word(POOL_SWEEP).value.get != 0_u64
+            wanted = pool_word(POOL_SWEEP_WANTED).value.get
+            arena = claim_slice(wanted == 0_u64 ? 0_u64 : IyiHeap.payload(wanted.to_i32 - 1) + IyiHeap::HEADER, true)
+            # Counted in under the lock that closes the round: closed, no
+            # slice starts; open, a slice begun is counted before the
+            # closer looks.
+            pool_word(POOL_SWEEPERS).value.add(1_u64) if arena != 0
+          end
+          IyiRuntimeLock.unlock
+          return false if arena == 0
+          epoch = @@epoch
+          batch = sweep_slice(arena, SWEEP_SPAN)
+          pool_word(POOL_SWEEPERS).value.sub(1_u64)
+          IyiRuntimeLock.lock
+          release_claim(arena, epoch)
+          arena_done(arena, epoch)
+          IyiHeap.free_batch(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), batch) if batch != 0 && @@epoch == epoch
+          IyiRuntimeLock.unlock
+          true
+        end
+
+        # At a collection's end, with helpers, before the threads it
+        # stopped are released: the round opened, so the first refill
+        # after the release finds helpers coming rather than sweep alone.
+        # The wake itself comes after the lock is released - a thread
+        # woken may preempt the waker, and seven helpers woken inside the
+        # stop made a 90 us pause 1.6 ms. SWEEP_HELPERS of the parked
+        # helpers are woken, and each takes a permit; on darwin every
+        # helper spins awake and the first SWEEP_HELPERS take one.
+        def self.open_sweep_round : Nil
+          return if @@helpers == 0_u64 || @@sweep_left == 0_u64
+          IyiHeap.write64(pool + POOL_ASKED, 0_u64)
+          pool_word(POOL_HELPERS_DONE).value.set(0_u64)
+          pool_word(POOL_SWEEP_PERMITS).value.set(@@helpers < SWEEP_HELPERS ? @@helpers : SWEEP_HELPERS)
+          pool_word(POOL_SWEEP).value.set(1_u64)
+          pool_word(POOL_GENERATION).value.add(1_u64)
+          @@round_to_wake = true
+        end
+
+        @@round_to_wake : Bool = false
+
+        def self.wake_sweep_round : Nil
+          return unless @@round_to_wake
+          @@round_to_wake = false
+          wake_some_helpers(SWEEP_HELPERS)
+        end
+
+        # Before a collection stops anything, under the lock: the round
+        # closed, and the slices in flight waited out with the lock
+        # released, since a slice's end wants it.
+        def self.close_sweep_round : Nil
+          return if @@helpers == 0_u64
+          pool_word(POOL_SWEEP).value.set(0_u64)
+          pool_word(POOL_SWEEP_PERMITS).value.set(0_u64)
+          while pool_word(POOL_SWEEPERS).value.get != 0_u64
+            IyiRuntimeLock.unlock
+            spin_pause
+            IyiRuntimeLock.lock
+          end
+        end
+      {% end %}
+
+      # An allocating thread about to wait on a class names it for the
+      # helpers; the last to name one is the one they read.
+      def self.sweep_wanted(index : Int32) : Nil
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          pool_word(POOL_SWEEP_WANTED).value.set(index.to_u64 + 1_u64)
+        {% end %}
       end
 
       # Dead chunks go on the class's list in one batch - except a run of
@@ -3436,14 +3749,22 @@ require "./file"
       RELEASE_PAGES = 2_u64
       @@kept_pages : UInt64 = 0_u64
 
-      # Answers the batch of dead chunks for the centre; the caller hands
-      # it over under the lock.
-      def self.sweep_arena(arena : UInt64) : UInt64
+      # One slice: from the arena's cursor, `span` bytes or to its high
+      # water, whichever is first; the cursor written back at the end,
+      # before anything can stop this thread. Answers the batch of dead
+      # chunks for the centre; the caller hands it over under the lock.
+      def self.sweep_slice(arena : UInt64, span : UInt64) : UInt64
         chunk = IyiHeap.arena_chunk(arena)
         first = arena + IyiHeap::HEAD
         batch_head = 0_u64
-        cursor = first
-        stop = IyiHeap.arena_high(arena)
+        cursor = IyiHeap.read64(arena + IyiHeap::OFF_SWEEP_CURSOR)
+        high = IyiHeap.arena_high(arena)
+        if cursor >= high
+          IyiHeap.write64(arena + IyiHeap::OFF_SWEEP_CURSOR, IyiHeap::SWEEP_DONE)
+          return 0_u64
+        end
+        stop = high
+        stop = cursor + span if stop - cursor > span
         @@bytes_walked = @@bytes_walked + (stop - cursor)
         # The uncarved part of the bump region, read once: the cursor only
         # rises, and a chunk carved past the value read here wears this
@@ -3508,7 +3829,15 @@ require "./file"
           end
           cursor = cursor + chunk
         end
+        # The run in progress closes at the slice's end and the next slice
+        # begins one of its own: a run cut back for a page release is the
+        # batch's newest prefix, and a batch handed over is nobody's to
+        # cut. A run split at a slice's edge may keep a page it would
+        # have released; the slices are sixteen pages, the edge one.
         batch_head = close_run(arena, chunk, run_low, cursor, batch_head, run_batch) if run_low != 0
+        # Past the high water the arena is done: what is carved after
+        # this wears the epoch's parity and is alive by construction.
+        IyiHeap.write64(arena + IyiHeap::OFF_SWEEP_CURSOR, cursor >= high ? IyiHeap::SWEEP_DONE : cursor)
         batch_head
       end
 
@@ -3622,12 +3951,19 @@ require "./file"
         @@bytes_kept = 0_u64
         @@bytes_walked = 0_u64
         debt = 0_u64
+        index = 0
+        while index < IyiHeap::CLASSES
+          IyiHeap.central[IyiHeap::SWEEP_LEFT_AT + index] = 0_u64
+          index = index + 1
+        end
         arena = IyiHeap.first_arena
         while arena != 0
           debt = debt + 1_u64
+          IyiHeap.sweep_left_add(IyiHeap.class_index(IyiHeap.arena_chunk(arena) - IyiHeap::HEADER), 1_i64)
           arena = IyiHeap.arena_next(arena)
         end
-        @@debt = debt
+        @@unswept = debt
+        @@sweep_left = debt
         @@collections = @@collections + 1_u64
       end
 
@@ -3635,10 +3971,14 @@ require "./file"
       # `EPOCH_FLAG` or 0: the parity the allocator stamps on a chunk it
       # hands out, and the sweep compares against.
       @@epoch_flag : UInt64 = 16_u64
-      @@debt : UInt64 = 0_u64
+      # Arenas whose sweep for this epoch has not begun, and arenas with
+      # any of it left - the second is the allocator's fast answer.
+      @@unswept : UInt64 = 0_u64
+      @@sweep_left : UInt64 = 0_u64
       @@debt_paid_in_pause : UInt64 = 0_u64
       @@debt_paid_before_stop : UInt64 = 0_u64
       @@swept_by_allocator : UInt64 = 0_u64
+      @@swept_by_helpers : UInt64 = 0_u64
       @@bytes_marked : UInt64 = 0_u64
 
       def self.epoch : UInt64
@@ -3649,10 +3989,10 @@ require "./file"
         @@epoch_flag
       end
 
-      # Arenas still wearing the last mark's colours: what the next pause
-      # would have to sweep first.
+      # Arenas whose sweep this epoch has not begun: what the next pause
+      # would have to sweep first, less the ones begun and unfinished.
       def self.debt : UInt64
-        @@debt
+        @@unswept
       end
 
       # Arenas the pauses swept before marking, in all — the lazy sweep's
@@ -3667,9 +4007,14 @@ require "./file"
         @@debt_paid_in_pause
       end
 
-      # Arenas the allocator swept on its own time, outside any pause.
+      # Arenas the allocator began sweeping on its own time, outside any
+      # pause; and the ones the helpers began.
       def self.swept_by_allocator : UInt64
         @@swept_by_allocator
+      end
+
+      def self.swept_by_helpers : UInt64
+        @@swept_by_helpers
       end
 
       def self.bytes_marked : UInt64
@@ -3768,6 +4113,8 @@ require "./file"
         end
         @@collecting = true
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          start_helpers(@@helpers_wanted)
+          close_sweep_round
           if concurrent_possible?
             # The mark runs beside the program: this thread stops the world
             # for the roots only and goes back to its allocation; helper 0
@@ -3780,6 +4127,9 @@ require "./file"
         collect_locked(false)
         @@collecting = false
         IyiRuntimeLock.unlock
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          wake_sweep_round
+        {% end %}
       end
 
       # One collection: decide, reclaim, and set the next budget. Explicit
@@ -3800,6 +4150,9 @@ require "./file"
           IyiRuntimeLock.lock
         end
         @@collecting = true
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          close_sweep_round
+        {% end %}
         collect_locked(true)
         @@collecting = false
         IyiRuntimeLock.unlock
@@ -3825,17 +4178,24 @@ require "./file"
 
       def self.collect_locked(eager : Bool) : Nil
         decide_helpers
-        started = now_ns
-        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
-          others = IyiThread.stop_others
-        {% end %}
         # Debt left from the last epoch: an unswept arena wears the last
         # mark's colours, and a mark over them would call last cycle's
         # black this cycle's live — and, worse, never re-count it, so an
         # arena of live objects would read as empty to the scavenge. Paid
         # here, every arena behind the epoch and not a counted number of
         # them, and counted, because a pause that sweeps is the thing the
-        # lazy sweep exists to end.
+        # lazy sweep exists to end. Paid before the stop, arena by arena
+        # under a claim, the lock released for the walk: the triggering
+        # thread's time, as an allocation's sweep is, and no other
+        # thread's. What a thread was inside a slice of is finished under
+        # the stop, where no slice is in flight.
+        while sweep_one_before_stop
+          @@debt_paid_before_stop = @@debt_paid_before_stop + 1_u64
+        end
+        started = now_ns
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          others = IyiThread.stop_others
+        {% end %}
         while sweep_one_held
           @@debt_paid_in_pause = @@debt_paid_in_pause + 1_u64
         end
@@ -3853,6 +4213,7 @@ require "./file"
         # no longer waits on a sweep to count.
         @@budget = next_budget(@@bytes_marked)
         {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          open_sweep_round
           IyiThread.resume_others(others)
         {% end %}
         pause = now_ns - started
@@ -3903,7 +4264,6 @@ require "./file"
         # The helpers are started before it: their first spawn is half a
         # millisecond, which is no part of a stop.
         def self.start_concurrent : Nil
-          start_helpers(@@helpers_wanted)
           # The last epoch's debt — an unswept arena wears the last mark's
           # colours, which this mark cannot read — is paid here, under the
           # lock the allocator's own sweep takes, before the world stops:
@@ -3911,11 +4271,14 @@ require "./file"
           # no other thread's. It was the first stop's largest part (500 us
           # of sweeping against 20 us of roots), and it is what Stage 8's
           # sweep beside the program is for.
-          while sweep_one_held
+          while sweep_one_before_stop
             @@debt_paid_before_stop = @@debt_paid_before_stop + 1_u64
           end
           started = now_ns
           others = IyiThread.stop_others
+          while sweep_one_held
+            @@debt_paid_in_pause = @@debt_paid_in_pause + 1_u64
+          end
           w = worker
           @@collector_worker = w
           IyiHeap.write64(w + W_LEN, 0_u64)
@@ -4046,6 +4409,11 @@ require "./file"
             survived = @@bytes_marked
             IyiHeap.allocated_word.value.set(born)
             @@budget = next_budget(survived)
+            # The round opened before the threads are released: a thread
+            # that refilled first found no round and swept the arena it
+            # wanted - the largest - itself, a millisecond on the
+            # allocating thread the round exists to spare.
+            open_sweep_round
             IyiThread.resume_others(others)
             pause = now_ns - started
             IyiHeap.unmap_released
@@ -4062,8 +4430,10 @@ require "./file"
             @@concurrent_collections = @@concurrent_collections + 1_u64
             @@collecting = false
             IyiRuntimeLock.unlock
+            wake_sweep_round
+            # Helper 0 takes its own turn at the round before it parks.
             # The generation as it stands - turned for the remainder and
-            # again for the sweep round - is the one helper 0 waits past.
+            # again for the round - is the one it waits past.
             return pool_word(POOL_GENERATION).value.get
           end
         end
