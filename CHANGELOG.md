@@ -685,7 +685,11 @@
   small classes' index is a shift inline rather than a call - binary
   trees 239 ms to 226. The thread exercise's oversubscription step runs
   twice the cores' worth of threads, at least nine and at most 32: 32 on
-  the darwin runner's three cores outlived the step's five minutes.
+  the darwin runner's three cores outlived the step's five minutes. And
+  `IyiMark.workers=` caps at the cores less one, for the same runner:
+  fifteen helpers asked of three cores, spinning as darwin's do when
+  parked, held the parallel mark's exercise past its five minutes too.
+  The exercise names its phases as it runs them now.
 
 ### Fixed
 

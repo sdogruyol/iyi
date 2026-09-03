@@ -3116,8 +3116,15 @@ require "./file"
 
       # How many helpers a mark may use. Set before the first collection;
       # the default is the core count less one, capped at fifteen, and 0
-      # marks alone.
+      # marks alone. A count past the cores is the cores less one: a
+      # helper past the cores has no core to run on, and on darwin, where
+      # a parked helper spins, fifteen of them on three cores held the
+      # parallel mark's exercise past its five minutes.
       def self.workers=(count : UInt64) : Nil
+        {% if (flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64)) %}
+          cap = default_helpers
+          count = cap if count > cap
+        {% end %}
         @@helpers_wanted = count
         @@workers_set = true
       end

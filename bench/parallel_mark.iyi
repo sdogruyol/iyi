@@ -66,14 +66,19 @@
 
   IyiMark.workers = 0_u64
   # Two marks first so the marker's own estimate of the live set is warm
-  # for both arms alike.
+  # for both arms alike. Each phase names itself before it runs: a hang
+  # on a runner then says where.
+  puts "phase: two marks alone"
   IyiMark.collect
   IyiMark.collect
+  puts "phase: five marks alone"
   alone = collect_five(tree, expected)
   fail("helpers blackened #{alone[1]} objects with none asked") if alone[1] != 0_i64
 
   IyiMark.workers = 15_u64
+  puts "phase: one mark with helpers"
   IyiMark.collect
+  puts "phase: five marks with helpers"
   helped = collect_five(tree, expected)
   fail("the helpers blackened nothing: the mark was one thread and the rest watched") if helped[1] == 0_i64
 
