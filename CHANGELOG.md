@@ -693,6 +693,16 @@
 
 ### Fixed
 
+- **A thread carving fresh chunks took the runtime lock on every
+  allocation, for nothing to sweep.** With every list dropped at the
+  pause, a thread past its lists refills on each allocation, and each
+  refill reached for the sweep: a lock and a walk of the arena list, 39
+  ns of a release build's 24-byte allocation on Linux and a microsecond
+  on darwin. The sweep answers no debt without the lock: 9 ns now, and
+  live churn 172 ms to 118. And the page the sweep hands back is the
+  kernel's: darwin arm64's is 16 KB, and its `madvise` refused a run of
+  four-kilobyte ones.
+
 - **darwin's helpers were started with a heap allocation under the
   runtime lock, and the parallel mark hung at its first mark with
   helpers.** `pthread_create`'s handle word was `Pointer.malloc`'d; the
@@ -3571,7 +3581,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 8,839-line library and nothing else. Every other
+  written against iyi's own 8,855-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

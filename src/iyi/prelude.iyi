@@ -780,10 +780,18 @@ require "./file"
     class IyiHeap
       MAP = 16777216_u64
       TOP = 1048576_u64
-      # The arena's first page is its header: the words below, and a bit
-      # per page of the mapping saying whether the sweep handed it back.
+      # The arena's first four kilobytes are its header: the words below,
+      # and a bit per page of the mapping saying whether the sweep handed
+      # it back. The page is the kernel's: darwin arm64's is 16 KB, and an
+      # `madvise` of a four-kilobyte run there is refused.
       HEAD = 4096_u64
-      PAGE = 4096_u64
+      {% if flag?(:darwin) %}
+        PAGE = 16384_u64
+        PAGE_SHIFT = 14_u64
+      {% else %}
+        PAGE = 4096_u64
+        PAGE_SHIFT = 12_u64
+      {% end %}
       DIR_LEN = 4096_u64
       # Size classes: eight-byte steps from 16 to 128, then four to each
       # doubling up to the top class, 67 in all; `FILL` is where a cache's
@@ -1242,14 +1250,14 @@ require "./file"
       # walk all refuse it by the bit. Taking a run up clears its bits
       # under the lock the sweep holds, so a sweep sees a region whole.
       def self.page_released?(arena : UInt64, address : UInt64) : Bool
-        page = (address - arena).unsafe_shr(12_u64)
+        page = (address - arena).unsafe_shr(PAGE_SHIFT)
         word = read64(arena + OFF_PAGES + page.unsafe_shr(6_u64) * 8_u64)
         word & 1_u64.unsafe_shl(page & 63_u64) != 0
       end
 
       def self.set_released(arena : UInt64, low : UInt64, high : UInt64, on : Bool) : Nil
-        page = (low - arena).unsafe_shr(12_u64)
-        stop = (high - arena).unsafe_shr(12_u64)
+        page = (low - arena).unsafe_shr(PAGE_SHIFT)
+        stop = (high - arena).unsafe_shr(PAGE_SHIFT)
         while page < stop
           slot = arena + OFF_PAGES + page.unsafe_shr(6_u64) * 8_u64
           bit = 1_u64.unsafe_shl(page & 63_u64)
@@ -1349,7 +1357,7 @@ require "./file"
       def self.reopen_in(arena : UInt64, owner : UInt64) : Bool
         return false if read64(arena + OFF_SWEEPING) != 0 || !claimable?(arena, owner)
         chunk = read64(arena + OFF_CHUNK)
-        pages = read64(arena + OFF_MAP).unsafe_shr(12_u64)
+        pages = read64(arena + OFF_MAP).unsafe_shr(PAGE_SHIFT)
         page = 1_u64
         while page < pages && !page_released?(arena, arena + page * PAGE)
           page = page + 1_u64
@@ -3339,6 +3347,14 @@ require "./file"
       # own words and the chunks below its frontier; the batch goes to
       # the centre under the lock at the end.
       def self.sweep_one : Bool
+        # No debt, no lock: with every list dropped at the pause, a thread
+        # carving fresh chunks refills on every allocation, and each refill
+        # came here - a lock and a walk of the arena list, 39 ns of a
+        # release build's allocation on Linux and a microsecond on
+        # darwin, for nothing to sweep. The count is read without the
+        # lock; a stale nonzero takes the lock and finds nothing, a stale
+        # zero carves a chunk that a sweep would have handed back later.
+        return false if @@debt == 0_u64
         IyiRuntimeLock.lock
         arena = IyiHeap.first_arena
         while arena != 0 && (IyiHeap.arena_epoch(arena) == @@epoch || IyiHeap.read64(arena + IyiHeap::OFF_SWEEPING) == @@epoch)
@@ -3507,7 +3523,7 @@ require "./file"
         page_low = (low + IyiHeap::PAGE - 1_u64) & (0_u64 &- IyiHeap::PAGE)
         page_high = high & (0_u64 &- IyiHeap::PAGE)
         return batch_head unless page_low < page_high && page_high - page_low >= RELEASE_PAGES * IyiHeap::PAGE
-        pages = (page_high - page_low).unsafe_shr(12_u64)
+        pages = (page_high - page_low).unsafe_shr(IyiHeap::PAGE_SHIFT)
         kept = Pointer(Atomic(UInt64)).new(pointerof(@@kept_pages).address)
         if kept.value.get * IyiHeap::PAGE < budget
           kept.value.add(pages)
