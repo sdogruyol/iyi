@@ -703,6 +703,14 @@
   kernel's: darwin arm64's is 16 KB, and its `madvise` refused a run of
   four-kilobyte ones.
 
+- **The thread floor's probe ran under the collector's trigger, and on
+  darwin the trigger's first collection took its signal.** The probe
+  installs its own handler on the collector's stop signal; a collection
+  run beside the program registers the main thread and installs the
+  collector's handler over it, and the probe's sigsuspend variant then
+  waited for threads the collector had parked. The probe turns the
+  trigger off: its stop is its own to measure.
+
 - **darwin's helpers were started with a heap allocation under the
   runtime lock, and the parallel mark hung at its first mark with
   helpers.** `pthread_create`'s handle word was `Pointer.malloc`'d; the

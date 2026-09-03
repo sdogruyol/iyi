@@ -1171,6 +1171,16 @@
   count = args.size > 0 ? args[0].to_i.to_i64 : 4_i64
   rounds = args.size > 1 ? args[1].to_i.to_i64 : 200_i64
   fail("at least one thread") if count < 1_i64
+  # The collector's trigger off: this probe's stop is its own, on the
+  # collector's signal, with a handler of its own installed under it. A
+  # collection the trigger ran would register the main thread and put
+  # the collector's handler in this one's place, and the probe's stop
+  # would wait for threads the collector had parked - which is what the
+  # sigsuspend variant did on darwin once the trigger's first collection
+  # ran beside the program.
+  {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
+    IyiMark.auto = false
+  {% end %}
   Threads.setup(count)
   own_tid = current_thread_id
   # The main thread's block is the loader's: its seed must be the image's
