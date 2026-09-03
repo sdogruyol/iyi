@@ -558,8 +558,14 @@
         result = __iyi_thread_clone(stack + IYI_THREAD_STACK, entry, argument, scratch, IyiTlsImage.make)
         raise "clone failed: #{result}" if result < 0
       {% else %}
-        handle = Pointer(UInt64).malloc(1_u64)
-        result = LibC.pthread_create(handle, Pointer(Void).new(0_u64), Pointer(Void).new(entry), Pointer(Void).new(argument))
+        # The handle in a local, not the heap: nobody joins a helper, and
+        # the collector starts helpers under the runtime lock with the
+        # world stopped - a heap allocation here reached for the lock it
+        # held, once the pause began dropping the free lists it used to
+        # find a chunk on, and darwin's parallel mark hung at its first
+        # mark with helpers.
+        handle = uninitialized UInt64
+        result = LibC.pthread_create(pointerof(handle), Pointer(Void).new(0_u64), Pointer(Void).new(entry), Pointer(Void).new(argument))
         raise "pthread_create failed: #{result}" if result != 0
       {% end %}
     end

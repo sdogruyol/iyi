@@ -693,6 +693,14 @@
 
 ### Fixed
 
+- **darwin's helpers were started with a heap allocation under the
+  runtime lock, and the parallel mark hung at its first mark with
+  helpers.** `pthread_create`'s handle word was `Pointer.malloc`'d; the
+  collector starts helpers under the lock with the world stopped, and
+  once the pause dropped the free lists, that allocation refilled, found
+  nothing, and reached for the lock it held. The handle is a local:
+  nobody joins a helper.
+
 - **The second stop's probe left live counts in its page, and the
   scavenge unmapped an arena under its live objects.** The bounded drain
   the second stop runs counts what it blackens per arena on helper 0's
@@ -3563,7 +3571,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 8,826-line library and nothing else. Every other
+  written against iyi's own 8,839-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
