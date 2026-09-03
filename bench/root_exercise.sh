@@ -24,10 +24,12 @@
 #
 # The Linux paths are cross-compiled and their objects audited. Root discovery
 # is the first part of this collector whose code differs by platform in more
-# than a syscall number: Linux reads `/proc/self/maps` and two linker symbols,
+# than a syscall number: Linux reads `/proc/self/maps` and three linker
+# symbols (`__data_start`, `_end`, and `__ehdr_start` for the thread-local
+# block a kernel thread lays out, which every program's trigger can start),
 # darwin asks libSystem and walks a Mach header. A workstation runs one of
 # them. Compiling the other, for both its architectures, is what says the
-# inline assembly assembles and the symbols are the two expected ones, and it
+# inline assembly assembles and the symbols are the expected ones, and it
 # is stated as that rather than as a run.
 #
 # And the two mechanisms most likely to pass for the wrong reason are removed
@@ -213,7 +215,7 @@ echo "== the other platform's code, compiled and audited"
 # it leaves exactly the two symbols named above.
 case "$(uname -s)" in
   Linux) other_targets="x86_64-darwin aarch64-darwin" ; other_expect="" ;;
-  *)     other_targets="x86_64-linux-gnu aarch64-linux-gnu" ; other_expect="__data_start _end" ;;
+  *)     other_targets="x86_64-linux-gnu aarch64-linux-gnu" ; other_expect="__data_start __ehdr_start _end" ;;
 esac
 for target in $other_targets; do
   if ! "$IYI" build --cross-compile --target "$target" \
@@ -236,7 +238,7 @@ for target in $other_targets; do
     done
     surplus="$(unexpected "$other_expect" "$found")"
     if [ -n "$surplus" ]; then
-      echo "  $target: asks for more than the two linker symbols:"
+      echo "  $target: asks for more than the linker symbols:"
       echo "$surplus" | sed 's/^/    /'
       status=1
     fi
