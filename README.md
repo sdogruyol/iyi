@@ -939,24 +939,21 @@ marked PROPOSED are the parts that will move under you.
   `x86_64-windows-msvc` and `arm-linux-gnueabihf` are not among them.
   Nothing here claims that the test suite runs on any target but the one CI
   builds on.
-- **A Windows binary is broken at run time, three different ways.** This is the
-  worst thing on this list, so it gets said plainly. `x86_64-windows-msvc`
-  compiles and links: the object asks Windows for six `kernel32` functions and
-  nothing else, and with `kernel32` and the *dynamic* CRT named (the static one,
-  `libcmt`, links just as cleanly and access-violates before `main`) the linker
-  is happy. Running it is where it ends. The same binary, run twenty times, has
-  printed the right answer, printed memory it was never given — `ache\w` where
-  `HELLO, IYI!` belongs, `BEEP ` with the digits gone — and exited
-  `0xC0000005`. All three, on the same executable, with nothing changed
-  between runs.
-
-  So there is nothing here to assert and no gate to write, and the two shapes
-  seen wrong (a case conversion, a number rendered into a string) are not the
-  whole story either, because an intermittent access violation is not a
-  formatting bug. CI keeps a twenty-run watch that always passes and prints the
-  tally, so the numbers are in every log. The cause is not the linker, not
-  `HeapAlloc` failing to clear (the POSIX path does not clear either and macOS
-  is fine), and not yet known.
+- **A Windows binary runs right now, and only that much is claimed.**
+  `x86_64-windows-msvc` compiles and links: the object asks Windows for six
+  `kernel32` functions and nothing else, and with `kernel32` and the
+  *dynamic* CRT named (the static one, `libcmt`, links just as cleanly and
+  access-violates before `main`) the linker is happy. It used to be broken at
+  run time three different ways — the right answer, memory it was never
+  given (`ache\w` where `HELLO, IYI!` belongs, `BEEP ` with the digits gone),
+  and `0xC0000005`, on the same binary with nothing changed between runs.
+  The wild write was the prelude's own `memset`, striding eight elements per
+  eight bytes; SPEC III.9 12c tells it whole. CI runs the binary twenty
+  times with a 50,000-iteration self-check in each, watched without failing
+  until thirty-six builds in a row read twenty right and nothing else, and
+  it is a gate now. What is not claimed: Windows is not a test target, has
+  no collector (its allocator is `HeapAlloc`, never freed) and no threads,
+  and nothing here has run on it but that probe.
 - **A wasm program needs a wasi toolchain, not just a linker.** A wasm32-wasi
   module is a program only once wasi-libc's entry stub is linked in, and only
   the compiler driver knows where its sysroot keeps that object — so this fork

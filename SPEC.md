@@ -7772,12 +7772,14 @@ Named honestly, so nobody mistakes this draft for complete.
     and found it; Windows had neighbours to trample from the first
     allocation. Fixed with the collector's merge, all three copies.
 
-    So Windows is still not a run target, but the claim has a suspect fixed
-    and a probe with teeth: the twenty-run watch now runs the two shapes
-    50,000 times, self-checked, so a packed-heap trample is probable rather
-    than lucky. There is nothing to gate until several builds in a row read
-    twenty right and nothing else; the day they do, this paragraph and the
-    README both move.
+    The probe grew teeth with the fix: the twenty-run watch runs the two
+    shapes 50,000 times, self-checked, so a packed-heap trample is probable
+    rather than lucky, and it watched without failing until several builds
+    in a row read twenty right and nothing else. Thirty-six in a row did —
+    720 runs, 36 million self-checks, no wrong output, no crash — and the
+    watch is a gate: a wrong output or a crash fails the build by its tally.
+    The diagnosis is retired. What Windows is not is unchanged: not a test
+    target, no collector (`HeapAlloc`, never freed), no threads.
 
     **wasm32-wasi had the same shape of defect and a smaller fix.** The module
     imports four `wasi_snapshot_preview1` functions and nothing else, and it

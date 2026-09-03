@@ -4734,11 +4734,11 @@ require "./file"
     # bound because nothing frees, and a program that outlives its memory is
     # what allocating without collecting asks for. `-Dgc_iyi` does not reach
     # this branch, deliberately rather than unfinished: the size-class arena
-    # allocator is POSIX-only in its stage. This target's diagnosis for
-    # printing memory it was never given has a fixed suspect — the memset
-    # below strode eight elements per eight bytes, trampling `HeapAlloc`'s
-    # packed neighbours and clearing at one-eighth coverage — and CI's
-    # twenty-run watch is what retires the diagnosis, not a new allocator.
+    # allocator is POSIX-only in its stage. This target once printed memory
+    # it was never given: the memset below strode eight elements per eight
+    # bytes, trampling `HeapAlloc`'s packed neighbours and clearing at
+    # one-eighth coverage. Fixed, and CI's twenty-run watch retired the
+    # diagnosis after thirty-six clean builds; it is a gate now.
     # Same reason as the block above: an LLVM-emitted object names no library
     # for itself, so the three heap functions have to name theirs.
     @[Link("kernel32")]

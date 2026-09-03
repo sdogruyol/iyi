@@ -872,6 +872,13 @@ jobs:
       - name: The mark beside the program (GC_DESIGN.md Stage 9)
         run: bash bench/concurrent_mark.sh
 
+      # The race, for the record: the same three programs under iyi's
+      # collector, Boehm and Go on this runner, so darwin's numbers are in
+      # every log the way Linux's are in GC_DESIGN.md. A shared runner is
+      # not a machine to gate on, and this step asserts nothing.
+      - name: The race, for the record (bench/gc_race.py)
+        run: python3 bench/gc_race.py
+
       # The collector's gates, which the collector's own darwin arm (the
       # default allocator there since the flip) had never been held to in
       # CI: the samples job runs all five on Linux, and nothing ran them
@@ -972,24 +979,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Windows is not a run target and nothing here is a gate. Three things have
-  # happened when the same Windows binary ran twenty times: it printed the
-  # right answer, it printed memory it was never given (`ache\w` where
-  # `HELLO, IYI!` belongs, or `BEEP ` with the digits gone), or it exited
-  # `0xC0000005`. The wild write behind the last two has a name now — the
-  # prelude's memset strode eight elements per eight bytes, fixed with the
-  # collector's merge (SPEC III.9 12c tells it whole) — and the probe above
-  # grew a 50,000-iteration self-checked loop so a packed-heap trample is
-  # probable rather than lucky.
-  #
-  # This job still always succeeds. It exists so the numbers are in every
-  # build's log; several clean builds of the strengthened probe in a row are
-  # what would move the README and SPEC III.9 12c, and that day is visible
-  # without anyone going looking.
+  # A Windows binary, run twenty times, and every run held to the right
+  # answer. Three things used to happen: it printed the right answer, it
+  # printed memory it was never given (`ache\w` where `HELLO, IYI!` belongs,
+  # or `BEEP ` with the digits gone), or it exited `0xC0000005`. The wild
+  # write behind the last two was the prelude's memset, striding eight
+  # elements per eight bytes, fixed with the collector's merge (SPEC III.9
+  # 12c tells it whole); the probe grew a 50,000-iteration self-checked loop
+  # so a packed-heap trample is probable rather than lucky, and this job
+  # watched without failing until several clean builds in a row had read
+  # twenty right and nothing else. Thirty-six in a row did — 720 runs, 36
+  # million self-checks, no wrong output and no crash — and the watch is a
+  # gate now: a wrong output or a crash fails the build by its tally.
   windows-probe:
     needs: cross-objects
     runs-on: windows-2022
-    name: "What a Windows binary does, twenty times (watch)"
+    name: "What a Windows binary does, twenty times"
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -1037,10 +1042,9 @@ jobs:
 
           Write-Host ""
           Write-Host ("right {0} of 20, wrong output {1}, crashed {2}" -f $right, $wrong, $crashed)
-          if ($right -eq 20) {
-            Write-Host "Twenty out of twenty. Not proof on its own, but several clean builds"
-            Write-Host "in a row would be, and the README and SPEC III.9 12c would then both"
-            Write-Host "be wrong on purpose."
+          if ($right -ne 20) {
+            Write-Host "a Windows binary answered wrong or crashed: the diagnosis SPEC III.9 12c retired is back"
+            exit 1
           }
           exit 0
 

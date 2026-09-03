@@ -124,9 +124,10 @@ libSystem's `mmap`/`munmap`, named in the floor's list with the flip as
 the reason.
 
 What it does not do yet: Windows and wasm32 keep their existing
-allocators — the first's memory diagnosis now has
-a fixed suspect (the prelude memset's stride) and CI's watch is what retires
-it, the second has no mmap and its watermark arena is a separate design.
+allocators — the first's memory diagnosis (the prelude memset's stride)
+retired after thirty-six clean builds of CI's twenty-run watch, which is a
+gate now; the second has no mmap and its watermark arena is a separate
+design.
 Threads, and with them Stages 4, 7, 8 and 9, were waiting when this was
 written; the sections after the next one are their account.
 
@@ -565,7 +566,10 @@ landed:
 | churn | 0.041 s | 15 MB | 0.03 ms | 0.4 ms | 0.080 s | 15 MB | 40 ms | 0.077 s | 15 MB | 0.17 ms | 3.5 ms |
 
 The wall time is under Go's on all three now and under Boehm's on two;
-the pauses are Go's or under on every program.
+the pauses are Go's or under on every program. Plugged in: on battery,
+under the `powersave` governor, every arm of the table reads about a
+tenth slower and binary trees' iyi and Go cells tie, so a run that is
+to be compared with this one is a run on mains.
 
 Live churn's RSS moves run to run (216 to 257 MB across four runs of
 the same binary) because the budget is what the last mark found live

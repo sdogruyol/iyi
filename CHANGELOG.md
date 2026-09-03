@@ -729,6 +729,16 @@
 
 ### Fixed
 
+- **The Windows run-time diagnosis is retired, and the watch is a gate.**
+  The prelude memset's stride was fixed with the collector's merge and
+  CI's twenty-run watch of a Windows binary, with a 50,000-iteration
+  self-check in every run, was to watch without failing until several
+  builds in a row read twenty right and nothing else. Thirty-six in a
+  row did: 720 runs, 36 million self-checks, no wrong output, no crash.
+  The job fails by its tally now, and the README, SPEC III.9 12c and
+  GC_DESIGN say what Windows is and is not: a binary that runs right,
+  not a test target, no collector, no threads.
+
 - **The thread floor's `sigsuspend` variant lost a wakeup on darwin,
   one CI run in ten.** The stop handler's `sa_mask` was empty, so a
   resume signal that landed between the handler's count-in and its
