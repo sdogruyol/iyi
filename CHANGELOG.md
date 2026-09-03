@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-09-03
+
+**The collector races Go, and is measured against it.** 0.8.0 seated iyi's
+own collector as the default; this release gives it the rest of its design
+and a number beside the collector it set out to match. The runtime has a
+kernel thread now — raw `clone` and `futex` on Linux, libSystem's pthreads on
+darwin, a stop-the-world by signal that reads the stopped thread's registers
+out of its context, and a thread-local that is the language's own
+`@[ThreadLocal]` — measured against the dependency floor before it was
+designed, and the floor did not move. On it: a parallel mark on helper
+threads with a stack per worker and a pool of batches; a mark that runs
+beside the program on a write barrier the compiler emits, a collection being
+two stops of tens of microseconds where it was one of milliseconds, with
+Go's two answers to a mutator outrunning the mark — allocate black, and
+assist; a sweep that runs beside the program too, in slices of an arena
+taken by the helpers after every collection and by an allocating thread only
+for the slice it needs; and a footprint that follows the live set — a
+one-word object header, eight-byte size classes, pages handed back to the
+kernel by the sweep and taken up again by the carve, and `IyiMark.growth`,
+Go's GOGC with Go's meaning.
+
+`bench/gc_race.py` is the measurement: three programs written once in iyi
+and once in Go, under iyi's collector, under Boehm as Crystal ships it and
+under Go's. On the twenty-core Linux machine GC_DESIGN.md records, the
+longest pause is Go's or under it on every program, the wall time is under
+Go's on all three and under Boehm's on two, and the footprint is Go's on
+churn and a budget or two over it on the rest; on darwin's three-core CI
+runner the shape is the same. Every mechanism has a gate that fails by name
+when it is removed, and the gates run on Linux x86-64, on aarch64 under
+emulation, and on darwin arm64.
+
+`Share` is built: a type's marker is decided structurally on the compiler's
+AST, `@[Share]` is trust, and a thread's block may capture only what it
+carries. The tarball went on its diet — a minimal static LLVM, 70 MB on Linux
+where it was 86 and 50 MB on darwin where it was 72, with the clean-room proof
+unchanged — and Windows' run-time diagnosis is retired after thirty-six clean
+builds of a watch that is a gate now.
+
+`.iyimod` format is unchanged at v43, and identity is the released version
+as ever: a 0.8.0 artifact is rejected by a 0.9.0 build and rebuilt, never
+migrated.
 
 ### Added
 
