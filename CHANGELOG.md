@@ -716,9 +716,9 @@
   helpers as kernel threads sized by `hw.ncpu` — and `pipe` and
   `sigaction` join with Stage 9, whose second stop registers the main
   thread and installs the stop's handler, and a line's park on darwin is
-  a pipe; the seven darwin lists carry the four, the thread floor's
-  runtime list rather than its probe's, and `bench/dependency_floor.sh`
-  says why. `bench/gc_race.py`'s docstring
+  a pipe; and `madvise` with the pages the sweep hands back. The seven
+  darwin lists carry the five, the thread floor's runtime list rather
+  than its probe's, and `bench/dependency_floor.sh` says why. `bench/gc_race.py`'s docstring
   said the Boehm arm was what Crystal ships; it is what the upstream
   compiler ships.
 
