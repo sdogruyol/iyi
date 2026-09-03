@@ -371,7 +371,7 @@
   build_typed(64_u64)
   build_chain(32_u64)
   IyiMark.mark
-  first_id = IyiHeap.read64(Held.cycle - 16_u64) & 0xFFFFFFFF_u64
+  first_id = IyiHeap.read64(Held.cycle - 8_u64).unsafe_shr(32_u64)
   raise "typed header: a class instance's type id is zero" if first_id == 0
   require_black(Held.cycle, "typed node")
   index = 0_u64
@@ -389,7 +389,6 @@
     raise "typed fields: #{count(Ledger.dead_count - whites)} of #{count(Ledger.dead_count)} integer-held addresses were retained, so the marker is following integer fields"
   end
   puts "    precision: type id #{count(first_id)} in the header, #{count(Ledger.live_count)} pointer-field children black, #{count(whites)} of #{count(Ledger.dead_count)} integer-held addresses stayed white"
-
 
   puts "    all mark checks passed"
 {% else %}

@@ -65,23 +65,24 @@ private class ShadingRace
 end
 
 describe Iyi::Collector::ObjectHeader do
-  it "is sixteen bytes" do
-    sizeof(ObjectHeader).should eq 16
+  it "is one word" do
+    sizeof(ObjectHeader).should eq 8
   end
 
-  it "lays out the type id, then alignment, then the mark word at offset 8" do
+  it "lays out the colour and flags in the low bits and the type id in the high half" do
     buffer = Pointer(ObjectHeader).malloc(1)
     buffer.value = ObjectHeader.new(7_u32)
 
-    # Little-endian, like every target iyi compiles for and like `.iyimod`.
-    buffer.as(UInt32*).value.should eq 7_u32
-    (buffer.as(UInt8*) + 8).as(UInt64*).value.should eq 0_u64
+    # Little-endian, like every target iyi compiles for and like `.iyimod`:
+    # the type id is the u32 at byte 4, which is where codegen stores it.
+    buffer.as(UInt64*).value.should eq 7_u64 << 32
+    (buffer.as(UInt8*) + 4).as(UInt32*).value.should eq 7_u32
 
-    # Shading through the pointer, the access shape Stage 2 will use against
-    # a header ahead of a heap object, touches only the word at offset 8.
+    # Shading through the pointer, the access shape the marker uses against
+    # a header ahead of a heap object, touches only the colour bits.
     buffer.value.shade_gray.should be_true
-    buffer.as(UInt32*).value.should eq 7_u32
-    (buffer.as(UInt8*) + 8).as(UInt64*).value.should eq 1_u64
+    buffer.as(UInt64*).value.should eq (7_u64 << 32) | 1_u64
+    buffer.value.type_id.should eq 7_u32
   end
 
   it "starts white with no flags and no payload" do
@@ -174,13 +175,13 @@ describe Iyi::Collector::ObjectHeader do
 
   it "round trips the reserved payload through colour and flag operations" do
     header = ObjectHeader.new(0_u32)
-    header.payload = 0x0123_4567_89AB_CDEF_u64
-    header.payload.should eq 0x0123_4567_89AB_CDEF_u64
+    header.payload = 0x0123_4567_u64
+    header.payload.should eq 0x0123_4567_u64
     header.shade_gray
     header.mark_has_finalizer
     header.pin
     header.shade_black
-    header.payload.should eq 0x0123_4567_89AB_CDEF_u64
+    header.payload.should eq 0x0123_4567_u64
     header.color.should eq Color::Black
     header.has_finalizer?.should be_true
     header.pinned?.should be_true

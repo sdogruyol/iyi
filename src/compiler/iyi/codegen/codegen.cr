@@ -2512,14 +2512,15 @@ module Iyi
         # iyi: the GC object header's `type_id` (GC_DESIGN.md Stage 5). The
         # allocator cannot write it — `malloc` is handed a size and nothing
         # else — so the store belongs here, right after the call returns,
-        # which is what the prelude's header comment promises. `P-16`, a
-        # u32, per `object_header.cr`; the same id `gc_layouts.cr` keys the
-        # embedded table by. Gated on `iyi_gc_arena?`, the prelude
-        # selection's twin: every other allocator's bytes under the pointer
-        # are its own, and a store there would corrupt the bump header or
-        # Boehm's heap.
+        # which is what the prelude's header comment promises. The high
+        # half of the header word at `P-8`, a u32 at `P-4` on the
+        # little-endian targets this reaches, per `object_header.cr`; the
+        # same id `gc_layouts.cr` keys the embedded table by. Gated on
+        # `iyi_gc_arena?`, the prelude selection's twin: every other
+        # allocator's bytes under the pointer are its own, and a store
+        # there would corrupt the bump header or Boehm's heap.
         if @program.iyi_gc_arena?
-          id_slot = gep llvm_context.int8, type_ptr, -16, "gc_type_id"
+          id_slot = gep llvm_context.int8, type_ptr, -4, "gc_type_id"
           store type_id(type), id_slot
         end
       end

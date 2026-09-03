@@ -8,21 +8,26 @@
 # by the `type_id` stored here, and Stage 7's parallel marking stands or
 # falls on colour changes being atomic.
 #
-# The header is sixteen bytes:
+# The header is one word, eight bytes ahead of the pointer the program
+# holds:
 #
-#     offset 0   type_id    u32   index into the program's layout table
-#     offset 4   padding          aligns the word that follows
-#     offset 8   mark_word  u64   atomic: colour, flags, reserved payload
+#     bits  0..1   colour: 00 white, 01 gray, 10 black
+#     bits  2..4   flags: the prelude's free, atomic and epoch bits
+#     bits  5..31  reserved
+#     bits 32..63  type_id  u32   index into the program's layout table
+#
+# It was sixteen bytes - a type id word and a mark word - beside a size
+# word the allocator kept, twenty-four in all ahead of every object, and a
+# 16-byte object cost 40 bytes of heap where Go's and Boehm's cost 16. The
+# size is the chunk's, which the arena knows; the type id is 32 bits, and
+# the mark word had 58 to spare. Codegen stores the id as a u32 at `P-4`,
+# the word's high half on the little-endian targets the collector reaches;
+# the allocator zeroes the whole word when it hands the chunk out.
 #
 # ## The mark word
 #
-# One atomic u64 holding three things at once, so recolouring an object never
-# takes a lock:
-#
-#     bits  0..1   colour: 00 white, 01 gray, 10 black
-#     bits  2..5   flags; has_finalizer and is_pinned are the intended two
-#     bits  6..63  reserved, so a forwarding pointer fits if collection ever
-#                  moves objects
+# One atomic u64 holding the colour, the flags and the type id at once, so
+# recolouring an object never takes a lock and never disturbs its type:
 #
 # A colour transition is a compare-and-swap over the whole word with the
 # expected colour folded into the expected word, never a plain write. Two
@@ -34,7 +39,7 @@
 #
 # The tri-colour invariant, stated where the transitions are: a black object
 # holds no pointer to a white one. `shade_gray` is how the invariant becomes
-# true (a white child is shaded before its parent goes black); Stage 6's
+# true (a white child is shaded before its parent goes black); Stage 9's
 # write barrier is how it stays true while mutators run. Mutators never
 # write the mark word themselves (GC_DESIGN.md, Stage 1 task 3).
 #
@@ -66,23 +71,27 @@ module Iyi::Collector
     HAS_FINALIZER = 1_u64 << 2
     IS_PINNED     = 1_u64 << 3
 
-    # Everything from this bit up is the reserved payload: 58 bits today, a
-    # forwarding pointer's home if moving collection is ever added.
-    PAYLOAD_SHIFT = 6
-    PAYLOAD_MAX   = UInt64::MAX >> PAYLOAD_SHIFT
+    # The type id's home: the high half of the word.
+    TYPE_SHIFT = 32
+    TYPE_MASK  = UInt64::MAX << TYPE_SHIFT
 
-    # The bits a payload write must not touch: colour and flags together.
-    NON_PAYLOAD_MASK = (1_u64 << PAYLOAD_SHIFT) - 1
+    # Between the flags and the type id is the reserved payload: 27 bits.
+    PAYLOAD_SHIFT = 5
+    PAYLOAD_MAX   = (1_u64 << (TYPE_SHIFT - PAYLOAD_SHIFT)) - 1
 
-    @type_id : UInt32
+    # The bits a payload write must not touch: colour, flags and type.
+    NON_PAYLOAD_MASK = ((1_u64 << PAYLOAD_SHIFT) - 1) | TYPE_MASK
+
     @mark_word : Atomic(UInt64)
 
-    def initialize(@type_id : UInt32)
-      # White, no flags, no payload: the all-zero word.
-      @mark_word = Atomic(UInt64).new(0_u64)
+    def initialize(type_id : UInt32)
+      # White, no flags, no payload: the type id alone.
+      @mark_word = Atomic(UInt64).new(type_id.to_u64 << TYPE_SHIFT)
     end
 
-    getter type_id : UInt32
+    def type_id : UInt32
+      (@mark_word.get >> TYPE_SHIFT).to_u32
+    end
 
     # The colour, read out of the word without disturbing flags or payload.
     def color : Color
@@ -119,9 +128,10 @@ module Iyi::Collector
       set_flag(IS_PINNED)
     end
 
-    # The reserved high bits, with colour and flags shifted away.
+    # The reserved middle bits, with colour and flags shifted away and the
+    # type id masked off.
     def payload : UInt64
-      @mark_word.get >> PAYLOAD_SHIFT
+      (@mark_word.get & ~TYPE_MASK) >> PAYLOAD_SHIFT
     end
 
     # Replaces the reserved payload, leaving colour and flags untouched.
@@ -131,7 +141,7 @@ module Iyi::Collector
     # truncated forwarding pointer is a corrupted heap.
     def payload=(value : UInt64) : Nil
       if value > PAYLOAD_MAX
-        raise ArgumentError.new("payload #{value} does not fit in #{64 - PAYLOAD_SHIFT} bits")
+        raise ArgumentError.new("payload #{value} does not fit in #{TYPE_SHIFT - PAYLOAD_SHIFT} bits")
       end
       word = @mark_word.get
       loop do

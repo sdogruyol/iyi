@@ -24,7 +24,7 @@
 #   3. The numbers, printed from the release run: allocations per thread,
 #      collections, stops, and the wall time per allocation per thread at
 #      1, 4 and 8 threads. Reported rather than budgeted.
-#   4. The same, 32 threads, release — past the core count on any runner —
+#   4. The same, twice the cores' worth of threads, release — past the core count —
 #      because a thread stopped while it has no CPU is the case the
 #      floor's table said costs the timeslice, and the properties must hold
 #      there too.
@@ -119,12 +119,20 @@ case "$(uname -s)" in
 esac
 
 # ── 3. The numbers ────────────────────────────────────────────────────────
-step "the numbers, release build ($(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) cores here)"
+cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)"
+step "the numbers, release build ($cores cores here)"
 grep -E '^(threads|speed):' answers-release.txt | sed 's/^/  /'
 
 # ── 4. Past the core count ────────────────────────────────────────────────
-step "the same, 32 threads, release"
-if ! timeout 300 ./threads-release 32 > answers-32.txt 2>&1; then
+# Twice the cores, at least nine and at most 32: past the core count on
+# any runner, and within a runner's patience - 32 threads on the darwin
+# runner's three cores are a stop of 33 for every one of the three that
+# can run, and the step outlived its five minutes there.
+over=$((cores * 2))
+[ "$over" -lt 9 ] && over=9
+[ "$over" -gt 32 ] && over=32
+step "the same, $over threads, release (past the $cores cores here)"
+if ! timeout 300 ./threads-release "$over" > answers-32.txt 2>&1; then
   cat answers-32.txt; exit 1
 fi
 grep -q 'every property held' answers-32.txt || { cat answers-32.txt; exit 1; }

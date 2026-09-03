@@ -173,7 +173,7 @@
     if IyiHeap.read64(address - 8_u64) & IyiHeap::FREE_FLAG != 0
       fail("round #{round}: the payload moved into a black holder under the mark was freed: the barrier lost it")
     end
-    fail("round #{round}: the payload's seed is #{payload.seed.to_i64} rather than #{seed.to_i64}: its chunk was reused") if payload.seed != seed
+    fail("round #{round}: the payload's seed is #{payload.seed.to_i64} rather than #{seed.to_i64}: its chunk was reused, the barrier lost it") if payload.seed != seed
     fail("round #{round}: the payload's bytes changed under the mark") unless payload.intact?
   end
 

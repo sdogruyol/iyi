@@ -63,6 +63,13 @@
     def self.go : Pointer(Atomic(UInt64))
       Pointer(Atomic(UInt64)).new(@@page + 192_u64)
     end
+
+    # Each thread takes its number here, not from a captured variable: a
+    # block captures the variable, not its value, and every thread
+    # started from one loop read the last iteration's.
+    def self.numbers : Pointer(Atomic(UInt64))
+      Pointer(Atomic(UInt64)).new(@@page + 256_u64)
+    end
   end
 
   # A list, and beside it a ledger of every node's address in a mapping
@@ -90,7 +97,11 @@
       index = 0
       while index < @count
         address = Pointer(UInt64).new(@nodes)[index]
-        freed = freed + 1_i64 if IyiHeap.read64(address - 8_u64) & IyiHeap::FREE_FLAG != 0
+        # Freed by the sweep: the flag it set, or a header word of zero,
+        # which is the page handed back to the kernel and read again - a
+        # live node's word carries its type id and is never zero.
+        word = IyiHeap.read64(address - 8_u64)
+        freed = freed + 1_i64 if word & IyiHeap::FREE_FLAG != 0 || word == 0_u64
         index = index + 1
       end
       freed
@@ -137,8 +148,32 @@
   # One thread's body: a live list, churn that triggers collections here
   # and lets other threads' collections stop this one, the list checked
   # after each burst; then fibers of its own.
-  def thread_body(seed : UInt64) : Nil
+  # Every ledger, held from a global: the ledger's own object is heap,
+  # and in the driver's failure proof - the thread-root walk removed -
+  # a ledger held only by its thread's frame was swept, its page handed
+  # back, and the check that names the fault read the ledger through
+  # zeros. The global's array is a root in every build.
+  class Ledgers
+    @@all : Array(Ledger?) = [] of Ledger?
+
+    def self.reserve(count : Int32) : Nil
+      index = 0
+      while index <= count
+        @@all << nil
+        index = index + 1
+      end
+    end
+
+    def self.hold(slot : Int32, ledger : Ledger) : Nil
+      @@all[slot] = ledger
+    end
+  end
+
+  def thread_body : Nil
+    number = Tally.numbers.value.add(1_u64) + 1_u64
+    seed = number * 100000_u64
     ledger = Ledger.new(1000)
+    Ledgers.hold(number.to_i32, ledger)
     list = build_list(1000, seed, ledger)
     expected = checksum(list)
     # First, one collection nobody here triggers: the list built, this
@@ -191,10 +226,10 @@
 
   def start_threads(count : Int32) : Array(IyiThread)
     threads = Array(IyiThread).new
+    Ledgers.reserve(count)
     index = 0
     while index < count
-      seed = (index + 1).to_u64 * 100000_u64
-      threads << IyiThread.start { thread_body(seed) }
+      threads << IyiThread.start { thread_body }
       index = index + 1
     end
     threads
@@ -218,6 +253,7 @@
   threads = start_threads(count)
   # The main thread churns beside them and holds a list of its own.
   main_ledger = Ledger.new(1000)
+  Ledgers.hold(0, main_ledger)
   main_list = build_list(1000, 1_u64, main_ledger)
   main_sum = checksum(main_list)
   # The one explicit collection, with every worker spinning on its list.

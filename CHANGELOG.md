@@ -630,7 +630,70 @@
   for a program that reads the count after churn: the count is of
   finished collections, and a mark beside the program is not one yet.
 
+- **The heap's footprint follows the live set: a one-word header,
+  eight-byte size classes, pages handed back to the kernel, and Go's two
+  answers to a mutator outrunning the mark.** Binary trees held 6 MB
+  live in 62 MB resident, three times Go, and the reasons were four.
+  The header was three words ahead of every object - a size, a type id,
+  a mark word - so a 16-byte object cost 40 bytes of heap where Go's and
+  Boehm's cost 16; the size is the chunk's, which the arena knows, and
+  the type id is 32 bits in a word that had 58 to spare, so the header
+  is one word at `P-8`, the type id its high half, stored by codegen as
+  a u32 at `P-4`. The classes were powers of two, so a 24-byte object -
+  two pointers behind a type id, the commonest shape - took 32 and a
+  40-byte one 64; they are eight-byte steps to 128 and quarter steps
+  above, 67 in all. The sweep hands runs of dead pages back with
+  `madvise(MADV_DONTNEED)`, a bit per page in the arena's header page,
+  and the carve takes a run up again before it touches the frontier,
+  which it carves a slab at a time so the heap fills from its low
+  addresses. Every free list is dropped at the pause, because a chunk
+  left on one between two dead ones broke their run and kept its page
+  resident (1.5 MB live keeping 12 MB); the epoch's sweeps keep a
+  budget's worth of free pages resident and release what is free beyond
+  it, because releasing on sight cost a 64-byte allocation 220 ns for
+  the fault and the syscall (21 now); arenas and the marker's stacks
+  refuse transparent huge pages, two megabytes resident for a class
+  with ten objects. Objects born under the mark are born black, not
+  gray: born gray they fed the pool a batch per sixty-four allocations
+  from every thread and the mark could not find the pool empty to end.
+  And the assist: a mutator that allocated 64 KB under a running mark
+  scans a thousand objects of the pool's first - thirty-two threads bore
+  13 MB beside a 4 MB budget without it, and every collection's end was
+  the next one's trigger. Two things left the stop on the way: the
+  scavenge's `munmap` (half a millisecond per resident 16 MB mapping,
+  ten of them a 5 ms stop) waits for the program to be running, and the
+  allocator's sweeps run outside the runtime lock, in parallel, claimed
+  by epoch - thirty-two threads refilling at once after a collection
+  and sweeping in turn under one lock were a convoy the thread exercise
+  measured as a hang. An arena is one cache's at a time; a region is
+  never set in an arena a walk holds; a walk parked through a pause
+  discards its batch; the scavenge leaves alone what is claimed, walked,
+  or named by a parked walker. `bench/gc_race.py`, release, 20 cores:
+  binary trees 62 MB resident to 29 (Go 17, Boehm 18), longest pause
+  0.16 ms (Go 0.17); live churn 316 MB to 171 (Go 115), 0.08 ms (Go
+  0.11); churn 38 MB to 15 (Go 15), 0.03 ms (Go 0.45). The thread
+  exercise's price, release: 26 ns an allocation with one thread, 63
+  with four, 162 with eight (22, 58, 139 before the pages).
+  `IyiHeap.size_of` answers what the header's size word did;
+  `IyiMark.settle` waits out a collection in flight; the arena
+  exercise's size-class and header checks say the new shapes.
+
 ### Fixed
+
+- **The second stop's probe left live counts in its page, and the
+  scavenge unmapped an arena under its live objects.** The bounded drain
+  the second stop runs counts what it blackens per arena on helper 0's
+  page and flushed nothing before the scavenge read the arenas' counts;
+  an arena whose only live objects were in that pending count read as
+  empty, was handed back, and the next collection's flush wrote into the
+  unmapped page - a segfault one run in ten with thirty-two threads,
+  and corruption before that. The probe flushes before the scavenge.
+
+- **Helpers' marked bytes were folded twice, and live churn's budget
+  was twice its live set's double.** The second stop folds every worker
+  page's bytes for the mutators' assists, and a helper's page is on that
+  list too, already folded at its drain's end: 40 MB live read as 76.
+  A helper's fold zeroes what it folded.
 
 - **The layout table refused a `StaticArray`, and any program holding
   one in an `uninitialized` local failed to build.** `gc_type_layout`
@@ -3487,7 +3550,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 8,299-line library and nothing else. Every other
+  written against iyi's own 8,815-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

@@ -9,10 +9,14 @@ threads the runtime has (`src/iyi/thread.iyi`, the section below); Stage 7
 is the parallel marker on helper threads; Stage 9 is the mark beside the
 program, on the compiler's write barrier, with two stops of tens of
 microseconds where the mark was one stop of milliseconds (the section
-after Stage 4's). Stage 8, the sweep beside the program, is the next
-measured target: the last epoch's sweep debt is paid by the triggering
-thread before its stop, and it is the largest thing a collection still
-costs a single-threaded program. Stage 10 is design.
+after Stage 4's). The heap's footprint follows the live set: a one-word
+header, size classes eight bytes apart, pages handed back to the kernel
+by the sweep and taken up again by the carve, and Go's two answers to
+a mutator outrunning the mark - allocate black, and assist (the section
+after Stage 9's). Stage 8, the sweep beside the program, is half built:
+the allocator's sweeps run outside the runtime lock, in parallel; what
+remains in a stop is the last epoch's debt, paid by the triggering
+thread before its first stop. Stage 10 is design.
 
 Stage 6: the sweep. One walk over every carved chunk, a white object's chunk
 goes back on its class's free list, a black one survives and is repainted white
@@ -34,8 +38,11 @@ swept, chunks kept, bytes freed, collections run.
 Stage 5: the mark phase. Roots go gray through Stage 3's walker, a queue in its
 own mapping drains, each object's payload is scanned to the bound its size
 header carries, and what is still white when the queue empties is unreachable.
-The object header is real now: with `P` the pointer a program holds, `P-24` is
-the size, `P-16` the `type_id`, `P-8` the mark word, and `P` the user data.
+The object header is real now, and it is one word: with `P` the pointer a
+program holds, `P-8` is the mark word - colour, flags, and the `type_id`
+in its high half - and `P` the user data. The size is the chunk's, which
+the arena knows (the section on the heap's footprint, below, says what
+the three-word header it replaced cost).
 
 Marking is **precise for typed objects and conservative for the rest**.
 Codegen stores the `type_id` into the header at the allocation site
@@ -472,10 +479,92 @@ The pauses are Go's now or under them, on every program (binary trees'
 longest was 2.3 ms with the parallel marker alone, 2.7 before it).
 Wall time is Boehm's column on two of three: the write barrier's
 test is on every pointer store, and the helpers share the cores the
-program runs on. Resident memory is Go's column — the price of no
-assists: a mutator allocating faster than the helpers mark is never
-slowed, and the budget grows from the marked bytes. That, and Stage 8,
-are the next measured targets.
+program runs on. Resident memory was Go's column by three times, and
+the section below is what closed it.
+
+**The footprint follows the live set: a one-word header, eight-byte
+classes, pages handed back, allocate-black and the assist.** Binary
+trees held 6 MB live in 62 MB resident, and the reasons were four.
+
+The header was three words - a size, a type id, a mark word - ahead of
+every object, so a 16-byte object cost 40 bytes of heap where Go's and
+Boehm's cost 16. The size is the chunk's, which the arena knows
+(`IyiHeap.size_of` reads it there, or off a large object's node); the
+type id is 32 bits and the mark word had 58 to spare; so the header is
+one word at `P-8`, colour and flags in its low bits and the type id in
+its high half, stored by codegen as a u32 at `P-4`. A free chunk's link
+and its batch's chain ride in the payload, which is nobody's while it
+is free. The size classes were powers of two, so a 24-byte object -
+two pointers behind its type id, the commonest shape a program has -
+took a 32-byte class and a 40-byte object a 64-byte one; they are
+eight-byte steps to 128 and four to each doubling above, 67 classes,
+and the waste is capped at eight bytes below 128 and a fifth above. A
+16-byte object costs 24 bytes now, a 24-byte one 32: Boehm's granule.
+
+Then the pages. A collector that frees chunks but never pages has a
+resident size that is its high-water mark. The sweep hands runs of dead
+pages back to the kernel with `madvise(MADV_DONTNEED)` (darwin:
+`MADV_FREE_REUSABLE`), a bit per page in the arena's first page saying
+so, and the carve takes a run up again as its bump region before it
+touches the frontier - which it now carves a slab at a time, 64 KB, so
+that the heap fills from its low addresses and the frontier stays cold.
+A chunk is on a released page when its head is; such a chunk is on no
+list, reads as zero, and the mark, the sweep and the root walk refuse it
+by the bit. Three things the build found. Every free list is dropped at
+the pause, the centre's and each stopped thread's cache's: a chunk left
+on a list between two dead ones broke the run they would have made and
+kept its page resident, and with the lists carried across an arena of
+40-byte chunks holding 1.5 MB live kept 12 MB of pages. Released on
+sight, every page the program churns through went back and came back
+each cycle, a syscall per run and a fault per page, and a 64-byte
+allocation cost 220 ns where it had cost 21: the epoch's sweeps keep a
+budget's worth of free pages resident - what the program will allocate
+before the next collection - and release what is free beyond it. And a
+16 MB arena touched at one end was given a transparent huge page, two
+megabytes resident for a class with ten objects in it, so arenas and
+the marker's stacks refuse them by `madvise`.
+
+Then what Go does about a mutator outrunning the mark, both halves.
+Objects born under the mark are born black: their fields are empty and
+every store into them goes through the barrier, so there is nothing to
+scan - born gray, they fed the pool a batch per sixty-four allocations
+from every thread and the mark could not find the pool empty to end.
+And the assist: a mutator that allocated a slice (64 KB) under a
+running mark scans a thousand objects of the pool's before it goes on,
+counting itself active on the pool while it holds a batch. Thirty-two
+threads allocating through a mark bore 13 MB beside a 4 MB budget, and
+every collection's end was the next one's trigger.
+
+Two things moved out of the stop on the way. The scavenge's unmap: the
+kernel frees a resident 16 MB mapping in half a millisecond, ten of
+them were the whole of a 5 ms stop, and a released arena - off the
+list, out of the directory - is nobody's to touch, so the unmap waits
+for the program to be running again. And the allocator's sweep runs
+outside the runtime lock, claimed by epoch: with every list dropped at
+the pause every thread refills at once after a collection, and
+thirty-two threads sweeping one arena each in turn under one lock were
+a convoy the thread exercise measured as a hang. An arena is one
+cache's at a time, claimed under the lock when a region is set in it,
+so two caches never bump one cursor; a region is never set in an arena
+a walk holds; a walk that parked through a pause discards its batch as
+the old epoch's; and the scavenge leaves alone an arena that is
+claimed, or walked, or whose mapping a parked walker still names.
+
+The table, read again with all of it in:
+
+| program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| binary trees | 0.218 s | 29 MB | 0.16 ms | 2.3 ms | 0.171 s | 18 MB | 63 ms | 0.164 s | 17 MB | 0.17 ms | 2.1 ms |
+| live churn | 0.176 s | 171 MB | 0.08 ms | 0.3 ms | 0.148 s | 91 MB | 92 ms | 0.191 s | 115 MB | 0.11 ms | 0.4 ms |
+| churn | 0.051 s | 15 MB | 0.03 ms | 0.3 ms | 0.077 s | 15 MB | 39 ms | 0.078 s | 15 MB | 0.45 ms | 4.1 ms |
+
+Churn's footprint is Go's and Boehm's; binary trees' is within a
+budget of Go's (its live set doubles into the next budget the same
+way, and Go's 16-byte node is our 32-byte one, its type id ahead of
+two pointers); live churn's is a budget over Go's, which is the same
+policy applied to a 40 MB live set. What remains is the wall time,
+which is the barrier's test on every pointer store and the helpers'
+share of the cores, and Stage 8's other half.
 
 **darwin's thread is measured too, and it is the pthreads price by
 name.** III.9's rule there is the opposite of Linux's: raw syscalls are

@@ -102,14 +102,15 @@ prove_fails() {
     "$(grep -m1 "$phrase" "$WORK/$dir/out" | sed 's/^iyi: panic: //')"
 }
 
-# The walk still counts, repaints and links, it just never hands the batch
-# to the centre.
+# The walk still counts and repaints, it just never closes a run of dead
+# chunks: nothing is linked, nothing handed back, nothing reused.
+
 prove_fails "sweep frees nothing" nofree "sweep:" \
-  '{ if ($0 ~ /IyiHeap\.free_batch\(IyiHeap\.class_index/) { print "        # removed"; next } print }'
+  '{ if (!done && $0 ~ /^            batch_head = cursor$/) { print "            # removed"; done = 1; next } print }'
 
 # The colour test stops mattering, so a live object goes on the free list.
 prove_fails "sweep frees the live" reckless "sweep:" \
-  '{ if ($0 ~ /^            if word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag$/) { print "            if true"; next } print }'
+  '{ if ($0 ~ /^          if word & IyiHeap::FREE_FLAG != 0 \|\| \(word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag\)$/) { print "          if true"; next } print }'
 
 echo
 if [ "$status" -eq 0 ]; then
