@@ -1103,8 +1103,11 @@ require "./file"
       # allocations cost no shared write until then.
       def self.take(size : UInt64, clear : Bool) : UInt64
         table = cache
-        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) + 1_u64)
-        slice = read64(table.address + CACHE_SLICE) + size
+        # The arithmetic on the way in and out is wrapping: a counter on
+        # a page cannot overflow, and a checked add is a branch each on
+        # the path every allocation takes.
+        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) &+ 1_u64)
+        slice = read64(table.address + CACHE_SLICE) &+ size
         if slice >= SLICE
           write64(table.address + CACHE_SLICE, 0_u64)
           # Before the carve: a collection triggered here cannot sweep the
@@ -1133,7 +1136,7 @@ require "./file"
       # Out of the allocator, or the barrier: the depth counter down, and
       # a stop that was deferred while it was up is paid now.
       def self.leave(table : Pointer(UInt64)) : Nil
-        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) - 1_u64)
+        write64(table.address + CACHE_INSIDE, read64(table.address + CACHE_INSIDE) &- 1_u64)
         {% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || (flag?(:darwin) && flag?(:aarch64))) %}
           if read64(table.address + CACHE_INSIDE) == 0_u64 && read64(table.address + CACHE_REQUEST) != 0
             IyiThread.park_if_requested
@@ -1157,7 +1160,10 @@ require "./file"
 
       def self.take_inside(table : Pointer(UInt64), size : UInt64, clear : Bool) : UInt64
         return take_large(size, clear) if size > TOP
-        index = class_index(size)
+        # The small classes' index inline: `class_index` has a loop for
+        # the large ones and is a call, and a call is what most
+        # allocations would pay for a shift.
+        index = size <= 128_u64 ? (size <= 16_u64 ? 0 : ((size &+ 7_u64).unsafe_shr(3_u64).to_i64 &- 2_i64).to_i32) : class_index(size)
         head = table[index]
         head = refill(table, index) if head == 0
         if head != 0
@@ -1217,9 +1223,9 @@ require "./file"
         # already wear this epoch's parity or it would read as last
         # epoch's dead — freed under the thread about to hand it out.
         write64(cursor + OFF_MARK, IyiMark.epoch_flag)
-        following = cursor + read64(arena + OFF_CHUNK)
+        following = cursor &+ read64(arena + OFF_CHUNK)
         Pointer(Atomic(UInt64)).new(arena + OFF_CURSOR).value.set(following)
-        write64(arena + OFF_LEFT, read64(arena + OFF_LEFT) - 1)
+        write64(arena + OFF_LEFT, read64(arena + OFF_LEFT) &- 1_u64)
         write64(arena + OFF_HIGH, following) if following > read64(arena + OFF_HIGH)
         cursor
       end
@@ -1684,16 +1690,16 @@ require "./file"
       def self.clear_block(start : UInt64, count : UInt64) : Nil
         words = Pointer(UInt64).new(start)
         filled = 0_u64
-        while filled + 8 <= count
+        while filled &+ 8_u64 <= count
           words.value = 0_u64
           words = words + 1_i64
-          filled = filled + 8
+          filled = filled &+ 8_u64
         end
-        bytes = Pointer(UInt8).new(start + filled)
+        bytes = Pointer(UInt8).new(start &+ filled)
         while filled < count
           bytes.value = 0_u8
           bytes = bytes + 1_i64
-          filled = filled + 1
+          filled = filled &+ 1_u64
         end
       end
 
@@ -3960,11 +3966,7 @@ require "./file"
             end
             # The retreats are spent and work remains: with the helpers,
             # inside the stop, the one case the stop is not bounded.
-            if unfinished
-              generation = remainder_round(w)
-            else
-              generation = pool_word(POOL_GENERATION).value.get
-            end
+            remainder_round(w) if unfinished
             @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
             @@last_marked = @@bytes_marked
             LibIyiGCTable.__iyi_marking = 0_u8
@@ -4007,7 +4009,9 @@ require "./file"
             @@concurrent_collections = @@concurrent_collections + 1_u64
             @@collecting = false
             IyiRuntimeLock.unlock
-            return generation
+            # The generation as it stands - turned for the remainder and
+            # again for the sweep round - is the one helper 0 waits past.
+            return pool_word(POOL_GENERATION).value.get
           end
         end
 

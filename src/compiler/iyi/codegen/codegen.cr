@@ -2499,14 +2499,20 @@ module Iyi
 
     def allocate_aggregate(type)
       struct_type = llvm_struct_type(type)
+      cleared = false
       if type.passed_by_value?
         type_ptr = alloca struct_type
       else
         if type.is_a?(InstanceVarContainer) && !type.struct? &&
            type.all_instance_vars.each_value.any? &.type.has_inner_pointers?
           type_ptr = malloc struct_type
+          # iyi: the collector's clearing entry hands the chunk back
+          # zeroed - the mark loop reads its words - so the memset below
+          # would zero it twice. The atomic entry clears nothing.
+          cleared = @program.iyi_gc_arena?
         else
           type_ptr = malloc_atomic struct_type
+          cleared = false
         end
 
         # iyi: the GC object header's `type_id` (GC_DESIGN.md Stage 5). The
@@ -2525,11 +2531,11 @@ module Iyi
         end
       end
 
-      pre_initialize_aggregate(type, struct_type, type_ptr)
+      pre_initialize_aggregate(type, struct_type, type_ptr, cleared: cleared)
     end
 
-    def pre_initialize_aggregate(type, struct_type, ptr)
-      memset ptr, int8(0), size_t(struct_type.size)
+    def pre_initialize_aggregate(type, struct_type, ptr, cleared = false)
+      memset ptr, int8(0), size_t(struct_type.size) unless cleared
       run_instance_vars_initializers(type, type, ptr)
 
       unless type.struct?

@@ -676,7 +676,14 @@
   with four, 162 with eight (22, 58, 139 before the pages).
   `IyiHeap.size_of` answers what the header's size word did;
   `IyiMark.settle` waits out a collection in flight; the arena
-  exercise's size-class and header checks say the new shapes.
+  exercise's size-class and header checks say the new shapes. And the
+  allocation path lost what it did twice or checked for nothing: codegen
+  no longer zeroes an aggregate the clearing entry handed back zeroed,
+  the counters on the cache page add without an overflow branch, and the
+  small classes' index is a shift inline rather than a call - binary
+  trees 239 ms to 226. The thread exercise's oversubscription step runs
+  twice the cores' worth of threads, at least nine and at most 32: 32 on
+  the darwin runner's three cores outlived the step's five minutes.
 
 ### Fixed
 
