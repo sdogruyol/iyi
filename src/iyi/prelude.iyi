@@ -1451,15 +1451,22 @@ require "./file"
         base
       end
 
+      # Arenas below this many - 128 MB - are refused transparent huge pages: a
+      # huge page given to an arena's first touch is two megabytes
+      # resident for a class with ten objects in it, and eight such
+      # arenas were 16 MB of binary trees' footprint. Past it the heap is
+      # large, the two megabytes are a rounding of it, and the page walk
+      # the huge pages save is what a large heap pays most: live churn,
+      # 48 MB live, ran 17% faster on them.
+      HUGE_FROM = 8_u64
+      @@arenas_mapped : UInt64 = 0_u64
+
       def self.map_arena(index : Int32, owner : UInt64) : UInt64
         base = map_aligned
-        # Four-kilobyte pages, not two-megabyte ones: the sweep hands pages
-        # back at that grain, and a huge page given to an arena's first
-        # touch is two megabytes resident for a class with ten objects in
-        # it - eight such arenas were 16 MB of binary trees' footprint.
         {% if flag?(:linux) %}
-          __iyi_madvise_nohuge(base, MAP)
+          __iyi_madvise_nohuge(base, MAP) if @@arenas_mapped < HUGE_FROM
         {% end %}
+        @@arenas_mapped = @@arenas_mapped &+ 1_u64
         chunk = payload(index) + HEADER
         write64(base + OFF_MAP, MAP)
         write64(base + OFF_CHUNK, chunk)

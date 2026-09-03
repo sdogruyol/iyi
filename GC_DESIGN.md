@@ -521,8 +521,11 @@ allocation cost 220 ns where it had cost 21: the epoch's sweeps keep a
 budget's worth of free pages resident - what the program will allocate
 before the next collection - and release what is free beyond it. And a
 16 MB arena touched at one end was given a transparent huge page, two
-megabytes resident for a class with ten objects in it, so arenas and
-the marker's stacks refuse them by `madvise`.
+megabytes resident for a class with ten objects in it, so the marker's
+stacks and the heap's first eight arenas refuse them by `madvise`;
+past 128 MB of arenas the two megabytes are a rounding of the heap and
+the page walk they save is what a large heap pays most - live churn,
+48 MB live, ran 17% faster on huge pages, and gets them.
 
 Then what Go does about a mutator outrunning the mark, both halves.
 Objects born under the mark are born black: their fields are empty and

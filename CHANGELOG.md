@@ -651,9 +651,11 @@
   resident (1.5 MB live keeping 12 MB); the epoch's sweeps keep a
   budget's worth of free pages resident and release what is free beyond
   it, because releasing on sight cost a 64-byte allocation 220 ns for
-  the fault and the syscall (21 now); arenas and the marker's stacks
-  refuse transparent huge pages, two megabytes resident for a class
-  with ten objects. Objects born under the mark are born black, not
+  the fault and the syscall (21 now); the marker's stacks and the
+  heap's first eight arenas refuse transparent huge pages, two megabytes
+  resident for a class with ten objects, and past 128 MB of arenas the
+  heap takes them, for the page walk they save a large heap (live churn
+  17% faster). Objects born under the mark are born black, not
   gray: born gray they fed the pool a batch per sixty-four allocations
   from every thread and the mark could not find the pool empty to end.
   And the assist: a mutator that allocated 64 KB under a running mark
