@@ -4,6 +4,47 @@
 
 ### Added
 
+- **Every collection starts stopped and goes beside the program if the
+  live set turns out large.** Which thread a mark runs on was decided
+  from an estimate - the last mark's live bytes against a megabyte -
+  and the estimate was wrong in both directions: binary trees' second
+  mark read sixteen bytes, the stretch tree having gone, and marked a
+  three-megabyte tree inside its pause (2 ms in a table of tens of
+  microseconds), while churn's tiny live set read as tiny for a mark
+  with four megabytes of fresh allocation to walk. There is no estimate
+  now. Every collection stops the world, shades the roots and marks up
+  to a thousand objects on the triggering thread; a mark that ends
+  inside the bound was the whole mark, one stop and no helper woken
+  (churn's 122 collections are all of them, 87 µs longest), and one
+  that does not hands its stack to the pool and goes beside the program
+  with every helper there is - beside the program the mark's length is
+  what the mutator pays for, and the cores are otherwise idle, where
+  inside a pause fifteen helpers over three megabytes cost twice what
+  three did. Binary trees' longest pause is 102 µs where the estimate
+  left it at 2 ms.
+
+- **A mark asks for the helpers it needs, and each helper parks on a
+  word of its own.** A mark's permits are as many as it asks; a helper
+  woken without one parks again without counting itself in. On Linux
+  the park words are a cache line apart in the pool, so waking three
+  helpers wakes three threads rather than fifteen - fourteen threads
+  woken to find nothing were a fifth of churn's wall time.
+
+- **A thread-local is one load under iyi's prelude.** Crystal reaches
+  a `@[ThreadLocal]` through a `noinline` accessor, which is what keeps
+  LLVM from hoisting the address across a fiber switch that lands the
+  fiber on another thread. An iyi fiber belongs to its scheduler thread
+  and never moves, so the address is a constant for the fiber's life:
+  the accessor is gone under iyi's prelude and the allocator's cache
+  pointer is one `%fs:`/`tpidr_el0` load, where it was four calls per
+  allocation. A `--crystal` program keeps the accessor, its fibers
+  being Crystal's.
+
+- **An assist yields to a stop.** A mutator that assists the mark scans
+  up to a thousand objects inside the allocator, where a stop is
+  deferred until the thread leaves - a hundred microseconds a second
+  stop waited for. It stops assisting the moment a stop is asked for.
+
 - **One type id: an object is its fields.** Crystal's layout carries
   the type id as an `i32` at the object's front, and iyi's header
   carried it in the mark word's high half too, so every class object
@@ -23,6 +64,13 @@
   id").
 
 ### Fixed
+
+- **A bounded first stop left its live counts in the worker's page.**
+  A mark that ends inside the bound does not reach the drain's end,
+  where the pending per-arena live counts are flushed, so the scavenge
+  read an arena whose only live objects sat in that count as empty and
+  handed its mapping back under them - a segfault one run in seventy.
+  Flushed before the scavenge now.
 
 - **A helper at the sweep round left it when every arena with work
   was inside another's slice.** It read that as nothing left and went
@@ -3736,7 +3784,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,285-line library and nothing else. Every other
+  written against iyi's own 9,446-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

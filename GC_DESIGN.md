@@ -680,6 +680,43 @@ cores give the mark one helper and the sweep round two; and live
 churn's footprint under Go's there, whose 274 MB is the same live set
 at Go's own budget on a machine with less memory to spare.
 
+**Which thread a mark runs on is measured, not estimated.** A mark
+beside the program costs two stops and a helper's wake; a mark inside
+one stop costs the live set. Until 0.10.0 the choice came from an
+estimate - the last mark's live bytes against `PARALLEL_FROM`, a
+megabyte - and an estimate is the last mark's, not this one's. Binary
+trees' second mark read sixteen bytes, the stretch tree having gone,
+and marked the three-megabyte long-lived tree inside its pause: 2 ms,
+in a table whose other rows are tens of microseconds. Bounding the
+estimate the other way (the last mark's bytes plus what was allocated
+since, which is what could be live) put churn's 122 tiny marks beside
+the program, and waking fifteen helpers 122 times cost churn three
+times its wall time.
+
+So there is no estimate. Every collection stops the world, pays the
+sweep debt, shades the roots and then marks up to `STW_MARK_BOUND` =
+1024 objects on the triggering thread, with nothing running and no
+barrier needed. A mark that ends inside the bound *was* the whole
+mark: the collection finishes in that one stop, no helper woken, no
+second stop - churn's every collection, 87 µs at its longest. One that
+does not is a large live set: the triggering thread hands what is left
+of its stack to the pool in batches, raises the marking flag, releases
+the threads and wakes the helpers, and helper 0 finishes with the
+second stop as before. The bound is a thousand objects because that is
+about ten microseconds of scanning, which is the price of finding out.
+
+What the mark asks for changed with it. A concurrent mark asks every
+helper there is, where sizing it by the live set (one per megabyte) cost
+binary trees a tenth of its wall time: inside a pause the wake and the
+end-detection are on the critical path, so fifteen helpers over three
+megabytes cost twice what three did, but beside the program the mark's
+length is what the mutator pays for - in barrier work, in assists, in a
+budget it cannot reset - and the cores are otherwise idle. A mark's
+permits are as many helpers as it asks, and a helper woken without one
+parks again without counting itself in; on Linux each helper parks on a
+word of its own, a cache line apart, so waking three wakes three
+threads rather than fifteen.
+
 **One type id: the object is its fields.** Crystal's object layout
 puts the type id at the object's front, an `i32` before the first
 field, and the header above put it in the mark word's high half too:

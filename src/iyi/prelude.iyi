@@ -3435,6 +3435,9 @@ require "./file"
 
         def self.wake_helpers : Nil
         end
+
+        def self.wake_some_helpers(count : UInt64) : Nil
+        end
       {% end %}
 
       # Put every live object back to white, so a second phase starts from
@@ -4192,11 +4195,18 @@ require "./file"
           start_helpers(@@helpers_wanted)
           close_sweep_round
           if concurrent_possible?
-            # The mark runs beside the program: this thread stops the world
-            # for the roots only and goes back to its allocation; helper 0
-            # finishes the collection and clears `@@collecting`.
-            start_concurrent
+            # The mark starts stopped and goes beside the program if the
+            # live set turns out past the bound: then this thread goes
+            # back to its allocation and helper 0 finishes the collection
+            # and clears `@@collecting`. Inside the bound the mark is
+            # over already and this thread owns the rest.
+            if start_concurrent
+              IyiRuntimeLock.unlock
+              return
+            end
+            @@collecting = false
             IyiRuntimeLock.unlock
+            wake_sweep_round
             return
           end
         {% end %}
@@ -4326,26 +4336,36 @@ require "./file"
         @@concurrent : Bool = false
         @@stw_first_ns : UInt64 = 0_u64
 
-        # Concurrent needs a thread to finish on: at least one helper. It
-        # used to need a live set past PARALLEL_FROM as well, the last
-        # mark's count being the estimate, and a mark alone was the
-        # cheaper pause below it; but the estimate is the last mark's,
-        # not this one's, and binary trees' first mark found sixteen
-        # bytes - the stretch tree was gone - so the mark that trusted it
-        # ran alone over the long-lived tree, a 2 ms pause back in a
-        # table of tens of microseconds. Every mark runs beside the
-        # program now, and what the threshold sizes is the helpers asked
-        # (one per MiB of the estimate, at least one) and no longer which
-        # thread the pause lands on; the helpers a small mark does not ask
-        # take no permit and park again.
+        # Concurrent needs a thread to finish on: at least one helper.
+        # Whether a mark *uses* one is not decided here and not from an
+        # estimate: every collection starts stopped and marks up to
+        # STW_MARK_BOUND objects on the triggering thread, and a mark
+        # that ends inside the bound was the whole mark - one stop, no
+        # helper woken, tens of microseconds (churn's 122 collections are
+        # all of them). One that does not is a large live set, and it
+        # goes beside the program from there.
+        #
+        # The estimate is what this replaces. It was the last mark's live
+        # bytes against PARALLEL_FROM, and it was wrong in both
+        # directions: binary trees' second mark read sixteen bytes - the
+        # stretch tree was gone - and marked a three-megabyte tree
+        # stopped, a 2 ms pause in a table of tens of microseconds; and
+        # churn's tiny live set read as tiny for a mark that had four
+        # megabytes of fresh allocation to walk. What the program did
+        # since the last mark is not in any estimate, and the bounded
+        # mark does not need one: it measures.
+        STW_MARK_BOUND = 1024_u64
+
         def self.concurrent_possible? : Bool
           @@helpers_wanted > 0_u64
         end
 
         # The first stop, on the triggering thread, under the runtime lock.
         # The helpers are started before it: their first spawn is half a
-        # millisecond, which is no part of a stop.
-        def self.start_concurrent : Nil
+        # millisecond, which is no part of a stop. Answers whether the
+        # mark went beside the program; false means it finished inside
+        # this stop and the caller owns the rest of the collection.
+        def self.start_concurrent : Bool
           # The last epoch's debt — an unswept arena wears the last mark's
           # colours, which this mark cannot read — is paid here, under the
           # lock the allocator's own sweep takes, before the world stops:
@@ -4374,12 +4394,44 @@ require "./file"
           end
           IyiHeap.write64(pool + POOL_HEAD, 0_u64)
           IyiHeap.write64(pool + POOL_CURSOR, IyiHeap.read64(pool + POOL_REGION_BASE))
-          # Helpers by the work, as the mark alone sizes them: one per MiB
-          # the last mark found live, at least one - a concurrent mark
-          # needs a helper to finish on - and at most what exists.
-          helpers = @@last_marked.unsafe_div(PARALLEL_FROM)
-          helpers = 1_u64 if helpers == 0_u64
-          helpers = @@helpers if helpers > @@helpers
+          # The roots, and then the mark up to the bound on this thread
+          # with the world still stopped: no barrier is needed for it,
+          # nothing is running.
+          @@workers = 1_u64
+          IyiHeap.write64(pool + POOL_ASKED, 0_u64)
+          pool_word(POOL_MARK_PERMITS).value.set(0_u64)
+          pool_word(POOL_FINISH).value.set(0_u64)
+          pool_word(POOL_ACTIVE).value.set(1_u64)
+          pool_word(POOL_HELPERS_DONE).value.set(0_u64)
+          IyiRoots.each_root(->(base : UInt64) { shade(base) })
+          flush_mutator(w)
+          if drain_bounded(w, STW_MARK_BOUND)
+            # The whole live set, inside the bound: this stop is the
+            # collection. The tail is `collect_locked`'s, and the caller
+            # is told so.
+            @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
+            @@last_marked = @@bytes_marked
+            @@workers = 0_u64
+            pool_word(POOL_ACTIVE).value.set(0_u64)
+            # The live counts this thread was holding into their arenas
+            # before the scavenge reads them: `drain` flushes them where
+            # it ends, and a bounded drain does not end there. An arena
+            # whose only live objects sat in this page's pending count
+            # read as empty and was unmapped under them.
+            flush_live(w)
+            finish_stopped(started, others)
+            return false
+          end
+          # A large live set. Every helper there is, and the reason is the
+          # opposite of the stop's: a mark inside a pause pays for waking
+          # and for detecting its end on the critical path, so fifteen
+          # helpers over a three-megabyte heap cost twice what three did;
+          # beside the program the mark's length is what the mutator pays
+          # for - in barrier work, in assists and in a budget it cannot
+          # reset - and the cores are otherwise idle. Sized by the last
+          # mark's live bytes here, binary trees ran a tenth slower than
+          # with all of them.
+          helpers = @@helpers
           @@workers = helpers + 1_u64
           IyiHeap.write64(pool + POOL_ASKED, helpers)
           pool_word(POOL_MARK_PERMITS).value.set(helpers)
@@ -4387,9 +4439,10 @@ require "./file"
           # Every helper holds work until it finds none; the pool is what
           # they hold, and the triggering thread is not a worker after this.
           pool_word(POOL_ACTIVE).value.set(helpers)
-          pool_word(POOL_HELPERS_DONE).value.set(0_u64)
-          IyiRoots.each_root(->(base : UInt64) { shade(base) })
-          flush_mutator(w)
+          # What the bounded mark left on this thread's stack goes to the
+          # pool: from here this thread is a mutator, and its stack is
+          # only its barrier's.
+          donate_all(w)
           @@concurrent = true
           LibIyiGCTable.__iyi_marking = 1_u8
           pool_word(POOL_GENERATION).value.add(1_u64)
@@ -4400,6 +4453,41 @@ require "./file"
           # microseconds are the futex's either way. The asked helpers and
           # no more.
           wake_some_helpers(helpers)
+          true
+        end
+
+        # Every entry on this stack into the pool, in batches: a stack
+        # this thread will not drain, whose objects are gray and have to
+        # be somebody's.
+        def self.donate_all(w : UInt64) : Nil
+          stack = IyiHeap.read64(w + W_STACK)
+          left = IyiHeap.read64(w + W_LEN)
+          while left > 0_u64
+            count = left < BATCH ? left : BATCH
+            left = left - count
+            publish(stack + left * 8_u64, count)
+          end
+          IyiHeap.write64(w + W_LEN, 0_u64)
+        end
+
+        # A collection whose mark ended inside the first stop: the tail of
+        # `collect_locked`, with the threads released and the pause
+        # recorded. The caller holds the lock and clears `@@collecting`.
+        def self.finish_stopped(started : UInt64, others : Int64) : Nil
+          scavenge
+          begin_sweep
+          sweep_large
+          IyiHeap.allocated_word.value.set(0_u64)
+          @@budget = next_budget(@@bytes_marked)
+          open_sweep_round
+          IyiThread.resume_others(others)
+          pause = now_ns - started
+          IyiHeap.unmap_released
+          @@stw_first_ns = pause
+          @@stop_second_ns = 0_u64
+          @@pause_last = pause
+          @@pause_max = pause if pause > @@pause_max
+          @@pause_total = @@pause_total + pause
         end
 
         # The second stop, on helper 0, once every helper found nothing.
