@@ -83,7 +83,8 @@
   holding the runtime lock, which is every thread in the program. A
   full pipe is a helper with wakes already pending, so the dropped
   write is one somebody else delivered. `fcntl` joins the darwin
-  allowlists.
+  allowlists - six gates state that list, and the thread floor is the
+  one that states it twice.
 
 - **A bounded first stop left its live counts in the worker's page.**
   A mark that ends inside the bound does not reach the drain's end,
