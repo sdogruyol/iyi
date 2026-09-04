@@ -2599,22 +2599,6 @@ require "./file"
       # The class an allocating thread is waiting on, plus one; 0 is none.
       # A helper's claim takes an arena of that class first.
       POOL_SWEEP_WANTED = 768_u64
-      # A mark's permits: as many as it asks helpers, taken one each by
-      # whichever helpers wake first, the first taker being the one that
-      # finishes a concurrent mark when POOL_FINISH says one is wanted.
-      # Every helper is woken; a helper that finds no permit parks again
-      # without counting itself in, so a mark over a small heap asks one
-      # helper and fifteen do not contend for its pool.
-      POOL_MARK_PERMITS = 832_u64
-      POOL_FINISH = 896_u64
-      NO_PERMIT = 0xFFFFFFFFFFFFFFFF_u64
-      # Each Linux helper parks on a line of its own, so a mark wakes the
-      # helpers it asks and no more: a small mark asks one, and fourteen
-      # threads woken to find no permit were a fifth of churn's wall
-      # time. The line holds the generation the helper was last woken to,
-      # and the futex is on it. darwin's helpers spin on the generation
-      # instead, for the reason `wait_generation` there records.
-      POOL_PARK = 1024_u64
 
       # Helpers: how many the collector may use besides itself, how many
       # exist, and the threshold under which a mark runs alone — waking
@@ -3151,8 +3135,6 @@ require "./file"
         end
         @@workers = helpers + 1_u64
         IyiHeap.write64(pool + POOL_ASKED, helpers)
-        pool_word(POOL_MARK_PERMITS).value.set(helpers)
-        pool_word(POOL_FINISH).value.set(0_u64)
         @@helper_black = 0_u64
         pool_word(POOL_ACTIVE).value.set(@@workers)
         pool_word(POOL_HELPERS_DONE).value.set(0_u64)
@@ -3161,13 +3143,13 @@ require "./file"
         # the same drain, this thread included.
         if helpers > 0_u64
           pool_word(POOL_GENERATION).value.add(1_u64)
-          wake_some_helpers(helpers)
+          wake_helpers
         end
         black = drain(w)
         # Every helper asked has answered - left the drain and folded its
         # accounts - before this thread reads them or turns the
         # generation again.
-        while pool_word(POOL_HELPERS_DONE).value.get < helpers
+        while pool_word(POOL_HELPERS_DONE).value.get < (helpers > 0_u64 ? @@helpers : 0_u64)
           spin_pause
         end
         @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
@@ -3296,29 +3278,33 @@ require "./file"
         seen = pool_word(POOL_GENERATION).value.get
         pool_word(POOL_READY).value.add(1_u64)
         while true
-          seen = wait_generation(index, seen)
-          # Not every helper is asked every time: a mark's permits are as
-          # many as it asked, and a helper that finds none parks again
-          # without counting itself in.
-          slot = take_mark_permit
-          if slot != NO_PERMIT
+          seen = wait_generation(seen)
+          # Every helper answers every generation, and one whose index is
+          # past this mark's count answers by counting itself out at once.
+          # A mark that asks fewer than exist still waits for all of them,
+          # because a helper that could miss a generation is a mark that
+          # can hang: permits were tried, so that a small mark woke one
+          # helper and the rest slept, and a helper that spent its wake on
+          # the sweep round then parked through the mark that followed -
+          # the mark waited for a count that never came, on three cores
+          # one run in three (`bench/thread_exercise.sh`, 8 threads).
+          if index < IyiHeap.read64(pool + POOL_ASKED)
             IyiHeap.write64(w + W_LEN, 0_u64)
             IyiHeap.write64(w + W_BYTES, 0_u64)
             IyiHeap.write64(w + W_BLACK, drain(w))
             fold_helper(w)
-            pool_word(POOL_HELPERS_DONE).value.add(1_u64)
-            # Beside the program, the drain's end is not the mark's: the
-            # first taker waits for the rest, then takes the second stop.
-            if slot == 0_u64 && pool_word(POOL_FINISH).value.get != 0_u64
-              pool_word(POOL_FINISH).value.set(0_u64)
-              while pool_word(POOL_HELPERS_DONE).value.get < IyiHeap.read64(pool + POOL_ASKED)
-                spin_pause
-              end
-              # The finish turns the generation once more, for the
-              # remainder, and again for the sweep round; that is the one
-              # this helper waits past next.
-              seen = finish_concurrent
+          end
+          pool_word(POOL_HELPERS_DONE).value.add(1_u64)
+          # Beside the program, the drain's end is not the mark's: helper 0
+          # waits for the rest, then takes the second stop.
+          if @@concurrent && index == 0_u64
+            while pool_word(POOL_HELPERS_DONE).value.get < @@helpers
+              spin_pause
             end
+            # The finish turns the generation once more, for the
+            # remainder, and again for the sweep round; that is the one
+            # this helper waits past next.
+            seen = finish_concurrent
           end
           # The round, if one is open and a permit is left: arenas until
           # none is left or a collection closes it.
@@ -3349,17 +3335,6 @@ require "./file"
           spins = spins + 1_u64
         end
         seen
-      end
-
-      # A mark's permit, or NO_PERMIT: the slot is the order of taking,
-      # 0 for the first.
-      def self.take_mark_permit : UInt64
-        word = pool_word(POOL_MARK_PERMITS)
-        while true
-          left = word.value.get
-          return NO_PERMIT if left == 0_u64
-          return IyiHeap.read64(pool + POOL_ASKED) - left if word.value.compare_and_set(left, left - 1_u64)[1]
-        end
       end
 
       # A round's permits are SWEEP_HELPERS; on Linux that many helpers
@@ -3397,38 +3372,26 @@ require "./file"
       @@helper_black : UInt64 = 0_u64
 
       {% if flag?(:linux) %}
-        def self.wait_generation(index : UInt64, seen : UInt64) : UInt64
+        # The generation is one word and every helper sleeps on it: a
+        # futex wake of fifteen threads is microseconds, and a per-helper
+        # park that woke only the helpers a mark asked let a helper miss a
+        # generation and the mark wait forever (`helper_main` says how).
+        def self.wait_generation(seen : UInt64) : UInt64
           word = pool_word(POOL_GENERATION)
-          park = pool + POOL_PARK + index * 64_u64
           spun = spin_for_generation(word, seen)
           return spun if spun != seen
           while (now = word.value.get) == seen
-            # The park word is what this helper was last woken to; asleep
-            # on it with the generation it saw, it wakes when a waker
-            # writes a newer one there - or returns at once if one did
-            # already.
-            __iyi_conc_syscall6(IYI_SYS_FUTEX, park.to_i64, IYI_FUTEX_WAIT, IyiHeap.read64(park).to_i64, 0_i64, 0_i64, 0_i64) if IyiHeap.read64(park) == seen
-            now = word.value.get
+            __iyi_conc_syscall6(IYI_SYS_FUTEX, (pool + POOL_GENERATION).to_i64, IYI_FUTEX_WAIT, seen.to_i64, 0_i64, 0_i64, 0_i64)
           end
           now
         end
 
-        # Every helper, to the generation as it stands.
         def self.wake_helpers : Nil
-          wake_some_helpers(@@helpers)
+          __iyi_conc_syscall6(IYI_SYS_FUTEX, (pool + POOL_GENERATION).to_i64, IYI_FUTEX_WAKE, 1000000_i64, 0_i64, 0_i64, 0_i64)
         end
 
-        # The first `count` helpers, by index: their park words set to the
-        # generation and each woken.
         def self.wake_some_helpers(count : UInt64) : Nil
-          generation = pool_word(POOL_GENERATION).value.get
-          index = 0_u64
-          while index < count && index < @@helpers
-            park = pool + POOL_PARK + index * 64_u64
-            Pointer(Atomic(UInt64)).new(park).value.set(generation)
-            __iyi_conc_syscall6(IYI_SYS_FUTEX, park.to_i64, IYI_FUTEX_WAKE, 1_i64, 0_i64, 0_i64, 0_i64)
-            index = index + 1_u64
-          end
+          wake_helpers
         end
       {% else %}
         # darwin has no futex: a helper spins on the generation with a
@@ -3446,7 +3409,7 @@ require "./file"
         # is worth less than the mark it delays. Linux's futex park costs
         # microseconds and keeps its cores, which is why the platforms
         # differ here at all.
-        def self.wait_generation(index : UInt64, seen : UInt64) : UInt64
+        def self.wait_generation(seen : UInt64) : UInt64
           word = pool_word(POOL_GENERATION)
           while (now = word.value.get) == seen
             IyiThread.yield_cpu
@@ -3809,7 +3772,6 @@ require "./file"
         def self.open_sweep_round : Nil
           return if @@helpers == 0_u64 || @@sweep_left == 0_u64
           IyiHeap.write64(pool + POOL_ASKED, 0_u64)
-          pool_word(POOL_MARK_PERMITS).value.set(0_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           pool_word(POOL_SWEEP_PERMITS).value.set(@@helpers < SWEEP_HELPERS ? @@helpers : SWEEP_HELPERS)
           pool_word(POOL_SWEEP).value.set(1_u64)
@@ -4438,8 +4400,6 @@ require "./file"
           # nothing is running.
           @@workers = 1_u64
           IyiHeap.write64(pool + POOL_ASKED, 0_u64)
-          pool_word(POOL_MARK_PERMITS).value.set(0_u64)
-          pool_word(POOL_FINISH).value.set(0_u64)
           pool_word(POOL_ACTIVE).value.set(1_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           IyiRoots.each_root(->(base : UInt64) { shade(base) })
@@ -4473,8 +4433,6 @@ require "./file"
           helpers = @@helpers
           @@workers = helpers + 1_u64
           IyiHeap.write64(pool + POOL_ASKED, helpers)
-          pool_word(POOL_MARK_PERMITS).value.set(helpers)
-          pool_word(POOL_FINISH).value.set(1_u64)
           # Every helper holds work until it finds none; the pool is what
           # they hold, and the triggering thread is not a worker after this.
           pool_word(POOL_ACTIVE).value.set(helpers)
@@ -4489,9 +4447,8 @@ require "./file"
           @@stw_first_ns = now_ns - started
           # The wake after the release: threads woken inside the stop were
           # the stop's largest part under load, and a helper's first
-          # microseconds are the futex's either way. The asked helpers and
-          # no more.
-          wake_some_helpers(helpers)
+          # microseconds are the futex's either way.
+          wake_helpers
           true
         end
 
@@ -4664,11 +4621,7 @@ require "./file"
         def self.remainder_round(w : UInt64) : UInt64
           helpers = @@helpers
           @@workers = helpers
-          # Every other helper: this one is inside the finish and drains
-          # below without a permit.
-          IyiHeap.write64(pool + POOL_ASKED, helpers - 1_u64)
-          pool_word(POOL_MARK_PERMITS).value.set(helpers - 1_u64)
-          pool_word(POOL_FINISH).value.set(0_u64)
+          IyiHeap.write64(pool + POOL_ASKED, helpers)
           pool_word(POOL_ACTIVE).value.set(helpers)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           generation = pool_word(POOL_GENERATION).value.add(1_u64) + 1_u64
