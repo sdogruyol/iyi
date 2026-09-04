@@ -3338,6 +3338,28 @@ require "./file"
         end
       end
 
+      # A spin before the park, and the reason is the stop rather than the
+      # wake: a sleeping thread has to be scheduled before it can answer a
+      # stop-the-world signal, and on a machine with fewer cores than
+      # threads that is milliseconds - darwin's CI runner has three cores,
+      # and its every-collection stop went from tens of microseconds to
+      # milliseconds when the helpers stopped spinning. Collections come
+      # in bursts, so a helper that spins for the length of one stays hot
+      # through the burst and sleeps between them; SPIN_BEFORE_PARK is
+      # about fifty microseconds of the pause hint.
+      SPIN_BEFORE_PARK = 20000_u64
+
+      def self.spin_for_generation(word : Pointer(Atomic(UInt64)), seen : UInt64) : UInt64
+        spins = 0_u64
+        while spins < SPIN_BEFORE_PARK
+          now = word.value.get
+          return now if now != seen
+          spin_pause
+          spins = spins + 1_u64
+        end
+        seen
+      end
+
       # A mark's permit, or NO_PERMIT: the slot is the order of taking,
       # 0 for the first.
       def self.take_mark_permit : UInt64
@@ -3387,6 +3409,8 @@ require "./file"
         def self.wait_generation(index : UInt64, seen : UInt64) : UInt64
           word = pool_word(POOL_GENERATION)
           park = pool + POOL_PARK + index * 64_u64
+          spun = spin_for_generation(word, seen)
+          return spun if spun != seen
           while (now = word.value.get) == seen
             # The park word is what this helper was last woken to; asleep
             # on it with the generation it saw, it wakes when a waker
@@ -3426,6 +3450,8 @@ require "./file"
           word = pool_word(POOL_GENERATION)
           park = pool + POOL_PARK + index * 64_u64
           IyiHeap.write64(park, IyiThread.park_pipe(park + 8_u64)) if IyiHeap.read64(park) == 0_u64
+          spun = spin_for_generation(word, seen)
+          return spun if spun != seen
           while (now = word.value.get) == seen
             IyiThread.park_pipe_wait(IyiHeap.read64(park))
             now = word.value.get

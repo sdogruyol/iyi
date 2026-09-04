@@ -30,15 +30,27 @@
   helpers wakes three threads rather than fifteen - fourteen threads
   woken to find nothing were a fifth of churn's wall time.
 
-- **A thread-local is one load under iyi's prelude.** Crystal reaches
-  a `@[ThreadLocal]` through a `noinline` accessor, which is what keeps
-  LLVM from hoisting the address across a fiber switch that lands the
-  fiber on another thread. An iyi fiber belongs to its scheduler thread
-  and never moves, so the address is a constant for the fiber's life:
-  the accessor is gone under iyi's prelude and the allocator's cache
-  pointer is one `%fs:`/`tpidr_el0` load, where it was four calls per
-  allocation. A `--crystal` program keeps the accessor, its fibers
-  being Crystal's.
+- **A thread-local is one load under iyi's prelude, on ELF.** Crystal
+  reaches a `@[ThreadLocal]` through a `noinline` accessor, which is
+  what keeps LLVM from hoisting the address across a fiber switch that
+  lands the fiber on another thread. An iyi fiber belongs to its
+  scheduler thread and never moves, so the address is a constant for
+  the fiber's life: the accessor is gone on Linux and the allocator's
+  cache pointer is one `%fs:`/`tpidr_el0` load, where it was four calls
+  per allocation. Mach-O keeps it: there is no local-exec there, a
+  thread-local's address comes from `_tlv_bootstrap` through a call
+  whatever the model, and one accessor per read is what keeps that call
+  out of the middle of an allocation. A `--crystal` program keeps it
+  everywhere, its fibers being Crystal's.
+
+- **A helper spins before it parks.** A sleeping thread has to be
+  scheduled before it can answer a stop-the-world signal, and on a
+  machine with fewer cores than threads that is milliseconds: darwin's
+  three-core CI runner turned every collection's stop from tens of
+  microseconds into milliseconds the day the helpers stopped spinning
+  on the `yield` hint and started sleeping in their pipes. Collections
+  come in bursts, so a helper spins for about fifty microseconds before
+  it parks - hot through a burst, asleep between them.
 
 - **An assist yields to a stop.** A mutator that assists the mark scans
   up to a thousand objects inside the allocator, where a stop is
@@ -3805,7 +3817,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,521-line library and nothing else. Every other
+  written against iyi's own 9,547-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
