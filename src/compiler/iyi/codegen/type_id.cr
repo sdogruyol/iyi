@@ -14,11 +14,25 @@ class Iyi::CodeGenVisitor
   end
 
   private def type_id_impl(value, type : ReferenceUnionType)
-    load(llvm_context.int32, value)
+    object_type_id(value)
   end
 
   private def type_id_impl(value, type : VirtualType)
-    load(llvm_context.int32, value)
+    object_type_id(value)
+  end
+
+  # iyi: an object's dynamic type id. Under iyi's layout it is the high
+  # half of the header word under the object, a u32 at `P-4` on the
+  # little-endian targets this reaches (GC_DESIGN.md Stage 5,
+  # `object_header.cr`), in every allocator mode, and the object's own
+  # words are its fields and nothing else; under Crystal's it is the
+  # `i32` at the object's front.
+  def object_type_id(value)
+    if @program.iyi_object_layout?
+      load(llvm_context.int32, gep(llvm_context.int8, value, -4, "type_id"))
+    else
+      load(llvm_context.int32, value)
+    end
   end
 
   private def type_id_impl(value, type : NilableReferenceUnionType)
@@ -32,7 +46,7 @@ class Iyi::CodeGenVisitor
     br exit_block
 
     position_at_end not_nil_block
-    phi_table.add insert_block, load(llvm_context.int32, value)
+    phi_table.add insert_block, object_type_id(value)
     br exit_block
 
     position_at_end exit_block

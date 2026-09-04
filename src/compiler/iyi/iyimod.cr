@@ -34,7 +34,7 @@ module Iyi::IyiMod
 
   # Bumped when the layout of any section changes incompatibly. IV.5: a
   # `.iyimod` from another version is rejected and rebuilt, never migrated.
-  FORMAT_VERSION = 43_u32
+  FORMAT_VERSION = 44_u32
 
   FORMAT = IO::ByteFormat::LittleEndian
 

@@ -5,10 +5,12 @@
 # string literals before any prelude is read. So this file reopens a type that
 # already has its shape and only says what can be done with it.
 class String
-  # The three `Int32`s in front of the bytes: the type id, the byte count and
-  # the character count. Written by hand because that layout is codegen's, and
-  # a string built here has to be indistinguishable from one it emitted.
-  HEADER_SIZE = 12
+  # The two `Int32`s in front of the bytes: the byte count and the character
+  # count. The type id is not in the object: it is the high half of the
+  # header word under it, at P-4, where every object carries it (GC_DESIGN.md
+  # Stage 5). Written by hand because that layout is codegen's, and a string
+  # built here has to be indistinguishable from one it emitted.
+  HEADER_SIZE = 8
 
   # Allocates *bytesize* bytes, hands the buffer to the block to fill, and
   # returns the string that results. The character count is scanned rather
@@ -19,10 +21,10 @@ class String
     buffer = memory + HEADER_SIZE
     yield buffer
 
+    Pointer(Int32).new(memory.address - 4_u64).value = "".crystal_type_id
     header = memory.as(Pointer(Int32))
-    header[0] = "".crystal_type_id
-    header[1] = bytesize
-    header[2] = character_count(buffer, bytesize)
+    header[0] = bytesize
+    header[1] = character_count(buffer, bytesize)
     memory.as(String)
   end
 

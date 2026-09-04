@@ -156,6 +156,21 @@
     false
   end
 
+  # The holder black, or the mark over: the move below has to land in a
+  # black holder for the barrier to be the only thing that saves the
+  # payload - a gray holder is scanned later and finds it by itself, and
+  # the failure proof, which removes the barrier's shade, then proves
+  # nothing. When the holder turns black is the workers' order of
+  # business: with the 200,000-cell chain on the same stacks it came
+  # last, once objects got eight bytes smaller and the order moved.
+  def wait_black(holder : Holder) : Bool
+    while IyiMark.marking?
+      return true if IyiMark.colour(holder.object_id.to_u64) == IyiMark::BLACK
+      IyiMark.spin_pause
+    end
+    false
+  end
+
   # The move, under a mark: payload from the chain's tail into a holder,
   # the tail's edge cut. `@[NoInline]` so the local that carried it is
   # gone with the frame before the mark finishes.
@@ -240,6 +255,7 @@
     holder.payload = nil
     IyiMark.auto = true
     marking = allocate_until_marking
+    marking = wait_black(holder) if marking
     under_mark = under_mark + 1 if marking
     move(chain, holder)
     # The chain is garbage from here; the payload lives in the holder only.

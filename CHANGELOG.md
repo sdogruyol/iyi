@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **One type id: an object is its fields.** Crystal's layout carries
+  the type id as an `i32` at the object's front, and iyi's header
+  carried it in the mark word's high half too, so every class object
+  was eight bytes larger than its fields - binary trees' node a
+  32-byte chunk where Go's is 16. The front copy is gone: a class is
+  laid out as its instance variables, every dynamic type-id read is
+  the u32 at `P-4`, `offsetof` and the layout tables lost their shift,
+  and a string literal is `{header word, {bytesize, length, bytes}}`.
+  Every allocator mode of the prelude leaves the header word under the
+  pointer - the bump pointer and wasm keep their size at `P-16`,
+  Boehm's and the process heap's blocks grow by eight with the pointer
+  eight bytes in - so an object's layout is one thing under all of
+  them and a module's object code links under any. A `--crystal`
+  program and the compiler's own bootstrap keep Crystal's layout
+  (`Program#iyi_object_layout?`). `.iyimod` is v44. Binary trees is 29
+  MB resident to 25, live churn 249 to 167 (GC_DESIGN.md, "One type
+  id").
+
+### Fixed
+
+- **A helper at the sweep round left it when every arena with work
+  was inside another's slice.** It read that as nothing left and went
+  back to its park; the allocating thread then swept the heap itself,
+  slice after slice - 8,600 slices to the helpers' 1,200 on binary
+  trees once its nodes fit one arena. A helper waits some microseconds
+  and looks again now.
+
+- **The concurrent mark's failure proof assumed a black holder.** The
+  exercise moves a payload into a holder and, with the barrier's shade
+  removed, expects the payload freed; that holds only if the holder was
+  black at the move, and with objects eight bytes smaller the workers
+  reached the 200,000-cell chain first and the holder last. The move
+  waits for the holder's colour now, which is what its message claimed.
+
 ## 0.9.0 — 2026-09-03
 
 **The collector races Go, and is measured against it.** 0.8.0 seated iyi's
@@ -3698,7 +3736,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,248-line library and nothing else. Every other
+  written against iyi's own 9,285-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

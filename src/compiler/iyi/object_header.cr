@@ -24,6 +24,17 @@
 # the word's high half on the little-endian targets the collector reaches;
 # the allocator zeroes the whole word when it hands the chunk out.
 #
+# And it is the only place the id lives: an iyi object is its fields and
+# nothing else. Crystal's layout carries the type id as an `i32` at the
+# object's front too, and an iyi object carried it twice until 0.10.0 -
+# eight bytes more than its fields for every class, binary trees' node a
+# 32-byte chunk where Go's is 16. Every dynamic dispatch reads it here
+# now, and every allocator mode of the prelude - the arena, the bump
+# pointer, Boehm, the process heap, wasm's linear memory - leaves this
+# word under the pointer so the layout is one thing under all of them.
+# A `--crystal` program keeps Crystal's layout, its runtime being
+# Crystal's (`Program#iyi_object_layout?` is the switch).
+#
 # ## The mark word
 #
 # One atomic u64 holding the colour, the flags and the type id at once, so

@@ -2401,8 +2401,9 @@ describe Iyi::IyiMod do
           (offset_of.call(outer, "@inner") + offset_of.call(inner, "@ref")).to_u16,
         ]
 
-        # A class carries its type id word first; `@point` has no inner
-        # pointers and `@count` is a scalar, so neither is here.
+        # A class carries its type id under the object, not in it, so its
+        # first field is at 0; `@point` has no inner pointers and `@count`
+        # is a scalar, so neither is here.
         labelled = shapes.types["Labelled"]
         labelled_layout = layout_of.call("App::Shapes::Labelled")
         labelled_layout.scan_offsets.should eq [

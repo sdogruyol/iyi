@@ -72,9 +72,30 @@ module Iyi
       nil_type.null
     end
 
+    # A string literal's global. Under iyi's layout: the object header
+    # word first - the type id in its high half, where every object
+    # carries it (GC_DESIGN.md Stage 5, `object_header.cr`) - then the
+    # object itself, which is what the program's pointer names; the word
+    # is eight bytes and keeps the object eight-aligned. Under Crystal's:
+    # the type id in front, as an `i32`.
     def llvm_string_type(bytesize)
+      if @program.iyi_object_layout?
+        @llvm_context.struct [
+          @llvm_context.int64, # the object header word
+          llvm_string_object_type(bytesize),
+        ]
+      else
+        @llvm_context.struct [
+          @llvm_context.int32,                    # type_id
+          @llvm_context.int32,                    # @bytesize
+          @llvm_context.int32,                    # @length
+          @llvm_context.int8.array(bytesize + 1), # @c
+        ]
+      end
+    end
+
+    def llvm_string_object_type(bytesize)
       @llvm_context.struct [
-        @llvm_context.int32,                    # type_id
         @llvm_context.int32,                    # @bytesize
         @llvm_context.int32,                    # @length
         @llvm_context.int8.array(bytesize + 1), # @c
@@ -298,12 +319,18 @@ module Iyi
           @structs[llvm_name] = a_struct
         end
 
+        # iyi: under iyi's layout a class's fields and nothing before
+        # them. The type id is not a field: it is the high half of the
+        # object header word under the pointer, at `P-4`, in every
+        # allocator mode (GC_DESIGN.md Stage 5), and an object that
+        # carried it twice - there and here - was eight bytes larger than
+        # its fields for every class in the program, binary trees' node a
+        # 32-byte chunk where Go's is 16. Crystal's layout keeps the id
+        # in front (`iyi_object_layout?` says whose program this is).
         ivars = type.all_instance_vars
-        ivars_size = ivars.size
-        ivars_size += 1 unless type.struct?
-
-        element_types = Array(LLVM::Type).new(ivars_size)
-        element_types.push @llvm_context.int32 unless type.struct? # For the type id
+        id_in_front = !type.struct? && !@program.iyi_object_layout?
+        element_types = Array(LLVM::Type).new(ivars.size + (id_in_front ? 1 : 0))
+        element_types.push @llvm_context.int32 if id_in_front # For the type id
 
         ivars.each do |name, ivar|
           if type.extern?

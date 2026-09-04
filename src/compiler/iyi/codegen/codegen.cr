@@ -216,8 +216,9 @@ module Iyi
 
     def instance_offset_of(type, element_index)
       # extern unions and static arrays must be value types, which always use
-      # the above `offset_of` instead
-      llvm_typer.offset_of(llvm_typer.llvm_struct_type(type), element_index + 1)
+      # the above `offset_of` instead. Under iyi's layout a class's fields
+      # are its elements; under Crystal's the type id word comes first.
+      llvm_typer.offset_of(llvm_typer.llvm_struct_type(type), element_index + (iyi_object_layout? ? 0 : 1))
     end
   end
 
@@ -2515,18 +2516,20 @@ module Iyi
           cleared = false
         end
 
-        # iyi: the GC object header's `type_id` (GC_DESIGN.md Stage 5). The
+        # iyi: the object header's `type_id` (GC_DESIGN.md Stage 5). The
         # allocator cannot write it — `malloc` is handed a size and nothing
         # else — so the store belongs here, right after the call returns,
         # which is what the prelude's header comment promises. The high
         # half of the header word at `P-8`, a u32 at `P-4` on the
         # little-endian targets this reaches, per `object_header.cr`; the
-        # same id `gc_layouts.cr` keys the embedded table by. Gated on
-        # `iyi_gc_arena?`, the prelude selection's twin: every other
-        # allocator's bytes under the pointer are its own, and a store
-        # there would corrupt the bump header or Boehm's heap.
-        if @program.iyi_gc_arena?
-          id_slot = gep llvm_context.int8, type_ptr, -4, "gc_type_id"
+        # same id `gc_layouts.cr` keys the embedded table by and the one
+        # every dynamic dispatch reads. In every allocator mode of iyi's
+        # prelude: each mode's `__crystal_malloc64` leaves a word of its
+        # own under the pointer for it, so an object's layout is one thing
+        # wherever it was allocated and a module's object code links under
+        # any mode. A Crystal-layout program stores it in front, below.
+        if @program.iyi_object_layout?
+          id_slot = gep llvm_context.int8, type_ptr, -4, "type_id"
           store type_id(type), id_slot
         end
       end
@@ -2538,7 +2541,7 @@ module Iyi
       memset ptr, int8(0), size_t(struct_type.size) unless cleared
       run_instance_vars_initializers(type, type, ptr)
 
-      unless type.struct?
+      if !type.struct? && !@program.iyi_object_layout?
         type_id_ptr = aggregate_index(struct_type, ptr, 0)
         store type_id(type), type_id_ptr
       end
@@ -2871,10 +2874,7 @@ module Iyi
       end
 
       index = type.index_of_instance_var(name).not_nil!
-
-      unless type.struct?
-        index += 1
-      end
+      index += 1 if !type.struct? && !@program.iyi_object_layout?
 
       target_type = type
       if type.is_a?(VirtualType)
@@ -2912,13 +2912,31 @@ module Iyi
         global = llvm_mod.globals.add(llvm_typer.llvm_string_type(str.bytesize), name.gsub('\\', "\\\\"))
         global.linkage = LLVM::Linkage::Private
         global.global_constant = true
-        global.initializer = llvm_context.const_struct [
-          llvm_context.int32.const_int(@program.llvm_id.type_id(@program.string)), # in practice, should always be 1
-          llvm_context.int32.const_int(str.bytesize),
-          llvm_context.int32.const_int(str.size),
-          llvm_context.const_string(str),
-        ]
-        pointer_cast global, llvm_typer.llvm_type(@program.string)
+        if @program.iyi_object_layout?
+          # The header word: the type id in its high half, the low half -
+          # the collector's colour, flags and parity - zero, and never
+          # written, because the marker refuses an address outside its
+          # arenas before it touches a header. The program's pointer is to
+          # the object, past the word.
+          global.initializer = llvm_context.const_struct [
+            llvm_context.int64.const_int(@program.llvm_id.type_id(@program.string).to_i64 << 32),
+            llvm_context.const_struct([
+              llvm_context.int32.const_int(str.bytesize),
+              llvm_context.int32.const_int(str.size),
+              llvm_context.const_string(str),
+            ]),
+          ]
+          object = llvm_context.const_inbounds_gep(llvm_typer.llvm_string_type(str.bytesize), global, [llvm_context.int32.const_int(0), llvm_context.int32.const_int(1)])
+          pointer_cast object, llvm_typer.llvm_type(@program.string)
+        else
+          global.initializer = llvm_context.const_struct [
+            llvm_context.int32.const_int(@program.llvm_id.type_id(@program.string)), # in practice, should always be 1
+            llvm_context.int32.const_int(str.bytesize),
+            llvm_context.int32.const_int(str.size),
+            llvm_context.const_string(str),
+          ]
+          pointer_cast global, llvm_typer.llvm_type(@program.string)
+        end
       end
     end
 

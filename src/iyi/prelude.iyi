@@ -496,16 +496,26 @@ require "./file"
 
   # Codegen emits calls to these by name for every allocation, so they are not
   # optional and their names are not ours to choose.
+  # Codegen emits calls to these by name for every allocation, so they are not
+  # optional and their names are not ours to choose. Every mode leaves one
+  # word under the pointer it answers: codegen stores an object's type id in
+  # its high half - the only place the id lives, so an object is its fields
+  # and nothing else (GC_DESIGN.md Stage 5) - and an object's layout is one
+  # thing under any allocator, which is what lets a module's object code
+  # link under any of them. Here the word is the first eight bytes of a
+  # block libgc handed out; the program's pointer is an interior one, which
+  # libgc follows by default.
   fun __crystal_malloc64(size : UInt64) : Void*
-    LibGC.malloc(size)
+    LibGC.malloc(size + 8_u64) + 8_i64
   end
 
   fun __crystal_malloc_atomic64(size : UInt64) : Void*
-    LibGC.malloc_atomic(size)
+    LibGC.malloc_atomic(size + 8_u64) + 8_i64
   end
 
   fun __crystal_realloc64(pointer : Void*, size : UInt64) : Void*
-    LibGC.realloc(pointer, size)
+    return __crystal_malloc64(size) if pointer.address == 0
+    LibGC.realloc(Pointer(Void).new(pointer.address - 8_u64), size + 8_u64) + 8_i64
   end
 {% else %}
   {% if !flag?(:gc_none) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
@@ -3544,12 +3554,16 @@ require "./file"
             end
           end
           # An allocating thread wants its class: busy is an answer, and
-          # so is nothing of the class; a helper goes on to any.
+          # so is nothing of the class; a helper goes on to any, and busy
+          # is its answer too once every arena with work is inside
+          # another's slice - a helper that took that for nothing left
+          # went back to its park with the round barely begun, and the
+          # allocating thread swept the heap itself, slice after slice.
           return 2_u64 if !helper && busy
           return 0_u64 if !helper && wanted != 0
           pass = pass + 1
         end
-        0_u64
+        busy ? 2_u64 : 0_u64
       end
 
       def self.sweep_left?(arena : UInt64, epoch : UInt64) : Bool
@@ -3666,10 +3680,20 @@ require "./file"
             # Counted in under the lock that closes the round: closed, no
             # slice starts; open, a slice begun is counted before the
             # closer looks.
-            pool_word(POOL_SWEEPERS).value.add(1_u64) if arena != 0
+            pool_word(POOL_SWEEPERS).value.add(1_u64) if arena > 2_u64
           end
           IyiRuntimeLock.unlock
           return false if arena == 0
+          if arena == 2_u64
+            # Every arena with work is inside another's slice, for
+            # microseconds: wait off the lock and come back.
+            spins = 0
+            while spins < 64
+              spin_pause
+              spins = spins + 1
+            end
+            return true
+          end
           epoch = @@epoch
           batch = sweep_slice(arena, SWEEP_SPAN)
           pool_word(POOL_SWEEPERS).value.sub(1_u64)
@@ -4568,7 +4592,10 @@ require "./file"
         bytes = size.to_i64
         remainder = bytes % 8
         bytes = bytes + (8 - remainder) if remainder > 0
-        bytes = bytes + 8
+        # Two words under the pointer: the size for `realloc` at P-16, and
+        # at P-8 the object header word every mode leaves, whose high half
+        # codegen fills with the type id.
+        bytes = bytes + 16
 
         if @@left < bytes.to_u64
           chunk = 1048576_i64
@@ -4581,15 +4608,15 @@ require "./file"
         @@cursor = @@cursor + bytes.to_u64
         @@left = @@left - bytes.to_u64
         block.as(Pointer(UInt64)).value = size
-        block + 8_i64
+        block + 16_i64
       end
 
       # Allocate-and-copy rather than growth in place, because nothing frees
-      # and the old size rides in the eight bytes under the pointer, which is
-      # the only place that knows it.
+      # and the old size rides in the sixteen bytes under the pointer, which
+      # is the only place that knows it.
       def self.realloc(pointer : Void*, size : UInt64) : Void*
         return alloc(size) if pointer.address == 0
-        old_size = Pointer(UInt64).new(pointer.address - 8).value
+        old_size = Pointer(UInt64).new(pointer.address - 16).value
         new_pointer = alloc(size)
         source = pointer.as(Pointer(UInt8))
         destination = new_pointer.as(Pointer(UInt8))
@@ -4702,18 +4729,21 @@ require "./file"
 
     # Codegen emits calls to these by name for every allocation, so they are not
     # optional and their names are not ours to choose.
+    # Every mode leaves the object header word under the pointer, for the
+    # type id codegen stores in its high half.
     fun __crystal_malloc64(size : UInt64) : Void*
-      pointer = LibC.malloc(size)
-      LibC.memset(pointer, 0, size)
-      pointer
+      pointer = LibC.malloc(size + 8_u64)
+      LibC.memset(pointer, 0, size + 8_u64)
+      pointer + 8_i64
     end
 
     fun __crystal_malloc_atomic64(size : UInt64) : Void*
-      LibC.malloc(size)
+      LibC.malloc(size + 8_u64) + 8_i64
     end
 
     fun __crystal_realloc64(pointer : Void*, size : UInt64) : Void*
-      LibC.realloc(pointer, size)
+      return __crystal_malloc64(size) if pointer.address == 0
+      LibC.realloc(Pointer(Void).new(pointer.address - 8_u64), size + 8_u64) + 8_i64
     end
   {% elsif flag?(:win32) %}
     # iyi: The allocator on Windows is the Win32 process heap: `HeapAlloc` and
@@ -4750,19 +4780,21 @@ require "./file"
 
     # Codegen emits calls to these by name for every allocation, so they are not
     # optional and their names are not ours to choose.
+    # Every mode leaves the object header word under the pointer, for the
+    # type id codegen stores in its high half.
     fun __crystal_malloc64(size : UInt64) : Void*
-      LibC.HeapAlloc(LibC.GetProcessHeap, 0x8_u32, size)
+      LibC.HeapAlloc(LibC.GetProcessHeap, 0x8_u32, size + 8_u64) + 8_i64
     end
 
     fun __crystal_malloc_atomic64(size : UInt64) : Void*
-      LibC.HeapAlloc(LibC.GetProcessHeap, 0_u32, size)
+      LibC.HeapAlloc(LibC.GetProcessHeap, 0_u32, size + 8_u64) + 8_i64
     end
 
     fun __crystal_realloc64(pointer : Void*, size : UInt64) : Void*
       if pointer.address == 0
-        LibC.HeapAlloc(LibC.GetProcessHeap, 0x8_u32, size)
+        LibC.HeapAlloc(LibC.GetProcessHeap, 0x8_u32, size + 8_u64) + 8_i64
       else
-        LibC.HeapReAlloc(LibC.GetProcessHeap, 0_u32, pointer, size)
+        LibC.HeapReAlloc(LibC.GetProcessHeap, 0_u32, Pointer(Void).new(pointer.address - 8_u64), size + 8_u64) + 8_i64
       end
     end
 
@@ -4864,7 +4896,10 @@ require "./file"
         bytes = size.to_i64
         remainder = bytes % 8
         bytes = bytes + (8 - remainder) if remainder > 0
-        bytes = bytes + 8
+        # Two words under the pointer: the size for `realloc` at P-16, and
+        # at P-8 the object header word every mode leaves, whose high half
+        # codegen fills with the type id.
+        bytes = bytes + 16
 
         if @@left < bytes.to_u64
           pages = bytes // 65536
@@ -4882,15 +4917,15 @@ require "./file"
         @@cursor = @@cursor + bytes.to_u64
         @@left = @@left - bytes.to_u64
         block.as(Pointer(UInt64)).value = size
-        block + 8_i64
+        block + 16_i64
       end
 
       # Allocate-and-copy rather than growth in place, because nothing frees
-      # and the old size rides in the eight bytes under the pointer, which is
-      # the only place that knows it.
+      # and the old size rides in the sixteen bytes under the pointer, which
+      # is the only place that knows it.
       def self.realloc(pointer : Void*, size : UInt64) : Void*
         return alloc(size) if pointer.address == 0
-        old_size = Pointer(UInt64).new(pointer.address - 8).value
+        old_size = Pointer(UInt64).new(pointer.address - 16).value
         new_pointer = alloc(size)
         source = pointer.as(Pointer(UInt8))
         destination = new_pointer.as(Pointer(UInt8))

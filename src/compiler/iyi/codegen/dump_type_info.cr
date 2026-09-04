@@ -90,7 +90,7 @@ module Iyi
       end
 
       element_index = type.index_of_instance_var(ivar_name).not_nil!
-      element_index += 1 unless type.struct?
+      element_index += 1 if !type.struct? && !@program.iyi_object_layout?
 
       ivar_llvm_type =
         if type.extern?

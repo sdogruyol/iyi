@@ -495,9 +495,12 @@ type id is 32 bits and the mark word had 58 to spare; so the header is
 one word at `P-8`, colour and flags in its low bits and the type id in
 its high half, stored by codegen as a u32 at `P-4`. A free chunk's link
 and its batch's chain ride in the payload, which is nobody's while it
-is free. The size classes were powers of two, so a 24-byte object -
-two pointers behind its type id, the commonest shape a program has -
-took a 32-byte class and a 40-byte object a 64-byte one; they are
+is free. (The object carried the id twice until 0.10.0, once here and
+once as an `i32` at its front, Crystal's layout; the section on one
+type id, below, is where the second copy went.) The size classes were
+powers of two, so a 24-byte object - two pointers behind its type id,
+the commonest shape a program has - took a 32-byte class and a 40-byte
+object a 64-byte one; they are
 eight-byte steps to 128 and four to each doubling above, 67 classes,
 and the waste is capped at eight bytes below 128 and a fifth above. A
 16-byte object costs 24 bytes now, a 24-byte one 32: Boehm's granule.
@@ -576,8 +579,9 @@ the same binary) because the budget is what the last mark found live
 times the growth, and which collection the run ends on decides the
 peak. Churn's footprint is Go's and Boehm's; binary trees' is within a
 budget of Go's (its live set doubles into the next budget the same
-way, and Go's 16-byte node is our 32-byte one, its type id ahead of
-two pointers); live churn's is two budgets over Go's, which is the
+way, and Go's 16-byte node was our 32-byte one, its type id ahead of
+two pointers - a 24-byte one since the type id left the object, below);
+live churn's is two budgets over Go's, which is the
 growth default applied to a 40 MB live set. The policy is a knob with
 Go's meaning: `IyiMark.growth = percent` is what the program may
 allocate before the next collection, in hundredths of the live set -
@@ -675,6 +679,48 @@ live churn and churn and a tenth behind on binary trees, where three
 cores give the mark one helper and the sweep round two; and live
 churn's footprint under Go's there, whose 274 MB is the same live set
 at Go's own budget on a machine with less memory to spare.
+
+**One type id: the object is its fields.** Crystal's object layout
+puts the type id at the object's front, an `i32` before the first
+field, and the header above put it in the mark word's high half too:
+every class object carried it twice, eight bytes past its fields, and
+binary trees' node - two pointers - was a 32-byte chunk where Go's is
+16. In 0.10.0 the front copy is gone. The compiler's `LLVMTyper` lays
+a class out as its instance variables and nothing before them; every
+dynamic type-id read (`type_id.cr`'s three loads, which every dispatch,
+`is_a?`, cast and union unboxing go through) is the u32 at `P-4`;
+`offsetof`, the layout tables and the type-info dump lost their shift
+of one; and a string literal's global is `{header word, {bytesize,
+length, bytes}}` with the program's pointer past the word. The word
+has to be there under every allocator, or a module's object code would
+link under one and corrupt under another: the arena had it; the bump
+pointer and wasm's linear memory keep their size word at `P-16` and
+leave `P-8` for it; Boehm's and the process heap's blocks are eight
+bytes larger with the pointer eight bytes in, an interior pointer
+libgc follows by default. A `--crystal` program keeps Crystal's layout
+- its runtime is Crystal's, allocating through Boehm with nothing under
+the pointer - and so does the compiler's own bootstrap, which is such
+a program; `Program#iyi_object_layout?` is the switch, true when the
+iyi prelude is loaded, and the spec harness's JIT-run snippets, which
+carry the default without loading it, keep Crystal's layout for the
+same reason. `.iyimod` is v44: the layouts a module carries are laid
+out differently, and a 0.9.0 artifact is rejected and rebuilt.
+
+The footprint: binary trees 29 MB resident to 25, live churn 249 to
+167, churn unchanged at 15 - a class object is eight bytes smaller and
+the size classes are eight bytes apart, so the saving is every object's.
+Two things found on the way. A helper at the sweep round that found
+every arena with work inside another's slice went back to its park as
+if nothing were left, and the allocating thread swept the heap itself,
+slice after slice; smaller objects and a smaller heap made the one
+arena of binary trees' nodes always somebody's, and the round was
+worth nothing until the helper learned to wait a few microseconds and
+look again. And the concurrent mark's failure proof assumed the holder
+it moves a payload into is black when the move happens; when it turns
+black is the workers' order of business, and with objects eight bytes
+smaller the 200,000-cell chain came first on the same stacks and the
+holder last, so the move now waits for the holder's colour, which is
+the property the proof's message always claimed.
 
 **This machine's cores are not alike, and the race's numbers move
 with placement.** The Ryzen AI 9 465 has four Zen 5 cores and six Zen

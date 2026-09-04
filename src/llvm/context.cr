@@ -123,6 +123,12 @@ class LLVM::Context
     Value.new LibLLVM.const_struct_in_context(self, (values.to_unsafe.as(LibLLVM::ValueRef*)), values.size, packed ? 1 : 0)
   end
 
+  # A constant `getelementptr inbounds` into a global: for a pointer into
+  # an initializer, past a header word.
+  def const_inbounds_gep(type : LLVM::Type, value : LLVM::Value, indices : Array(LLVM::Value)) : Value
+    Value.new LibLLVM.const_in_bounds_gep2(type, value, (indices.to_unsafe.as(LibLLVM::ValueRef*)), indices.size)
+  end
+
   def md_string(value : String) : Value
     LLVM::Value.new LibLLVM.md_string_in_context2(self, value, value.bytesize)
   end

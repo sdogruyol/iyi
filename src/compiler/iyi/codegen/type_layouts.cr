@@ -71,8 +71,9 @@ module Iyi
 
     # The pointer words of one type's own fields, at *base* within the object
     # being mapped. *struct_type* is the type's emitted struct, whose element
-    # order is `all_instance_vars` order with the type id word first for a
-    # class, so `index_of_instance_var` plus that shift is the element index.
+    # order is `all_instance_vars` order - under iyi's layout the type id is
+    # under the object, not in it, and the table is only ever emitted for
+    # that layout - so `index_of_instance_var` is the element index.
     private def gc_scan_offsets(type : Type, struct_type : LLVM::Type, base : UInt64, into : Array(UInt64)) : Nil
       if type.extern_union?
         # A C union's fields overlap, so which one is live is runtime
@@ -83,9 +84,8 @@ module Iyi
         return
       end
 
-      shift = type.struct? ? 0 : 1
       type.all_instance_vars.each do |name, ivar|
-        index = type.index_of_instance_var(name).not_nil! + shift
+        index = type.index_of_instance_var(name).not_nil!
         gc_field_offsets(ivar.type, base + llvm_typer.offset_of(struct_type, index), into,
           extern: type.extern?)
       end
@@ -191,12 +191,11 @@ module Iyi
       return typer.size_of(struct_type) if type.extern_union?
 
       count = type.all_instance_vars.size
-      shift = type.struct? ? 0 : 1
-      # A class with no fields still carries its type id word; an empty
-      # struct carries nothing.
-      return shift.to_u64 * 4_u64 if count == 0
+      # A class with no fields carries nothing either: its type id is under
+      # the object, not in it, and this table is iyi's layout's only.
+      return 0_u64 if count == 0
 
-      last = count - 1 + shift
+      last = count - 1
       element = struct_type.struct_element_types[last]
       typer.offset_of(struct_type, last) + typer.size_of(element)
     end
