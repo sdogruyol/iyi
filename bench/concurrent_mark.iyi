@@ -156,19 +156,20 @@
     false
   end
 
-  # The holder black, or the mark over: the move below has to land in a
-  # black holder for the barrier to be the only thing that saves the
-  # payload - a gray holder is scanned later and finds it by itself, and
-  # the failure proof, which removes the barrier's shade, then proves
-  # nothing. When the holder turns black is the workers' order of
-  # business: with the 200,000-cell chain on the same stacks it came
-  # last, once objects got eight bytes smaller and the order moved.
-  def wait_black(holder : Holder) : Bool
-    while IyiMark.marking?
-      return true if IyiMark.colour(holder.object_id.to_u64) == IyiMark::BLACK
-      IyiMark.spin_pause
-    end
-    false
+  # A holder born under the mark: allocate-black makes it black by
+  # construction, so nobody scans it and the move below lands in a black
+  # holder the moment it is made - the barrier is then the only thing
+  # that saves the payload, which is what the failure proof removes.
+  # Waiting for one of the pre-made holders to turn black instead proved
+  # nothing on some machines: when it turns black is the workers' order
+  # of business, and where the 200,000-cell chain came first the payload
+  # was black already, found through the chain's tail, and the proof had
+  # nothing to lose. The new holder goes into the rooted array so it is
+  # a root's child; the array's store is its own barrier's business.
+  def born_black_holder(round : Int32) : Holder
+    holder = Holder.new
+    Roots.holders[round % 64] = holder
+    holder
   end
 
   # The move, under a mark: payload from the chain's tail into a holder,
@@ -251,11 +252,16 @@
     IyiMark.auto = false
     seed = 1000_u64 + round.to_u64
     chain = build_chain(seed)
-    holder = Roots.holders[round % 64]
-    holder.payload = nil
+    Roots.holders[round % 64].payload = nil
     IyiMark.auto = true
     marking = allocate_until_marking
-    marking = wait_black(holder) if marking
+    holder = born_black_holder(round)
+    # Under a mark, and the chain's tail not reached yet: a payload the
+    # workers found through the chain is saved by the chain, and that
+    # round is not the barrier's to prove.
+    payload = tail(chain).payload
+    payload_white = payload.is_a?(Payload) && IyiMark.colour(payload.object_id.to_u64) == IyiMark::WHITE
+    marking = marking && IyiMark.marking? && IyiMark.colour(holder.object_id.to_u64) == IyiMark::BLACK && payload_white
     under_mark = under_mark + 1 if marking
     move(chain, holder)
     # The chain is garbage from here; the payload lives in the holder only.

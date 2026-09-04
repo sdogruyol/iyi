@@ -1477,7 +1477,16 @@ module Iyi
     end
 
     def get_global(name, type, real_var, initial_value = nil)
-      if real_var.thread_local?
+      # iyi: a program under iyi's prelude reads a thread-local straight off
+      # the thread pointer - one `%fs:`/`tpidr_el0` load, local-exec. The
+      # NoInline accessor below guards against LLVM hoisting a thread-local's
+      # address across a fiber switch that lands the fiber on another thread;
+      # an iyi fiber belongs to its scheduler thread and never moves
+      # (`src/iyi/concurrency.iyi`, the scheduler), so the address is a
+      # constant for the fiber's life and the guard priced four calls into
+      # every allocation. A `--crystal` program keeps the accessor: its fibers
+      # are Crystal's, which may.
+      if real_var.thread_local? && !@program.iyi_prelude?
         get_thread_local(name, type, real_var)
       else
         get_global_var(name, type, real_var, initial_value)
