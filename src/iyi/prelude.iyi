@@ -2608,12 +2608,12 @@ require "./file"
       POOL_MARK_PERMITS = 832_u64
       POOL_FINISH = 896_u64
       NO_PERMIT = 0xFFFFFFFFFFFFFFFF_u64
-      # Each helper parks on a line of its own, so a mark wakes the
+      # Each Linux helper parks on a line of its own, so a mark wakes the
       # helpers it asks and no more: a small mark asks one, and fourteen
       # threads woken to find no permit were a fifth of churn's wall
-      # time. On Linux the line holds the generation the helper was last
-      # woken to and the futex is on it; on darwin, which has none, it
-      # holds the helper's park pipe, two fds in one word.
+      # time. The line holds the generation the helper was last woken to,
+      # and the futex is on it. darwin's helpers spin on the generation
+      # instead, for the reason `wait_generation` there records.
       POOL_PARK = 1024_u64
 
       # Helpers: how many the collector may use besides itself, how many
@@ -3294,15 +3294,6 @@ require "./file"
       def self.helper_main(index : UInt64) : Nil
         w = worker
         seen = pool_word(POOL_GENERATION).value.get
-        {% if flag?(:darwin) %}
-          # The park before the ready: a wake goes to this line, and the
-          # collector waits for the ready count before it wakes anybody.
-          # The pipe's fds are made into the line's second word, which is
-          # this helper's alone - nothing is allocated here, because the
-          # collector holds the runtime lock while it waits.
-          park = pool + POOL_PARK + index * 64_u64
-          IyiHeap.write64(park, IyiThread.park_pipe(park + 8_u64)) if IyiHeap.read64(park) == 0_u64
-        {% end %}
         pool_word(POOL_READY).value.add(1_u64)
         while true
           seen = wait_generation(index, seen)
@@ -3442,34 +3433,33 @@ require "./file"
       {% else %}
         # darwin has no futex: a helper spins on the generation with a
         # yield between reads, which costs no name on the floor.
-        # darwin's park is a pipe per helper, made by the helper before it
-        # announces itself ready: a spin on darwin's `yield` hint is a hot
-        # spin - two helpers spinning on a three-core machine cost churn
-        # sixteen times its wall time - and there is no futex to sleep on.
+        # darwin's helpers spin on the generation, and it is a hot spin -
+        # `yield` there is the ARM hint, not a syscall. Measured and kept:
+        # a park was built for them, a pipe per helper (there is no futex
+        # on darwin, and a signal handler may call `read` but not
+        # `os_unfair_lock_lock`), and on CI's three-core runner it cost
+        # binary trees 1.07 s against the spin's 0.23 and churn 0.19
+        # against 0.075. A parked helper has to be woken and then
+        # scheduled before it marks, and on a machine with three cores
+        # that is the mark's latency; a spinning helper is at the pool the
+        # instant the generation turns, and the core it burns while idle
+        # is worth less than the mark it delays. Linux's futex park costs
+        # microseconds and keeps its cores, which is why the platforms
+        # differ here at all.
         def self.wait_generation(index : UInt64, seen : UInt64) : UInt64
           word = pool_word(POOL_GENERATION)
-          park = pool + POOL_PARK + index * 64_u64
-          IyiHeap.write64(park, IyiThread.park_pipe(park + 8_u64)) if IyiHeap.read64(park) == 0_u64
-          spun = spin_for_generation(word, seen)
-          return spun if spun != seen
           while (now = word.value.get) == seen
-            IyiThread.park_pipe_wait(IyiHeap.read64(park))
-            now = word.value.get
+            IyiThread.yield_cpu
           end
           now
         end
 
+        # Nothing to wake: a darwin helper is spinning on the generation,
+        # which the caller has already turned.
         def self.wake_helpers : Nil
-          wake_some_helpers(@@helpers)
         end
 
         def self.wake_some_helpers(count : UInt64) : Nil
-          index = 0_u64
-          while index < count && index < @@helpers
-            park = IyiHeap.read64(pool + POOL_PARK + index * 64_u64)
-            IyiThread.park_pipe_wake(park) if park != 0_u64
-            index = index + 1_u64
-          end
         end
       {% end %}
       {% else %}

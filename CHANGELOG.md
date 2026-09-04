@@ -43,14 +43,20 @@
   out of the middle of an allocation. A `--crystal` program keeps it
   everywhere, its fibers being Crystal's.
 
-- **A helper spins before it parks.** A sleeping thread has to be
-  scheduled before it can answer a stop-the-world signal, and on a
-  machine with fewer cores than threads that is milliseconds: darwin's
-  three-core CI runner turned every collection's stop from tens of
-  microseconds into milliseconds the day the helpers stopped spinning
-  on the `yield` hint and started sleeping in their pipes. Collections
-  come in bursts, so a helper spins for about fifty microseconds before
-  it parks - hot through a burst, asleep between them.
+- **A Linux helper spins before it parks; a darwin helper spins.** A
+  parked helper has to be woken and then scheduled before it marks, and
+  on a machine with three cores that latency is the mark's: the mutator
+  keeps allocating under a mark that has not started, paying the barrier
+  and its assists. A park was built for darwin's helpers - a pipe each,
+  there being no futex there and a signal handler being allowed `read`
+  but not `os_unfair_lock_lock` - and it was measured on CI's three-core
+  runner and refused: binary trees 1.07 s against the spin's 0.23,
+  churn 0.19 against 0.075. darwin's helpers keep spinning on the
+  generation, which is what 0.9.0 shipped, and the core one burns while
+  idle is worth less than the mark it delays. Linux keeps the futex
+  park, whose wake is microseconds, with a spin of about fifty
+  microseconds before it - collections come in bursts, and a helper that
+  spins through one is hot for the next.
 
 - **An assist yields to a stop.** A mutator that assists the mark scans
   up to a thousand objects inside the allocator, where a stop is
@@ -77,26 +83,17 @@
 
 ### Fixed
 
-- **darwin's helpers spun on a hint, and the first pipe park deadlocked
-  them.** `yield_cpu` on darwin is the ARM `YIELD` instruction, not a
-  syscall: it hands the core's other hardware thread a turn and the
-  scheduler nothing, so a helper waiting for the next mark burned a
-  core - two of them on CI's three-core runner cost churn sixteen times
-  its wall time once every collection turned the generation. Each
-  helper parks on a pipe of its own now, the same park the
-  stop-the-world uses and for the same reasons. The first cut made the
-  pipe with a heap allocation, which asks the allocator for the runtime
-  lock the collector is holding while it waits for that very helper to
-  announce itself: darwin's thread exercise deadlocked on its first
-  step. The fds are written into the helper's own park line, and
-  nothing is allocated. The write end is non-blocking, too: a wake for
-  a helper that is not parked leaves its byte behind, and 65,536 of
-  them filled the pipe - the next waker would block inside `write`
-  holding the runtime lock, which is every thread in the program. A
-  full pipe is a helper with wakes already pending, so the dropped
-  write is one somebody else delivered. `fcntl` joins the darwin
-  allowlists - six gates state that list, and the thread floor is the
-  one that states it twice.
+- **The mark's wake, taken apart on darwin and put back.** Three things
+  were found while a park for darwin's helpers was built and then
+  refused (Added, above, has the numbers). A pipe made with a heap
+  allocation asks the allocator for the runtime lock the collector is
+  holding while it waits for that very helper to announce itself:
+  darwin's thread exercise deadlocked on its first step. A wake for a
+  helper that is not parked leaves its byte in the pipe, and 65,536 of
+  them fill it: the next waker blocks inside `write` holding the
+  runtime lock, which is every thread in the program. And a symbol the
+  runtime reaches for lands on six gates' darwin allowlists, the thread
+  floor's twice. None of it ships; all of it is why the spin stayed.
 
 - **A bounded first stop left its live counts in the worker's page.**
   A mark that ends inside the bound does not reach the drain's end,
@@ -3817,7 +3814,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,547-line library and nothing else. Every other
+  written against iyi's own 9,491-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 
