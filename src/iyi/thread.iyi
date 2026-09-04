@@ -764,9 +764,43 @@
       {% if flag?(:linux) %}
         __iyi_conc_syscall3(IYI_SYS_SCHED_YIELD, 0_i64, 0_i64, 0_i64)
       {% else %}
+        # darwin's `yield` is the ARM hint, not a syscall: it gives the
+        # core's other hardware thread a turn and nothing to the
+        # scheduler, so a loop around it is a hot spin. Where a thread has
+        # nothing to do until somebody tells it, `park_pipe_wait` is the
+        # answer; this remains for the short spins.
         asm("yield" :::: "volatile")
       {% end %}
     end
+
+    {% if flag?(:darwin) %}
+      # A park a helper can sleep in, and a wake that costs the waker one
+      # write: the same pipe the stop-the-world park uses, and for the same
+      # reason - there is no futex on darwin, `os_unfair_lock` is not on
+      # the list of what a signal handler may call, and a spin on the
+      # `yield` hint burns a core. One pipe per helper, its two fds packed
+      # into one word, read end low.
+      def self.park_pipe : UInt64
+        fds = Pointer(Int32).malloc(2_u64)
+        raise "pipe failed" if LibC.pipe(fds) != 0
+        fds[1].to_i64.to_u64.unsafe_shl(32_u64) | fds[0].to_i64.to_u64
+      end
+
+      # Until somebody writes. A byte already in the pipe returns at once,
+      # which is what makes a wake that arrives before the park harmless.
+      def self.park_pipe_wait(packed : UInt64) : Nil
+        byte = uninitialized UInt8
+        fd = (packed & 0xFFFFFFFF_u64).to_i32
+        while LibC.read(fd, pointerof(byte).as(Void*), 1_u64) != 1_i64
+        end
+      end
+
+      def self.park_pipe_wake(packed : UInt64) : Nil
+        byte = 1_u8
+        fd = packed.unsafe_shr(32_u64).to_i32
+        LibC.write(fd, pointerof(byte).as(Void*), 1_u64)
+      end
+    {% end %}
 
     # This thread's line, from the thread-local or, in the instant before
     # a child names its own, by its handle.

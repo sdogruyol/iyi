@@ -2608,12 +2608,12 @@ require "./file"
       POOL_MARK_PERMITS = 832_u64
       POOL_FINISH = 896_u64
       NO_PERMIT = 0xFFFFFFFFFFFFFFFF_u64
-      # On Linux each helper parks on a word of its own, a line apart from
-      # the next, so a mark wakes the helpers it asks and no more: a
-      # small mark asks one, and fourteen threads woken to find no permit
-      # were a fifth of churn's wall time. The word holds the generation
-      # the helper was last woken to; the waker writes the new one and
-      # wakes that word.
+      # Each helper parks on a line of its own, so a mark wakes the
+      # helpers it asks and no more: a small mark asks one, and fourteen
+      # threads woken to find no permit were a fifth of churn's wall
+      # time. On Linux the line holds the generation the helper was last
+      # woken to and the futex is on it; on darwin, which has none, it
+      # holds the helper's park pipe, two fds in one word.
       POOL_PARK = 1024_u64
 
       # Helpers: how many the collector may use besides itself, how many
@@ -3294,6 +3294,12 @@ require "./file"
       def self.helper_main(index : UInt64) : Nil
         w = worker
         seen = pool_word(POOL_GENERATION).value.get
+        {% if flag?(:darwin) %}
+          # The park before the ready: a wake goes to this line, and the
+          # collector waits for the ready count before it wakes anybody.
+          park = pool + POOL_PARK + index * 64_u64
+          IyiHeap.write64(park, IyiThread.park_pipe) if IyiHeap.read64(park) == 0_u64
+        {% end %}
         pool_word(POOL_READY).value.add(1_u64)
         while true
           seen = wait_generation(index, seen)
@@ -3409,18 +3415,32 @@ require "./file"
       {% else %}
         # darwin has no futex: a helper spins on the generation with a
         # yield between reads, which costs no name on the floor.
+        # darwin's park is a pipe per helper, made by the helper before it
+        # announces itself ready: a spin on darwin's `yield` hint is a hot
+        # spin - two helpers spinning on a three-core machine cost churn
+        # sixteen times its wall time - and there is no futex to sleep on.
         def self.wait_generation(index : UInt64, seen : UInt64) : UInt64
           word = pool_word(POOL_GENERATION)
+          park = pool + POOL_PARK + index * 64_u64
+          IyiHeap.write64(park, IyiThread.park_pipe) if IyiHeap.read64(park) == 0_u64
           while (now = word.value.get) == seen
-            IyiThread.yield_cpu
+            IyiThread.park_pipe_wait(IyiHeap.read64(park))
+            now = word.value.get
           end
           now
         end
 
         def self.wake_helpers : Nil
+          wake_some_helpers(@@helpers)
         end
 
         def self.wake_some_helpers(count : UInt64) : Nil
+          index = 0_u64
+          while index < count && index < @@helpers
+            park = IyiHeap.read64(pool + POOL_PARK + index * 64_u64)
+            IyiThread.park_pipe_wake(park) if park != 0_u64
+            index = index + 1_u64
+          end
         end
       {% end %}
       {% else %}

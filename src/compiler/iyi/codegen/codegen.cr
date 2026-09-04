@@ -2536,7 +2536,7 @@ module Iyi
         # prelude: each mode's `__crystal_malloc64` leaves a word of its
         # own under the pointer for it, so an object's layout is one thing
         # wherever it was allocated and a module's object code links under
-        # any mode. A Crystal-layout program stores it in front, below.
+        # any mode. The other layout stores it in front, below.
         if @program.iyi_object_layout?
           id_slot = gep llvm_context.int8, type_ptr, -4, "type_id"
           store type_id(type), id_slot
