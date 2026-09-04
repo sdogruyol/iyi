@@ -252,6 +252,23 @@ echo "  A size-class allocator is expected to cost more than a bump pointer on"
 echo "  the fast path. The number is reported rather than hidden, and it is the"
 echo "  price of a heap that can hand memory back."
 
+# And asserted, in release, where a program ships: the allocation is a
+# thread-local cache pop and a header store, and it has measured 11 to 20 ns
+# on the machines this runs on against the bump pointer's 9 to 13. The
+# ceiling is what a regression would have to cross - a lock taken per
+# allocation put it at 39 ns, a sweep walked per refill at 80 - not a
+# target to tune to, and it is checked rather than eyeballed because
+# nobody reads a printed number twice.
+ALLOCATION_CEILING=${ALLOCATION_CEILING:-40}
+if [ -n "$arena_rel" ] && [ "$arena_rel" -gt "$ALLOCATION_CEILING" ]; then
+  echo "  FAIL: an allocation costs $arena_rel ns in release, past the ${ALLOCATION_CEILING} ns ceiling"
+  status=1
+fi
+if [ -n "$pair_rel" ] && [ "$pair_rel" -gt "$ALLOCATION_CEILING" ]; then
+  echo "  FAIL: an alloc+free pair costs $pair_rel ns in release, past the ${ALLOCATION_CEILING} ns ceiling"
+  status=1
+fi
+
 echo
 if [ "$status" -eq 0 ]; then
   echo "the arena allocator holds"

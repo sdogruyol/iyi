@@ -65,6 +65,20 @@
 
 ### Fixed
 
+- **darwin's helpers spun on a hint, and the first pipe park deadlocked
+  them.** `yield_cpu` on darwin is the ARM `YIELD` instruction, not a
+  syscall: it hands the core's other hardware thread a turn and the
+  scheduler nothing, so a helper waiting for the next mark burned a
+  core - two of them on CI's three-core runner cost churn sixteen times
+  its wall time once every collection turned the generation. Each
+  helper parks on a pipe of its own now, the same park the
+  stop-the-world uses and for the same reasons. The first cut made the
+  pipe with a heap allocation, which asks the allocator for the runtime
+  lock the collector is holding while it waits for that very helper to
+  announce itself: darwin's thread exercise deadlocked on its first
+  step. The fds are written into the helper's own park line, and
+  nothing is allocated.
+
 - **A bounded first stop left its live counts in the worker's page.**
   A mark that ends inside the bound does not reach the drain's end,
   where the pending per-arena live counts are flushed, so the scavenge
@@ -3784,7 +3798,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,446-line library and nothing else. Every other
+  written against iyi's own 9,500-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

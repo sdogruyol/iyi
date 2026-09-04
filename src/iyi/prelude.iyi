@@ -3297,8 +3297,11 @@ require "./file"
         {% if flag?(:darwin) %}
           # The park before the ready: a wake goes to this line, and the
           # collector waits for the ready count before it wakes anybody.
+          # The pipe's fds are made into the line's second word, which is
+          # this helper's alone - nothing is allocated here, because the
+          # collector holds the runtime lock while it waits.
           park = pool + POOL_PARK + index * 64_u64
-          IyiHeap.write64(park, IyiThread.park_pipe) if IyiHeap.read64(park) == 0_u64
+          IyiHeap.write64(park, IyiThread.park_pipe(park + 8_u64)) if IyiHeap.read64(park) == 0_u64
         {% end %}
         pool_word(POOL_READY).value.add(1_u64)
         while true
@@ -3422,7 +3425,7 @@ require "./file"
         def self.wait_generation(index : UInt64, seen : UInt64) : UInt64
           word = pool_word(POOL_GENERATION)
           park = pool + POOL_PARK + index * 64_u64
-          IyiHeap.write64(park, IyiThread.park_pipe) if IyiHeap.read64(park) == 0_u64
+          IyiHeap.write64(park, IyiThread.park_pipe(park + 8_u64)) if IyiHeap.read64(park) == 0_u64
           while (now = word.value.get) == seen
             IyiThread.park_pipe_wait(IyiHeap.read64(park))
             now = word.value.get
