@@ -1477,16 +1477,23 @@ module Iyi
     end
 
     def get_global(name, type, real_var, initial_value = nil)
-      # iyi: a program under iyi's prelude reads a thread-local straight off
-      # the thread pointer - one `%fs:`/`tpidr_el0` load, local-exec. The
-      # NoInline accessor below guards against LLVM hoisting a thread-local's
-      # address across a fiber switch that lands the fiber on another thread;
-      # an iyi fiber belongs to its scheduler thread and never moves
-      # (`src/iyi/concurrency.iyi`, the scheduler), so the address is a
-      # constant for the fiber's life and the guard priced four calls into
-      # every allocation. A `--crystal` program keeps the accessor: its fibers
-      # are Crystal's, which may.
-      if real_var.thread_local? && !@program.iyi_prelude?
+      # iyi: a program under iyi's prelude, on ELF, reads a thread-local
+      # straight off the thread pointer - one `%fs:`/`tpidr_el0` load,
+      # local-exec. The NoInline accessor below guards against LLVM hoisting
+      # a thread-local's address across a fiber switch that lands the fiber
+      # on another thread; an iyi fiber belongs to its scheduler thread and
+      # never moves (`src/iyi/concurrency.iyi`, the scheduler), so the
+      # address is a constant for the fiber's life and the guard priced four
+      # calls into every allocation.
+      #
+      # Mach-O keeps the accessor, and the reason is the platform's: there
+      # is no local-exec there, a thread-local's address comes from
+      # `_tlv_bootstrap` through a call whatever the model, and one accessor
+      # per read is what keeps that call from being made several times in an
+      # allocation - measured, the direct form cost darwin's binary trees
+      # six times its wall time. A `--crystal` program keeps it everywhere:
+      # its fibers are Crystal's, which may change threads.
+      if real_var.thread_local? && !(@program.iyi_prelude? && @program.has_flag?("linux"))
         get_thread_local(name, type, real_var)
       else
         get_global_var(name, type, real_var, initial_value)
