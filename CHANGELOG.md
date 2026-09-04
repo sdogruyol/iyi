@@ -78,8 +78,8 @@
   them and a module's object code links under any. A `--crystal`
   program and the compiler's own bootstrap keep Crystal's layout
   (`Program#iyi_object_layout?`). `.iyimod` is v44. Binary trees is 29
-  MB resident to 25, live churn 249 to 167 (GC_DESIGN.md, "One type
-  id").
+  MB resident to 25, live churn 249 to 186, and a 200,000-node list
+  marks 200,000 times eight bytes fewer (GC_DESIGN.md, "One type id").
 
 ### Fixed
 

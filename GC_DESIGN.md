@@ -564,15 +564,18 @@ landed:
 
 | program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| binary trees | 0.202 s | 29 MB | 0.09 ms | 2.1 ms | 0.179 s | 18 MB | 65 ms | 0.214 s | 18 MB | 0.18 ms | 3.3 ms |
-| live churn | 0.131 s | 249 MB | 0.09 ms | 0.4 ms | 0.150 s | 91 MB | 94 ms | 0.204 s | 136 MB | 0.16 ms | 0.5 ms |
-| churn | 0.041 s | 15 MB | 0.03 ms | 0.4 ms | 0.080 s | 15 MB | 40 ms | 0.077 s | 15 MB | 0.17 ms | 3.5 ms |
+| binary trees | 0.227 s | 25 MB | 0.33 ms | 3.9 ms | 0.194 s | 18 MB | 81 ms | 0.210 s | 17 MB | 0.23 ms | 3.1 ms |
+| live churn | 0.136 s | 186 MB | 0.13 ms | 0.4 ms | 0.160 s | 91 MB | 104 ms | 0.249 s | 117 MB | 0.06 ms | 0.4 ms |
+| churn | 0.059 s | 15 MB | 0.09 ms | 0.4 ms | 0.082 s | 15 MB | 42 ms | 0.091 s | 15 MB | 0.18 ms | 3.6 ms |
 
-The wall time is under Go's on all three now and under Boehm's on two;
-the pauses are Go's or under on every program. Plugged in: on battery,
-under the `powersave` governor, every arm of the table reads about a
-tenth slower and binary trees' iyi and Go cells tie, so a run that is
-to be compared with this one is a run on mains.
+The wall time is under Go's on all three and under Boehm's on two; the
+longest pause is Go's or near it, and the total paused is a third to a
+tenth of Boehm's. 0.10.0's numbers against 0.9.0's, same machine: the
+resident set is where the work went - binary trees 29 MB to 25 and live
+churn 249 to 186 - and the wall time is within the run-to-run spread
+either way. Plugged in: on battery, under the `powersave` governor,
+every arm of the table reads about a tenth slower, so a run that is to
+be compared with this one is a run on mains.
 
 Live churn's RSS moves run to run (216 to 257 MB across four runs of
 the same binary) because the budget is what the last mark found live
@@ -744,8 +747,11 @@ same reason. `.iyimod` is v44: the layouts a module carries are laid
 out differently, and a 0.9.0 artifact is rejected and rebuilt.
 
 The footprint: binary trees 29 MB resident to 25, live churn 249 to
-167, churn unchanged at 15 - a class object is eight bytes smaller and
+186, churn unchanged at 15 - a class object is eight bytes smaller and
 the size classes are eight bytes apart, so the saving is every object's.
+The live-churn program's own accounting says the same thing from the
+other side: its 200,000-node list marked 14,400,096 bytes under 0.9.0's
+layout and 12,800,272 under this one, which is 200,000 times eight.
 Two things found on the way. A helper at the sweep round that found
 every arena with work inside another's slice went back to its park as
 if nothing were left, and the allocating thread swept the heap itself,
