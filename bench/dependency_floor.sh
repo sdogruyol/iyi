@@ -93,7 +93,7 @@ trap 'rm -rf "$WORK"' EXIT
 # sweep handing a run of dead pages back (`MADV_FREE_REUSABLE`, the
 # advice darwin's accounting honours). Linux names none of the five:
 # clone, sched_getaffinity, futex, rt_sigaction and madvise are syscalls.
-ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap madvise pipe pthread_create pthread_kill sigaction sysctlbyname _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
+ALLOWED_SYMBOLS_DARWIN="__error _tlv_bootstrap fcntl madvise pipe pthread_create pthread_kill sigaction sysctlbyname _dyld_get_image_header _dyld_get_image_vmaddr_slide chmod clock_gettime_nsec_np close exit kevent kqueue mmap munmap open pthread_get_stackaddr_np pthread_self read unlink write"
 ALLOWED_SYMBOLS_LINUX="ITM_deregisterTMCloneTable ITM_registerTMCloneTable _cxa_finalize _gmon_start__ _libc_start_main"
 
 # What a program may link. The platform libc only.

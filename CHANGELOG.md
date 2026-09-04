@@ -77,7 +77,13 @@
   lock the collector is holding while it waits for that very helper to
   announce itself: darwin's thread exercise deadlocked on its first
   step. The fds are written into the helper's own park line, and
-  nothing is allocated.
+  nothing is allocated. The write end is non-blocking, too: a wake for
+  a helper that is not parked leaves its byte behind, and 65,536 of
+  them filled the pipe - the next waker would block inside `write`
+  holding the runtime lock, which is every thread in the program. A
+  full pipe is a helper with wakes already pending, so the dropped
+  write is one somebody else delivered. `fcntl` joins the darwin
+  allowlists.
 
 - **A bounded first stop left its live counts in the worker's page.**
   A mark that ends inside the bound does not reach the drain's end,
