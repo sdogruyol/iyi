@@ -577,8 +577,14 @@ either way. Plugged in: on battery, under the `powersave` governor,
 every arm of the table reads about a tenth slower, so a run that is to
 be compared with this one is a run on mains.
 
-Live churn's RSS moves run to run (216 to 257 MB across four runs of
-the same binary) because the budget is what the last mark found live
+One thing landed after this table was read and is not in it: the sweep
+round's retry, the wait a helper takes before it looks for a claim
+again (darwin's section below is where it was found). Interleaved
+against the build above on the same machine, minimum of eight, it took
+binary trees a further tenth - 402 ms to 367 on battery, where the
+table's own run was on mains - and left churn and live churn where they
+were. Live churn's RSS moves run to run (186 to 244 MB across four runs
+of the same binary) because the budget is what the last mark found live
 times the growth, and which collection the run ends on decides the
 peak. Churn's footprint is Go's and Boehm's; binary trees' is within a
 budget of Go's (its live set doubles into the next budget the same
