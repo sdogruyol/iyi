@@ -557,36 +557,46 @@ a walk holds; a walk that parked through a pause discards its batch as
 the old epoch's; and the scavenge leaves alone an arena that is
 claimed, or walked, or whose mapping a parked walker still names.
 
-The table, read again with all of it in - the lock-free carve, the
-growth default of 200 and Stage 8's slices (the section after this
-one) included, one run of `bench/gc_race.py` on the day the slices
-landed:
+The table, read on the tree 0.10.0 shipped: the lock-free carve, the
+growth default of 200, Stage 8's slices, one type id and the sweep
+round's retry all in, one run of `bench/gc_race.py` on mains, the
+median of four:
 
 | program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| binary trees | 0.227 s | 25 MB | 0.33 ms | 3.9 ms | 0.194 s | 18 MB | 81 ms | 0.210 s | 17 MB | 0.23 ms | 3.1 ms |
-| live churn | 0.136 s | 186 MB | 0.13 ms | 0.4 ms | 0.160 s | 91 MB | 104 ms | 0.249 s | 117 MB | 0.06 ms | 0.4 ms |
-| churn | 0.059 s | 15 MB | 0.09 ms | 0.4 ms | 0.082 s | 15 MB | 42 ms | 0.091 s | 15 MB | 0.18 ms | 3.6 ms |
+| binary trees | 0.207 s | 29 MB | 0.59 ms | 6.7 ms | 0.188 s | 18 MB | 76 ms | 0.214 s | 16 MB | 0.14 ms | 3.2 ms |
+| live churn | 0.110 s | 224 MB | 0.37 ms | 1.0 ms | 0.163 s | 91 MB | 106 ms | 0.248 s | 130 MB | 0.12 ms | 0.5 ms |
+| churn | 0.059 s | 15 MB | 0.01 ms | 0.5 ms | 0.078 s | 15 MB | 40 ms | 0.082 s | 15 MB | 0.17 ms | 3.9 ms |
 
-The wall time is under Go's on all three and under Boehm's on two; the
-longest pause is Go's or near it, and the total paused is a third to a
-tenth of Boehm's. 0.10.0's numbers against 0.9.0's, same machine: the
-resident set is where the work went - binary trees 29 MB to 25 and live
-churn 249 to 186 - and the wall time is within the run-to-run spread
-either way. Plugged in: on battery, under the `powersave` governor,
-every arm of the table reads about a tenth slower, so a run that is to
-be compared with this one is a run on mains.
+The wall time is under Go's on all three and under Boehm's on two -
+binary trees is a tenth behind Boehm and a hundredth under Go - and the
+total paused is a fortieth to a tenth of Boehm's. The longest pause is
+under Go's on churn, three times Go's on live churn and four times on
+binary trees, whose second stop retreats over a 200,000-node chain
+held on a register; the spread across the four runs is the tell -
+binary trees paused 4.4 ms, 6.7, 8.1 and 10.0 while Go paused 3.1 to
+3.3 - and the retreat is what Stage 9's own section says is the one
+stop it does not bound.
 
-One thing landed after this table was read and is not in it: the sweep
-round's retry, the wait a helper takes before it looks for a claim
-again (darwin's section below is where it was found). Interleaved
-against the build above on the same machine, minimum of eight, it took
-binary trees a further tenth - 402 ms to 367 on battery, where the
-table's own run was on mains - and left churn and live churn where they
-were. Live churn's RSS moves run to run (186 to 244 MB across four runs
-of the same binary) because the budget is what the last mark found live
-times the growth, and which collection the run ends on decides the
-peak. Churn's footprint is Go's and Boehm's; binary trees' is within a
+The spread, same four runs: binary trees 0.197 to 0.223 s and 26 to 29
+MB, live churn 0.110 to 0.117 s and 186 to 238 MB, churn 0.051 to
+0.060 s and 15 MB. Live churn's resident set moves because the budget
+is what the last mark found live times the growth, and which
+collection the run ends on decides the peak; binary trees' moves with
+where its collections fall in the iteration. Against 0.9.0 on this
+machine the wall time is a little better on binary trees (0.227 to
+0.207) and live churn (0.136 to 0.110) and unchanged on churn, and the
+resident set is what the layout bought: a 200,000-node list marks
+200,000 times eight bytes fewer, which shows in live churn's floor
+(249 MB to 186) more than in binary trees' (29 to 26-29, its peak
+being a budget rather than a live set). On battery, under the
+`powersave` governor, every arm of this table reads about twice as
+slow, so a run that is to be compared with it is a run on mains.
+
+The sweep round's retry landed after the previous reading of this
+table and is in this one. Interleaved against the build before it, on
+the same machine, minimum of eight: binary trees 402 ms to 367 on
+battery, with churn and live churn where they were. Churn's footprint is Go's and Boehm's; binary trees' is within a
 budget of Go's (its live set doubles into the next budget the same
 way, and Go's 16-byte node was our 32-byte one, its type id ahead of
 two pointers - a 24-byte one since the type id left the object, below);

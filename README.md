@@ -339,10 +339,14 @@ bench/gc_race.py` runs three programs written once in iyi and once in Go —
 binary trees, a million live items beside 256 MiB of garbage, and pure
 churn — under iyi's own collector, under Boehm as Crystal ships it, and under
 Go's, and prints wall time, resident memory and the pauses side by side. On
-the machine GC_DESIGN.md records, the longest pause is Go's or under it on
-every program (0.09 ms, 0.09 ms, 0.03 ms), the wall time beats Go on all
-three and Boehm on two, and the footprint is Go's on churn and a budget or
-two over it on the rest. The collector is iyi's own: precise for typed objects, a mark
+the machine GC_DESIGN.md records, the wall time beats Go on all three and
+Boehm on two, the total paused is a fortieth to a tenth of Boehm's, and the
+footprint is Go's on churn and a budget or two over it on the rest. The
+longest pause is under Go's on churn (0.01 ms against 0.17) and over it on
+the other two (0.37 ms against 0.12, 0.59 against 0.14): binary trees holds
+a 200,000-node chain on a register, and the second stop that retreats over
+it is the one pause the design does not bound — GC_DESIGN.md says so where
+it prints the spread. The collector is iyi's own: precise for typed objects, a mark
 that runs in parallel on helper threads and beside the program on a write
 barrier the compiler emits, a sweep that runs beside the program too, in
 slices the helpers take after every collection, and hands pages back to

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The docs' race table and the two claims that outlived it.** The
+  table GC_DESIGN.md carried was read before the sweep round's retry
+  landed, and it stated the longest pause as "Go's or near it" on every
+  program. Read again on the tree 0.10.0 shipped, on mains, the median
+  of four runs: the wall time is under Go's on all three and under
+  Boehm's on two, and the total paused is a fortieth to a tenth of
+  Boehm's - but the longest pause is under Go's only on churn, and is
+  three to four times Go's on live churn and binary trees, whose second
+  stop retreats over a 200,000-node chain held on a register. The
+  spread is printed with it, README and SPEC III.4.11 say the same
+  thing now, and SPEC's allocation price is the release build's 13 ns
+  the arena exercise gates rather than the plain build's.
+
 ## 0.10.0 — 2026-09-05
 
 **An object is its fields, and which thread a mark runs on is measured.**

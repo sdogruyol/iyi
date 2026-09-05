@@ -2777,10 +2777,14 @@ compiler emits, a collection being two stops of tens of microseconds;
 the header is one word and the only place an object's type id lives,
 the classes eight bytes apart, and the sweep hands pages back to the
 kernel; a mutator outrunning the mark
-allocates black and assists. The price today: 29 ns an allocation with
-one thread, 104 with four, 282 with eight, and `bench/gc_race.py`'s
-table beside Boehm and Go — the pauses Go's or under on every program,
-the footprint Go's on churn and within a budget of it on the rest.
+allocates black and assists. The price today: 13 ns an allocation in a
+release build (`bench/arena_exercise.sh` asserts a ceiling on it now),
+29 ns with one thread under the thread exercise's collections, 104 with
+four, 282 with eight, and `bench/gc_race.py`'s table beside Boehm and
+Go — the wall time under Go's on all three programs, the total paused a
+fortieth to a tenth of Boehm's, the longest pause under Go's on churn
+and over it on the other two, and the footprint Go's on churn and
+within a budget or two of it on the rest.
 
 ### III.5 Module initialisation: **PROPOSED; rules 1, 2 and 4 BUILT**
 
