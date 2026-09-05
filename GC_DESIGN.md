@@ -649,6 +649,20 @@ without the lock: the first cut of the slices took the lock on every
 refill of a class with nothing left and made eight threads' 269 ns
 allocation 8 µs.
 
+A helper that finds every arena with work inside another's slice does
+not leave the round: a program whose nodes fit one arena would then be
+swept by the thread allocating out of it, 471 slices to 34 on binary
+trees. Nor does it look again at once. Every look takes the runtime
+lock and walks the arena list, and a look after 64 pause hints - the
+first cut of the wait - meant 450 looks for every slice a helper
+swept, 4.6 million across binary trees. The wait is `SWEEP_BUSY_SPINS`
+= 4096 pause hints, which is `SWEEP_SPAN` bytes of walking, ended
+early when `POOL_SWEEPERS` falls, because a claim is let go at some
+walker's slice end and that is the event waited for: 71,000 looks, five
+a slice, and the helpers take more slices than the short wait did
+(13,258 against 10,292). What the short wait cost is the darwin
+section below.
+
 The numbers, release builds, pinned to this machine's four fast cores
 and interleaved, minimum and median of ten: binary trees 222 / 228 ms
 to 199 / 201, live churn 102 / 107 to 101 / 104, churn 52 / 53 to 40
@@ -708,6 +722,24 @@ the threads and wakes the helpers, and helper 0 finishes with the
 second stop as before. The bound is a thousand objects because that is
 about ten microseconds of scanning, which is the price of finding out.
 
+Both platforms measure, and darwin came to it late. It kept the
+estimate for most of this cycle on a measurement of a rule without its
+drain: `concurrent_possible?` was opened to every collection while the
+bounded mark stayed behind a Linux-only flag, so every collection on
+darwin went beside the program whatever it found, and churn's 122 of
+them cost 0.49 s against 0.075 - a true number for a rule nobody would
+ship, read as the bound's price. With the drain on both, churn's 122
+marks all end inside the bound: one stop each, 18 µs at their longest,
+none beside the program, and its wall time does not move. What the
+estimate cost is a stop the bound has no room for: binary trees' second
+collection, on darwin with the two helpers three cores give, read
+sixteen bytes of last mark, marked 2,097,568 bytes stopped and paused
+2.1 ms where every other stop in that run is under 230 µs. Whether a
+run lands on that collection is luck - 0.9.0's runner read 0.06 ms and
+this cycle's, whose smaller objects moved the collection points, read
+2.56 ms on the same three cores - and with the bound there is no such
+stop to land on: 0.10 ms, and the wall times below.
+
 What the mark asks for changed with it. A concurrent mark asks every
 helper there is, where sizing it by the live set (one per megabyte) cost
 binary trees a tenth of its wall time: inside a pause the wake and the
@@ -765,22 +797,49 @@ smaller the 200,000-cell chain came first on the same stacks and the
 holder last, so the move now waits for the holder's colour, which is
 the property the proof's message always claimed.
 
-**Open, and the release is waiting on it: darwin's throughput.** Every
-gate passes on darwin, its pauses are microseconds, and its footprint
-fell with everyone's - and its wall time on `bench/gc_race.py` is five
-times what 0.9.0 measured on the same three-core runner: binary trees
-1.56 s against 0.23, churn 0.74 against 0.075, live churn 0.47 against
-0.10. What it is not: the mark's thread (darwin keeps 0.9.0's estimate
-rule and the numbers are the same either way), the helpers' park (the
-pipe was built, measured and refused; they spin as they did), the
-thread-local (Mach-O keeps its accessor), and the two hangs found on
+**darwin's throughput, which the release waited on: it was the round's
+retry.** Every gate passed on darwin, its pauses were microseconds and
+its footprint fell with everyone's - and its wall time on
+`bench/gc_race.py` was five times what 0.9.0 measured on the same
+three-core runner: binary trees 1.56 s against 0.23, churn 0.74
+against 0.075, live churn 0.47 against 0.10. It was the wait in the
+sweep round's retry, above: a helper that finds every arena with work
+inside another's slice looked again after 64 pause hints, and every
+look takes the runtime lock and walks the arena list. That is the lock
+every refill takes. On the shared path it came to 4.6 million looks
+across binary trees where the slice-long wait comes to 71,000 - the
+count is the code's, not the platform's, and what differed is what a
+look cost the thread that wanted the lock: twenty cores and parked
+helpers absorbed it, three cores and helpers that spin rather than
+park did not, and the allocating thread paid for it in refills.
+
+What the wait is worth, on a ten-core M2 Pro, unpinned, interleaved,
+minimum of nine rounds: binary trees 1.33 s to 0.33, churn 0.32 to
+0.061, live churn 0.33 to 0.124, where 0.9.0's own compiler measures
+0.30, 0.082 and 0.116 on the same machine and the same programs. With
+`IyiMark.workers = 2`, the two helpers a three-core runner gets:
+binary trees 0.39 s to 0.19, churn 0.17 to 0.051, live churn 0.15 to
+0.087, against 0.9.0's 0.21, 0.068 and 0.085. The round is not weaker
+for the longer wait - the helpers take 13,258 slices where the short
+wait took 10,292, and the allocating thread sweeps 34 where the short
+wait left it 7 and no retry at all left it 471 - and every gate still
+passes, `collect_trigger`'s among them, whose helpers begin 218 arenas
+to the allocator's 10.
+
+What the wall time was not, each measured: the helpers' park (the pipe
+was built, measured and refused; they spin as they did), the
+thread-local (Mach-O keeps its accessor), the two hangs found on
 few-core machines (both fixed, both in this document's Stage 8 and 9
-sections). What is left to try, in order: a darwin build with
-`IyiMark.workers = 0`, which prices the helpers out entirely; the
-16-kilobyte page against `RELEASE_PAGES`, since churn's resident set
-moved from 6 MB to 19 and back across these runs; and a bisect of the
-layout change alone, which is the one thing in this cycle that changes
-every program's code. 0.10.0 is not cut until that number is back.
+sections), the 16-kilobyte page against `RELEASE_PAGES` (churn hands
+no page back and takes none up - its counters are zero in every one of
+these runs - so the resident set that moved between runs is not the
+sweep's `madvise` traffic, and it moves under 0.9.0's compiler too,
+6.7 MB on one run and 26 on the next), and the layout, which this
+cycle changed for every program and which measures at 0.9.0's numbers
+once the wait is a slice. The mark's thread was not the wall either -
+it reads the same under both rules - but it was darwin's longest
+*pause*, and the rule is the measured bound there now: "Which thread a
+mark runs on is measured, not estimated" above has the numbers.
 
 **This machine's cores are not alike, and the race's numbers move
 with placement.** The Ryzen AI 9 465 has four Zen 5 cores and six Zen

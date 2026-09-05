@@ -62,19 +62,34 @@
   microseconds before it - collections come in bursts, and a helper that
   spins through one is hot for the next.
 
-- **Which thread the mark runs on is Linux's measurement.** The bounded
-  first stop above is a stop per collection, and what it buys depends on
-  what a stop costs: microseconds on Linux, where `tgkill` and a futex
-  are the whole of it, and milliseconds on darwin's three-core runner,
-  where it is `pthread_kill` and a pipe per thread and the threads have
-  to be scheduled to answer. So darwin keeps 0.9.0's rule - the last
-  mark's live bytes against a megabyte - and Linux measures. Both are
-  written where `concurrent_possible?` decides.
+- **Which thread the mark runs on is measured on both platforms.** The
+  bounded first stop was Linux's alone for most of this cycle, and
+  darwin kept 0.9.0's estimate on a measurement of the rule without its
+  drain: the decision was opened to every collection while the bounded
+  mark itself stayed behind a Linux-only flag, so every collection went
+  beside the program whatever it found, and churn's 122 of them cost
+  0.49 s against 0.075. With the drain on both platforms churn's 122
+  marks all end inside the bound - one stop each, 18 µs at their
+  longest, no helper woken - and what the estimate cost darwin is gone
+  with it: binary trees' second collection read sixteen bytes of last
+  mark, marked 2,097,568 bytes stopped and paused 2.1 ms, where every
+  other stop in that run is under 230 µs. One rule now, where
+  `concurrent_possible?` decides.
 
 - **An assist yields to a stop.** A mutator that assists the mark scans
   up to a thousand objects inside the allocator, where a stop is
   deferred until the thread leaves - a hundred microseconds a second
   stop waited for. It stops assisting the moment a stop is asked for.
+
+- **An allocation has a ceiling, not just a printed number.**
+  `bench/arena_exercise.sh` reported the allocator's nanoseconds and
+  nobody reads a printed number twice. It asserts them now, in release,
+  where a program ships: 40 ns for an allocation and for an alloc+free
+  pair, against the 13 ns they measure on the Linux machine and 15 on
+  darwin. The ceiling is what a regression has to cross rather than a
+  target to tune to - a lock taken per allocation put it at 39 ns, a
+  sweep walked per refill at 80 - and this cycle wrote the first of
+  those and measured it away.
 
 - **One type id: an object is its fields.** Crystal's layout carries
   the type id as an `i32` at the object's front, and iyi's header
@@ -3849,7 +3864,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,531-line library and nothing else. Every other
+  written against iyi's own 9,530-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

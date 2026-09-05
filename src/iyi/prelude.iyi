@@ -4417,23 +4417,22 @@ require "./file"
         # megabytes of fresh allocation to walk. What the program did
         # since the last mark is not in any estimate, and the bounded
         # mark does not need one: it measures.
+        #
+        # Both platforms measure, and darwin's turn came late. It kept the
+        # estimate for a cycle on a measurement of a rule without its
+        # drain - `concurrent_possible?` opened to every collection while
+        # the bounded mark below stayed Linux's, so every collection went
+        # beside the program whatever it found, and churn's 122 of them
+        # cost 0.49 s against 0.075. With the drain there too, churn's
+        # 122 marks all end inside the bound: one stop each, 18 µs at
+        # their longest, none beside the program. What the estimate cost
+        # darwin is what it cost Linux - binary trees' one mispredicted
+        # collection read 16 bytes, marked 2,097,568 stopped and paused
+        # 2.1 ms, where every other stop in the run is under 230 µs.
         STW_MARK_BOUND = 1024_u64
 
         def self.concurrent_possible? : Bool
-          {% if flag?(:linux) %}
-            @@helpers_wanted > 0_u64
-          {% else %}
-            # darwin keeps the estimate, and the platform is the reason: a
-            # stop there is `pthread_kill` and a pipe per thread, and on
-            # CI's three-core runner it measures tens of microseconds at
-            # best and milliseconds under load (`bench/thread_floor.sh`
-            # prints both). A collection that starts stopped to find out
-            # how much is live pays that toll every time, and churn's 122
-            # collections paid it: 0.49 s against 0.075. Where a stop is
-            # cheap the measurement is better than any estimate; where it
-            # is not, the estimate is what there is.
-            @@helpers_wanted > 0_u64 && (@@last_marked >= PARALLEL_FROM || @@collections == 0_u64)
-          {% end %}
+          @@helpers_wanted > 0_u64
         end
 
         # The first stop, on the triggering thread, under the runtime lock.
@@ -4481,10 +4480,10 @@ require "./file"
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           IyiRoots.each_root(->(base : UInt64) { shade(base) })
           flush_mutator(w)
-          # The bound is Linux's: darwin's `concurrent_possible?` decided
-          # from the estimate before it stopped anything, and a mark that
-          # got here there is one it wants beside the program.
-          bounded = {% if flag?(:linux) %}drain_bounded(w, STW_MARK_BOUND){% else %}false{% end %}
+          # The mark, up to the bound, on both platforms: what it finds
+          # inside the bound is the whole live set and this stop is the
+          # collection.
+          bounded = drain_bounded(w, STW_MARK_BOUND)
           if bounded
             # The whole live set, inside the bound: this stop is the
             # collection. The tail is `collect_locked`'s, and the caller
