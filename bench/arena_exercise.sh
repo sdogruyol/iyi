@@ -252,22 +252,28 @@ echo "  A size-class allocator is expected to cost more than a bump pointer on"
 echo "  the fast path. The number is reported rather than hidden, and it is the"
 echo "  price of a heap that can hand memory back."
 
-# And asserted, in release, where a program ships: the allocation is a
-# thread-local cache pop and a header store, and it has measured 11 to 20 ns
-# on the machines this runs on against the bump pointer's 9 to 13. The
-# ceiling is what a regression would have to cross - a lock taken per
-# allocation put it at 39 ns, a sweep walked per refill at 80 - not a
-# target to tune to, and it is checked rather than eyeballed because
+# And asserted, in release, where a program ships - against the bump
+# pointer measured in the same run, not against a number typed here. The
+# allocation is a thread-local cache pop and a header store: it has read
+# 13 ns to the bump pointer's 11 on a twenty-core Linux box and 41 to its
+# 28 on darwin's shared three-core runner, so the platform's own floor
+# moves by two and a fixed ceiling of 40 ns failed the second machine
+# while passing every regression the first one has seen. What a
+# regression does is multiply: a lock taken per allocation read 39 ns
+# against an 11 ns bump pointer, a sweep walked per refill 80 against 17.
+# So the gate is the ratio, and the ratio is what a regression crosses -
+# not a target to tune to, and checked rather than eyeballed because
 # nobody reads a printed number twice.
-ALLOCATION_CEILING=${ALLOCATION_CEILING:-40}
-if [ -n "$arena_rel" ] && [ "$arena_rel" -gt "$ALLOCATION_CEILING" ]; then
-  echo "  FAIL: an allocation costs $arena_rel ns in release, past the ${ALLOCATION_CEILING} ns ceiling"
-  status=1
-fi
-if [ -n "$pair_rel" ] && [ "$pair_rel" -gt "$ALLOCATION_CEILING" ]; then
-  echo "  FAIL: an alloc+free pair costs $pair_rel ns in release, past the ${ALLOCATION_CEILING} ns ceiling"
-  status=1
-fi
+ALLOCATION_RATIO=${ALLOCATION_RATIO:-25}
+ratio_holds() { # name arena bump
+  [ -n "$2" ] && [ -n "$3" ] && [ "$3" -gt 0 ] || return 0
+  if [ $(( $2 * 10 )) -gt $(( $3 * ALLOCATION_RATIO )) ]; then
+    echo "  FAIL: $1 costs $2 ns in release against the bump pointer's $3, past $((ALLOCATION_RATIO / 10)).$((ALLOCATION_RATIO % 10))x"
+    status=1
+  fi
+}
+ratio_holds "an allocation" "$arena_rel" "$bump_rel"
+ratio_holds "an alloc+free pair" "$pair_rel" "$bump_rel"
 
 echo
 if [ "$status" -eq 0 ]; then

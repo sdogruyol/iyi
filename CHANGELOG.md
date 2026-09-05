@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **The allocation gate was a number, and the number was one
+  machine's.** 0.10.0's arena exercise asserted a 40 ns ceiling on a
+  release allocation: 13 ns on a twenty-core Linux box, and 41 on
+  darwin's shared three-core runner, where the bump pointer it is
+  supposed to be compared against reads 28 to Linux's 11. The platform's
+  own floor moves by two, so the gate failed the second machine while
+  passing every regression the first has seen. It is a ratio now - the
+  arena's allocation against the bump pointer measured in the same run,
+  2.5x - because what a regression does is multiply: a lock taken per
+  allocation read 3.5x, a sweep walked per refill 4.7x.
+
 - **The docs' race table and the two claims that outlived it.** The
   table GC_DESIGN.md carried was read before the sweep round's retry
   landed, and it stated the longest pause as "Go's or near it" on every
