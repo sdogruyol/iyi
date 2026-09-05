@@ -129,8 +129,20 @@
   was inside another's slice.** It read that as nothing left and went
   back to its park; the allocating thread then swept the heap itself,
   slice after slice - 8,600 slices to the helpers' 1,200 on binary
-  trees once its nodes fit one arena. A helper waits some microseconds
-  and looks again now.
+  trees once its nodes fit one arena. A helper waits and looks again
+  now, and the wait is a slice long, because a slice is what it waits
+  for: a claim is let go at some walker's slice end, and the wait ends
+  early when a helper's does. Looking again after 64 pause hints, as
+  the first cut did, took the runtime lock - the lock every refill
+  takes - 4.6 million times across binary trees where the slice-long
+  wait takes it 71,000, and it took it from the allocating thread: on
+  darwin, whose helpers spin where Linux's park, binary trees ran
+  1.33 s against 0.33, churn 0.32 against 0.061 and live churn 0.33
+  against 0.124 (a ten-core M2 Pro, interleaved, min of nine; 0.9.0
+  measures 0.30, 0.082 and 0.116 there). The longer wait costs the
+  round nothing - the helpers take 13,258 slices against the short
+  wait's 10,292, and leave the allocating thread 34 against the 471
+  it swept with no retry at all.
 
 - **The concurrent mark's failure proof assumed a black holder.** The
   exercise moves a payload into a holder and, with the barrier's shade
@@ -3837,7 +3849,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,516-line library and nothing else. Every other
+  written against iyi's own 9,531-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

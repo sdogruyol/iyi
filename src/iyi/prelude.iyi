@@ -3591,6 +3591,11 @@ require "./file"
       # one - with the lock released, since a slice's end wants it.
       SWEEP_SPAN = 65536_u64
       SWEEP_HELPERS = 3_u64
+      # What a helper waits, in pause hints, before it looks for a claim
+      # again: `SWEEP_SPAN` bytes of walking is some ten microseconds,
+      # and `spin_pause` is about 2.5 nanoseconds of one, so this is a
+      # slice. `sweep_one_helper` says what a shorter wait cost.
+      SWEEP_BUSY_SPINS = 4096_u64
 
       # A slice of an arena of `wanted`'s class, or any if the class has
       # none left, by an allocating thread. Answers 1 for a slice swept,
@@ -3787,12 +3792,22 @@ require "./file"
           IyiRuntimeLock.unlock
           return false if arena == 0
           if arena == 2_u64
-            # Every arena with work is inside another's slice, for
-            # microseconds: wait off the lock and come back.
-            spins = 0
-            while spins < 64
+            # Every arena with work is inside another's slice. The wait
+            # is a slice long, because a slice is what it waits for: the
+            # claim this helper wants is let go at some walker's slice
+            # end, and POOL_SWEEPERS falls when a helper's does. Looking
+            # again sooner buys nothing and costs the runtime lock, which
+            # every refill takes: 64 spins between looks had a helper
+            # take that lock a hundred times a slice, and on three cores
+            # the allocating thread's own claim went with it - darwin's
+            # binary trees 1.36 s against 0.33, churn 0.27 against 0.085,
+            # with the mark and the sweep otherwise unchanged.
+            watch = pool_word(POOL_SWEEPERS)
+            seen = watch.value.get
+            spins = 0_u64
+            while spins < SWEEP_BUSY_SPINS && watch.value.get == seen
               spin_pause
-              spins = spins + 1
+              spins = spins + 1_u64
             end
             return true
           end
