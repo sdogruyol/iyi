@@ -765,6 +765,23 @@ smaller the 200,000-cell chain came first on the same stacks and the
 holder last, so the move now waits for the holder's colour, which is
 the property the proof's message always claimed.
 
+**Open, and the release is waiting on it: darwin's throughput.** Every
+gate passes on darwin, its pauses are microseconds, and its footprint
+fell with everyone's - and its wall time on `bench/gc_race.py` is five
+times what 0.9.0 measured on the same three-core runner: binary trees
+1.56 s against 0.23, churn 0.74 against 0.075, live churn 0.47 against
+0.10. What it is not: the mark's thread (darwin keeps 0.9.0's estimate
+rule and the numbers are the same either way), the helpers' park (the
+pipe was built, measured and refused; they spin as they did), the
+thread-local (Mach-O keeps its accessor), and the two hangs found on
+few-core machines (both fixed, both in this document's Stage 8 and 9
+sections). What is left to try, in order: a darwin build with
+`IyiMark.workers = 0`, which prices the helpers out entirely; the
+16-kilobyte page against `RELEASE_PAGES`, since churn's resident set
+moved from 6 MB to 19 and back across these runs; and a bisect of the
+layout change alone, which is the one thing in this cycle that changes
+every program's code. 0.10.0 is not cut until that number is back.
+
 **This machine's cores are not alike, and the race's numbers move
 with placement.** The Ryzen AI 9 465 has four Zen 5 cores and six Zen
 5c: binary trees pinned to one of the first runs 241 ms, to one of the
