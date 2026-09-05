@@ -23,12 +23,16 @@
   three did. Binary trees' longest pause is 102 µs where the estimate
   left it at 2 ms.
 
-- **A mark asks for the helpers it needs, and each helper parks on a
-  word of its own.** A mark's permits are as many as it asks; a helper
-  woken without one parks again without counting itself in. On Linux
-  the park words are a cache line apart in the pool, so waking three
-  helpers wakes three threads rather than fifteen - fourteen threads
-  woken to find nothing were a fifth of churn's wall time.
+- **A mark asks for the helpers it needs.** A mark's permits are as
+  many as it asks, taken one each by whichever helpers wake first, and
+  the first taker is the one that finishes a concurrent mark; a helper
+  woken without one parks again. What the mark waits for is the count
+  *taken*, never the count asked - a helper can spend its wake on the
+  sweep round and find the mark's generation already seen by the time
+  it looks again, and a wait for a headcount that never arrives is a
+  hang, which three cores found one run in three
+  (`bench/thread_exercise.sh`, eight threads; it reproduces on Linux
+  under `taskset -c 0-2`).
 
 - **A thread-local is one load under iyi's prelude, on ELF.** Crystal
   reaches a `@[ThreadLocal]` through a `noinline` accessor, which is
@@ -57,6 +61,15 @@
   park, whose wake is microseconds, with a spin of about fifty
   microseconds before it - collections come in bursts, and a helper that
   spins through one is hot for the next.
+
+- **Which thread the mark runs on is Linux's measurement.** The bounded
+  first stop above is a stop per collection, and what it buys depends on
+  what a stop costs: microseconds on Linux, where `tgkill` and a futex
+  are the whole of it, and milliseconds on darwin's three-core runner,
+  where it is `pthread_kill` and a pipe per thread and the threads have
+  to be scheduled to answer. So darwin keeps 0.9.0's rule - the last
+  mark's live bytes against a megabyte - and Linux measures. Both are
+  written where `concurrent_possible?` decides.
 
 - **An assist yields to a stop.** A mutator that assists the mark scans
   up to a thousand objects inside the allocator, where a stop is
@@ -3814,7 +3827,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,444-line library and nothing else. Every other
+  written against iyi's own 9,507-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

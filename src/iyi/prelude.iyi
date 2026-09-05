@@ -1263,7 +1263,10 @@ require "./file"
             if answer == 2_u64
               # Every arena of the class is inside another thread's
               # slice: its batch lands within the slice, microseconds,
-              # and the wait for it is off the lock.
+              # and the wait for it is off the lock. Carving instead was
+              # tried and costs: a fresh page is a fault where a swept
+              # chunk is free, and churn - whose every refill meets a
+              # helper mid-slice - ran 40 ms to 59.
               spins = 0
               while centre[index] == 0 && spins < 256
                 IyiMark.spin_pause
@@ -2599,6 +2602,39 @@ require "./file"
       # The class an allocating thread is waiting on, plus one; 0 is none.
       # A helper's claim takes an arena of that class first.
       POOL_SWEEP_WANTED = 768_u64
+      # A mark's permits: as many as it asks helpers, taken one each by
+      # whichever helpers wake first, and the first taker is the one that
+      # finishes a concurrent mark. Every helper is woken and one that
+      # finds no permit parks again, so a mark over a small heap asks one
+      # helper and fifteen do not contend for its pool - churn's 122
+      # marks are 40 ms of wall time with permits and 52 without.
+      #
+      # The count they are waited for is the count *taken*, `ASKED -
+      # PERMITS`, never `ASKED`: a helper can miss a generation
+      # altogether - it spends its wake on the sweep round, and by the
+      # time it looks again the mark's generation is the one it has
+      # already seen - and a wait for a headcount that never arrives is
+      # a hang, which is what three cores found one run in three.
+      POOL_MARK_PERMITS = 832_u64
+      POOL_FINISH = 896_u64
+      NO_PERMIT = 0xFFFFFFFFFFFFFFFF_u64
+
+      # A mark's permit, or NO_PERMIT: the slot is the order of taking,
+      # 0 for the first.
+      def self.take_mark_permit : UInt64
+        word = pool_word(POOL_MARK_PERMITS)
+        while true
+          left = word.value.get
+          return NO_PERMIT if left == 0_u64
+          return IyiHeap.read64(pool + POOL_ASKED) - left if word.value.compare_and_set(left, left - 1_u64)[1]
+        end
+      end
+
+      # How many helpers took a permit for the mark in flight.
+      def self.mark_takers : UInt64
+        IyiHeap.read64(pool + POOL_ASKED) - pool_word(POOL_MARK_PERMITS).value.get
+      end
+
 
       # Helpers: how many the collector may use besides itself, how many
       # exist, and the threshold under which a mark runs alone — waking
@@ -3135,6 +3171,8 @@ require "./file"
         end
         @@workers = helpers + 1_u64
         IyiHeap.write64(pool + POOL_ASKED, helpers)
+        pool_word(POOL_MARK_PERMITS).value.set(helpers)
+        pool_word(POOL_FINISH).value.set(0_u64)
         @@helper_black = 0_u64
         pool_word(POOL_ACTIVE).value.set(@@workers)
         pool_word(POOL_HELPERS_DONE).value.set(0_u64)
@@ -3149,7 +3187,7 @@ require "./file"
         # Every helper asked has answered - left the drain and folded its
         # accounts - before this thread reads them or turns the
         # generation again.
-        while pool_word(POOL_HELPERS_DONE).value.get < (helpers > 0_u64 ? @@helpers : 0_u64)
+        while pool_word(POOL_HELPERS_DONE).value.get < mark_takers
           spin_pause
         end
         @@bytes_marked = @@bytes_marked + IyiHeap.read64(w + W_BYTES)
@@ -3279,32 +3317,30 @@ require "./file"
         pool_word(POOL_READY).value.add(1_u64)
         while true
           seen = wait_generation(seen)
-          # Every helper answers every generation, and one whose index is
-          # past this mark's count answers by counting itself out at once.
-          # A mark that asks fewer than exist still waits for all of them,
-          # because a helper that could miss a generation is a mark that
-          # can hang: permits were tried, so that a small mark woke one
-          # helper and the rest slept, and a helper that spent its wake on
-          # the sweep round then parked through the mark that followed -
-          # the mark waited for a count that never came, on three cores
-          # one run in three (`bench/thread_exercise.sh`, 8 threads).
-          if index < IyiHeap.read64(pool + POOL_ASKED)
+          # A permit or nothing: a helper the mark did not ask for parks
+          # again without counting itself in, and is not waited for.
+          slot = take_mark_permit
+          if slot != NO_PERMIT
             IyiHeap.write64(w + W_LEN, 0_u64)
             IyiHeap.write64(w + W_BYTES, 0_u64)
             IyiHeap.write64(w + W_BLACK, drain(w))
             fold_helper(w)
-          end
-          pool_word(POOL_HELPERS_DONE).value.add(1_u64)
-          # Beside the program, the drain's end is not the mark's: helper 0
-          # waits for the rest, then takes the second stop.
-          if @@concurrent && index == 0_u64
-            while pool_word(POOL_HELPERS_DONE).value.get < @@helpers
-              spin_pause
+            pool_word(POOL_HELPERS_DONE).value.add(1_u64)
+            # Beside the program, the drain's end is not the mark's: the
+            # first taker waits for the rest - for the count taken, which
+            # rises if another helper is still arriving and is never a
+            # promise a missing helper has to keep - and takes the second
+            # stop.
+            if slot == 0_u64 && pool_word(POOL_FINISH).value.get != 0_u64
+              pool_word(POOL_FINISH).value.set(0_u64)
+              while pool_word(POOL_HELPERS_DONE).value.get < mark_takers
+                spin_pause
+              end
+              # The finish turns the generation once more, for the
+              # remainder, and again for the sweep round; that is the one
+              # this helper waits past next.
+              seen = finish_concurrent
             end
-            # The finish turns the generation once more, for the
-            # remainder, and again for the sweep round; that is the one
-            # this helper waits past next.
-            seen = finish_concurrent
           end
           # The round, if one is open and a permit is left: arenas until
           # none is left or a collection closes it.
@@ -3581,13 +3617,14 @@ require "./file"
       end
 
       # Under the lock: an arena with sweeping left, its walk claim taken.
-      # `wanted` is a chunk size to take first, 0 any; `helper` says a
+      # An arena not yet begun this epoch is begun here: its cursor set
+      # to its first chunk, the count of unbegun arenas down by one.
+      #
+      # `wanted` names a class to take first, 0 any; `helper` says a
       # helper asks, which takes any class when the wanted one has none
       # left, where an allocating thread answers 2 (busy) if the wanted
-      # class has arenas but every one is inside a helper's slice, and
-      # 0 only when the class has nothing left to sweep at all. An arena
-      # not yet begun this epoch is begun here: its cursor set to its
-      # first chunk, the count of unbegun arenas down by one.
+      # class has arenas but every one is inside another walker's slice,
+      # and 0 only when the class has nothing left to sweep at all.
       def self.claim_slice(wanted : UInt64, helper : Bool) : UInt64
         epoch = @@epoch
         busy = false
@@ -3772,6 +3809,7 @@ require "./file"
         def self.open_sweep_round : Nil
           return if @@helpers == 0_u64 || @@sweep_left == 0_u64
           IyiHeap.write64(pool + POOL_ASKED, 0_u64)
+          pool_word(POOL_MARK_PERMITS).value.set(0_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           pool_word(POOL_SWEEP_PERMITS).value.set(@@helpers < SWEEP_HELPERS ? @@helpers : SWEEP_HELPERS)
           pool_word(POOL_SWEEP).value.set(1_u64)
@@ -4358,7 +4396,20 @@ require "./file"
         STW_MARK_BOUND = 1024_u64
 
         def self.concurrent_possible? : Bool
-          @@helpers_wanted > 0_u64
+          {% if flag?(:linux) %}
+            @@helpers_wanted > 0_u64
+          {% else %}
+            # darwin keeps the estimate, and the platform is the reason: a
+            # stop there is `pthread_kill` and a pipe per thread, and on
+            # CI's three-core runner it measures tens of microseconds at
+            # best and milliseconds under load (`bench/thread_floor.sh`
+            # prints both). A collection that starts stopped to find out
+            # how much is live pays that toll every time, and churn's 122
+            # collections paid it: 0.49 s against 0.075. Where a stop is
+            # cheap the measurement is better than any estimate; where it
+            # is not, the estimate is what there is.
+            @@helpers_wanted > 0_u64 && (@@last_marked >= PARALLEL_FROM || @@collections == 0_u64)
+          {% end %}
         end
 
         # The first stop, on the triggering thread, under the runtime lock.
@@ -4400,11 +4451,17 @@ require "./file"
           # nothing is running.
           @@workers = 1_u64
           IyiHeap.write64(pool + POOL_ASKED, 0_u64)
+          pool_word(POOL_MARK_PERMITS).value.set(0_u64)
+          pool_word(POOL_FINISH).value.set(0_u64)
           pool_word(POOL_ACTIVE).value.set(1_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           IyiRoots.each_root(->(base : UInt64) { shade(base) })
           flush_mutator(w)
-          if drain_bounded(w, STW_MARK_BOUND)
+          # The bound is Linux's: darwin's `concurrent_possible?` decided
+          # from the estimate before it stopped anything, and a mark that
+          # got here there is one it wants beside the program.
+          bounded = {% if flag?(:linux) %}drain_bounded(w, STW_MARK_BOUND){% else %}false{% end %}
+          if bounded
             # The whole live set, inside the bound: this stop is the
             # collection. The tail is `collect_locked`'s, and the caller
             # is told so.
@@ -4433,6 +4490,8 @@ require "./file"
           helpers = @@helpers
           @@workers = helpers + 1_u64
           IyiHeap.write64(pool + POOL_ASKED, helpers)
+          pool_word(POOL_MARK_PERMITS).value.set(helpers)
+          pool_word(POOL_FINISH).value.set(1_u64)
           # Every helper holds work until it finds none; the pool is what
           # they hold, and the triggering thread is not a worker after this.
           pool_word(POOL_ACTIVE).value.set(helpers)
@@ -4621,13 +4680,17 @@ require "./file"
         def self.remainder_round(w : UInt64) : UInt64
           helpers = @@helpers
           @@workers = helpers
-          IyiHeap.write64(pool + POOL_ASKED, helpers)
+          # This helper is inside the finish and drains below without a
+          # permit; every other may take one.
+          IyiHeap.write64(pool + POOL_ASKED, helpers - 1_u64)
+          pool_word(POOL_MARK_PERMITS).value.set(helpers - 1_u64)
+          pool_word(POOL_FINISH).value.set(0_u64)
           pool_word(POOL_ACTIVE).value.set(helpers)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           generation = pool_word(POOL_GENERATION).value.add(1_u64) + 1_u64
           wake_helpers
           drain(w)
-          while pool_word(POOL_HELPERS_DONE).value.get < helpers - 1_u64
+          while pool_word(POOL_HELPERS_DONE).value.get < mark_takers
             spin_pause
           end
           generation
