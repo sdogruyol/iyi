@@ -108,6 +108,16 @@
   runtime reaches for lands on six gates' darwin allowlists, the thread
   floor's twice. None of it ships; all of it is why the spin stayed.
 
+- **A mark counted the workers it asked for, not the ones that came.**
+  `POOL_ACTIVE` - the number of workers holding work, whose fall to zero
+  over an empty pool is how a mark knows it is over - was pre-set to the
+  helper count the mark asked for. With permits a helper may skip a
+  generation, and then the count never fell: the helpers that did take
+  work spun in the drain forever. It hung the collector's own gate on a
+  two-core runner and the thread exercise on three. Every worker counts
+  itself in now, in `drain`, which is the only place that knows a worker
+  arrived.
+
 - **A bounded first stop left its live counts in the worker's page.**
   A mark that ends inside the bound does not reach the drain's end,
   where the pending per-arena live counts are flushed, so the scavenge
@@ -3827,7 +3837,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,507-line library and nothing else. Every other
+  written against iyi's own 9,516-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

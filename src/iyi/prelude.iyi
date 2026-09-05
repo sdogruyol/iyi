@@ -3174,7 +3174,7 @@ require "./file"
         pool_word(POOL_MARK_PERMITS).value.set(helpers)
         pool_word(POOL_FINISH).value.set(0_u64)
         @@helper_black = 0_u64
-        pool_word(POOL_ACTIVE).value.set(@@workers)
+        pool_word(POOL_ACTIVE).value.set(0_u64)
         pool_word(POOL_HELPERS_DONE).value.set(0_u64)
         IyiRoots.each_root(->(base : UInt64) { shade(base) })
         # The helpers wake on the generation; from here every worker runs
@@ -3202,10 +3202,19 @@ require "./file"
       # is over at zero with an empty pool — a batch is always published
       # before its publisher could count out, so a spinner that sees zero
       # and an empty pool has seen every batch there will be.
+      #
+      # The count is of workers that took work, and every worker counts
+      # itself *in* here rather than being counted by whoever asked for
+      # it. Pre-setting it to the number asked is a hang: a mark's
+      # permits let a helper skip a generation, and the helpers that did
+      # take one then spun forever waiting for a count that nobody would
+      # ever pay - the collector's own gate on a two-core runner, and the
+      # thread exercise on three.
       def self.drain(w : UInt64) : UInt64
         black = 0_u64
         stack = IyiHeap.read64(w + W_STACK)
         active = pool_word(POOL_ACTIVE)
+        active.value.add(1_u64)
         while true
           while (len = IyiHeap.read64(w + W_LEN)) > 0_u64
             len = len - 1_u64
@@ -4453,7 +4462,7 @@ require "./file"
           IyiHeap.write64(pool + POOL_ASKED, 0_u64)
           pool_word(POOL_MARK_PERMITS).value.set(0_u64)
           pool_word(POOL_FINISH).value.set(0_u64)
-          pool_word(POOL_ACTIVE).value.set(1_u64)
+          pool_word(POOL_ACTIVE).value.set(0_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           IyiRoots.each_root(->(base : UInt64) { shade(base) })
           flush_mutator(w)
@@ -4492,9 +4501,9 @@ require "./file"
           IyiHeap.write64(pool + POOL_ASKED, helpers)
           pool_word(POOL_MARK_PERMITS).value.set(helpers)
           pool_word(POOL_FINISH).value.set(1_u64)
-          # Every helper holds work until it finds none; the pool is what
-          # they hold, and the triggering thread is not a worker after this.
-          pool_word(POOL_ACTIVE).value.set(helpers)
+          # Every helper counts itself in when it starts draining; the
+          # triggering thread is not a worker after this.
+          pool_word(POOL_ACTIVE).value.set(0_u64)
           # What the bounded mark left on this thread's stack goes to the
           # pool: from here this thread is a mutator, and its stack is
           # only its barrier's.
@@ -4685,7 +4694,7 @@ require "./file"
           IyiHeap.write64(pool + POOL_ASKED, helpers - 1_u64)
           pool_word(POOL_MARK_PERMITS).value.set(helpers - 1_u64)
           pool_word(POOL_FINISH).value.set(0_u64)
-          pool_word(POOL_ACTIVE).value.set(helpers)
+          pool_word(POOL_ACTIVE).value.set(0_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           generation = pool_word(POOL_GENERATION).value.add(1_u64) + 1_u64
           wake_helpers
