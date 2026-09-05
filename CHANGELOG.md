@@ -1,6 +1,60 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-09-05
+
+**An object is its fields, and which thread a mark runs on is measured.**
+0.9.0 gave the collector its design and a number beside the collector it set
+out to match; this release takes the last word out of the object and the last
+estimate out of the collection. Crystal's layout carries a type id at the
+object's front, and iyi's header carried one in the mark word's high half
+too: every class object was eight bytes larger than its fields, and binary
+trees' node — two pointers — was a 32-byte chunk where Go's is 16. The front
+copy is gone. A class is laid out as its instance variables and nothing
+before them, every dynamic type-id read is the `u32` at `P-4`, and the header
+word is under the pointer in every allocator mode the prelude has, because a
+module's object code has to link under one without corrupting under another.
+`.iyimod` is v44. The footprint is every object's eight bytes: binary trees
+29 MB resident to 25, live churn 249 to 186, and a 200,000-node list marks
+200,000 times eight bytes fewer.
+
+Which thread a mark runs on was an estimate — the last mark's live bytes
+against a megabyte — and an estimate is the last mark's, not this one's:
+binary trees' second mark read sixteen bytes, the stretch tree having gone,
+and then marked the three-megabyte long-lived tree inside its pause, 2 ms in
+a table whose other rows are tens of microseconds. There is no estimate now,
+on either platform. Every collection stops the world, pays the sweep debt,
+shades the roots and marks up to a thousand objects on the triggering thread;
+a mark that ends inside that bound *was* the whole mark — one stop, no helper
+woken, which is all 122 of churn's collections at 87 µs longest — and one
+that does not is a large live set, and goes beside the program with every
+helper there is. Binary trees' longest pause is 102 µs on Linux where the
+estimate left it at 2 ms, and 88 µs on darwin where it left it at 2.0.
+
+Eight bugs, and the two that decided the release were found where cores are
+few. `POOL_ACTIVE`, whose fall to zero is how a mark knows it is over, was
+pre-set to the helper count the mark asked for; a permit lets a helper skip a
+generation, and then the count never fell — the collector's own gate hung on
+a two-core runner and the thread exercise on three. And the sweep round's
+retry, which keeps a helper at the round when every arena with work is inside
+another's slice, looked again after 64 pause hints: every look takes the
+runtime lock, the one every refill takes, and it came to 4.6 million looks
+across binary trees where the wait this ships comes to 71,000. That was
+darwin's throughput, five times 0.9.0's wall time on the three-core runner,
+and the wait is a slice long now. Interleaved on one machine with the two
+helpers three cores give, minimum of fifteen: binary trees 0.199 s against
+0.9.0's 0.217, churn 0.050 against 0.066, live churn 0.095 against 0.091, and
+the longest stop 88 µs against 283. The eighth was found by the release's
+own gate run: a mark's taker count was the count asked less the permits
+left, two words set one after the other, and a helper reading them across a
+round's reset underflowed the difference — the takers are a counter now.
+
+An allocation has a ceiling as well as a printed number now, 40 ns in release
+against the 13 to 15 it measures, because this cycle put a lock in the
+allocator's path and measured it away again — and a number nobody asserts is
+a number that drifts.
+
+Identity is the released version, as ever: a 0.9.0 artifact is rejected by a
+0.10.0 build and rebuilt, never migrated.
 
 ### Added
 
@@ -132,6 +186,17 @@
   two-core runner and the thread exercise on three. Every worker counts
   itself in now, in `drain`, which is the only place that knows a worker
   arrived.
+
+- **A mark's taker count was a difference of two words, and the
+  difference raced.** How many helpers took a permit - the count the
+  mark waits for, and each taker's slot - was the count asked less the
+  permits left, two pool words set one after the other at every round.
+  A helper whose CAS on the permits landed just before a round reset
+  both read the new count asked, zero, less its old permit, and the
+  subtraction underflowed: `iyi: panic: arithmetic overflow` out of the
+  thread exercise, once in eighty runs on eight threads. The takers are a
+  word of their own now, counted up by each taker, whose slot is the
+  count it found; nothing is subtracted.
 
 - **A bounded first stop left its live counts in the worker's page.**
   A mark that ends inside the bound does not reach the drain's end,
@@ -3864,7 +3929,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,530-line library and nothing else. Every other
+  written against iyi's own 9,542-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

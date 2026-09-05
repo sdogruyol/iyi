@@ -681,21 +681,32 @@ held it - it reads first now, and pauses between tries.
 **darwin's race, for the record.** The darwin job runs the same
 `bench/gc_race.py` on GitHub's arm64 runner (an M-series machine with
 three cores the parallel mark sees, shared, not a machine to gate on),
-so darwin's numbers are in every log; the run that landed the step,
+so darwin's numbers are in every log; the run that landed this step,
 release builds, best of five:
 
 | program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| binary trees | 0.227 s | 30 MB | 0.06 ms | 2.1 ms | 0.211 s | 17 MB | 72 ms | 0.205 s | 15 MB | 0.06 ms | 3.7 ms |
-| live churn | 0.102 s | 187 MB | 0.06 ms | 0.3 ms | 0.149 s | 101 MB | 94 ms | 0.176 s | 274 MB | 0.09 ms | 0.2 ms |
-| churn | 0.075 s | 6 MB | 0.04 ms | 1.0 ms | 0.095 s | 3 MB | 35 ms | 0.085 s | 11 MB | 0.07 ms | 5.1 ms |
+| binary trees | 0.271 s | 23 MB | 0.78 ms | 8.9 ms | 0.290 s | 17 MB | 108 ms | 0.241 s | 15 MB | 0.98 ms | 5.8 ms |
+| live churn | 0.160 s | 173 MB | 0.87 ms | 1.6 ms | 0.218 s | 101 MB | 146 ms | 0.202 s | 292 MB | 0.10 ms | 0.3 ms |
+| churn | 0.077 s | 6 MB | 0.04 ms | 1.1 ms | 0.099 s | 3 MB | 37 ms | 0.100 s | 10 MB | 0.11 ms | 5.9 ms |
 
-The same shape as Linux's with three cores in place of twenty: the
-pauses Go's or under on every program, the wall time under both on
-live churn and churn and a tenth behind on binary trees, where three
-cores give the mark one helper and the sweep round two; and live
-churn's footprint under Go's there, whose 274 MB is the same live set
-at Go's own budget on a machine with less memory to spare.
+The same shape as Linux's with three cores in place of twenty: the wall
+time under Boehm's on all three programs, under Go's on churn and live
+churn and a tenth over it on binary trees, where three cores give the
+mark two helpers and the sweep round two; the footprint 23 MB where
+Linux reads 25 and under Go's on live churn, whose 292 MB is the same
+live set at Go's own budget on a machine with less memory to spare; and
+the pauses under a millisecond, in a run where Go's own longest was
+0.98 ms.
+
+How much of that table is the machine: between this run and the one
+before it, on the same commit tree but for one constant, Boehm's binary
+trees moved 0.241 s to 0.290 and Go's 0.211 to 0.241, a fifth of the
+wall time, with iyi's arm moving with them. It is a shared runner and it
+reads like one, which is why it is here for the record and why the
+comparisons that decided anything in this cycle were made interleaved
+on one machine, minimum of nine or fifteen rounds, with `IyiMark.workers
+= 2` where the point was to stand where three cores stand.
 
 **Which thread a mark runs on is measured, not estimated.** A mark
 beside the program costs two stops and a helper's wake; a mark inside
@@ -785,33 +796,34 @@ The live-churn program's own accounting says the same thing from the
 other side: its 200,000-node list marked 14,400,096 bytes under 0.9.0's
 layout and 12,800,272 under this one, which is 200,000 times eight.
 Two things found on the way. A helper at the sweep round that found
-every arena with work inside another's slice went back to its park as
-if nothing were left, and the allocating thread swept the heap itself,
-slice after slice; smaller objects and a smaller heap made the one
-arena of binary trees' nodes always somebody's, and the round was
-worth nothing until the helper learned to wait a few microseconds and
-look again. And the concurrent mark's failure proof assumed the holder
-it moves a payload into is black when the move happens; when it turns
-black is the workers' order of business, and with objects eight bytes
-smaller the 200,000-cell chain came first on the same stacks and the
-holder last, so the move now waits for the holder's colour, which is
-the property the proof's message always claimed.
+every arena with work inside another's slice went back to its park as if
+nothing were left, and the allocating thread swept the heap itself,
+slice after slice; smaller objects and a smaller heap made the one arena
+of binary trees' nodes always somebody's, and the round was worth
+nothing until the helper learned to wait a slice and look again - how
+long that wait has to be is darwin's story below. And the concurrent
+mark's failure proof assumed the holder it moves a payload into is black
+when the move happens; when it turns black is the workers' order of
+business, and with objects eight bytes smaller the 200,000-cell chain
+came first on the same stacks and the holder last, so the move now waits
+for the holder's colour, which is the property the proof's message
+always claimed.
 
 **darwin's throughput, which the release waited on: it was the round's
-retry.** Every gate passed on darwin, its pauses were microseconds and
-its footprint fell with everyone's - and its wall time on
-`bench/gc_race.py` was five times what 0.9.0 measured on the same
-three-core runner: binary trees 1.56 s against 0.23, churn 0.74
-against 0.075, live churn 0.47 against 0.10. It was the wait in the
-sweep round's retry, above: a helper that finds every arena with work
-inside another's slice looked again after 64 pause hints, and every
-look takes the runtime lock and walks the arena list. That is the lock
-every refill takes. On the shared path it came to 4.6 million looks
-across binary trees where the slice-long wait comes to 71,000 - the
-count is the code's, not the platform's, and what differed is what a
-look cost the thread that wanted the lock: twenty cores and parked
-helpers absorbed it, three cores and helpers that spin rather than
-park did not, and the allocating thread paid for it in refills.
+retry, and its longest pause was the estimate.** Every gate passed on
+darwin, its pauses were microseconds and its footprint fell with
+everyone's - and its wall time on `bench/gc_race.py` was five times what
+0.9.0 measured on the same three-core runner: binary trees 1.56 s
+against 0.23, churn 0.74 against 0.075, live churn 0.47 against 0.10. It
+was the wait in the sweep round's retry, above: a helper that finds
+every arena with work inside another's slice looked again after 64 pause
+hints, and every look takes the runtime lock and walks the arena list.
+That is the lock every refill takes. On the shared path it came to 4.6
+million looks across binary trees where the slice-long wait comes to
+71,000 - the count is the code's, not the platform's, and what differed
+is what a look cost the thread that wanted the lock: twenty cores and
+parked helpers absorbed it, three cores and helpers that spin rather
+than park did not, and the allocating thread paid for it in refills.
 
 What the wait is worth, on a ten-core M2 Pro, unpinned, interleaved,
 minimum of nine rounds: binary trees 1.33 s to 0.33, churn 0.32 to
@@ -825,6 +837,20 @@ wait took 10,292, and the allocating thread sweeps 34 where the short
 wait left it 7 and no retry at all left it 471 - and every gate still
 passes, `collect_trigger`'s among them, whose helpers begin 218 arenas
 to the allocator's 10.
+
+With the walls back, the pause was left, and it was the estimate's:
+the longest stop in a binary trees run was 2.0 ms - one collection in
+fifty-three, the one the estimate mispredicted, marking two megabytes
+stopped while every other stop in the run was under 230 µs. darwin
+measures the bound now too, which costs its walls nothing (churn 0.050
+s against the estimate's 0.049, live churn 0.095 against 0.094, binary
+trees 0.199 against 0.203, fifteen interleaved rounds each) and takes
+that stop out: the same rounds read binary trees' longest stop 88 µs
+against 0.9.0's 283, churn's 20 against 54, live churn's 65 against 40.
+Against 0.9.0 on the same machine, with the two helpers three cores
+give: binary trees 0.199 s against 0.217, churn 0.050 against 0.066,
+live churn 0.095 against 0.091 at 173 MB resident against 187. That is
+where the release was cut.
 
 What the wall time was not, each measured: the helpers' park (the pipe
 was built, measured and refused; they spin as they did), the

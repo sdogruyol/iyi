@@ -2591,7 +2591,11 @@ require "./file"
       POOL_ACTIVE = 256_u64
       POOL_GENERATION = 320_u64
       POOL_HELPERS_DONE = 384_u64
-      POOL_ASKED = 448_u64
+      # Helpers that took a permit for the mark in flight: reset to zero
+      # wherever permits are set, counted up by each taker, and the
+      # taker's slot is the count it found. `take_mark_permit` says why
+      # it is a count and not a difference.
+      POOL_MARK_TAKEN = 448_u64
       POOL_READY = 512_u64
       # The sweep round (GC_DESIGN.md Stage 8): open after a collection
       # while helpers may claim arenas, closed by the next collection
@@ -2609,30 +2613,38 @@ require "./file"
       # helper and fifteen do not contend for its pool - churn's 122
       # marks are 40 ms of wall time with permits and 52 without.
       #
-      # The count they are waited for is the count *taken*, `ASKED -
-      # PERMITS`, never `ASKED`: a helper can miss a generation
-      # altogether - it spends its wake on the sweep round, and by the
-      # time it looks again the mark's generation is the one it has
-      # already seen - and a wait for a headcount that never arrives is
-      # a hang, which is what three cores found one run in three.
+      # The count they are waited for is the count *taken*, never the
+      # count asked: a helper can miss a generation altogether - it spends
+      # its wake on the sweep round, and by the time it looks again the
+      # mark's generation is the one it has already seen - and a wait for
+      # a headcount that never arrives is a hang, which is what three
+      # cores found one run in three.
+      #
+      # Taken is a word of its own, POOL_MARK_TAKEN, counted up by each
+      # taker. It was a difference - the count asked less the permits
+      # left - and a difference of two words that are set one after the
+      # other is a race: a helper whose CAS on the permits landed just
+      # before a round reset both words read the new asked, 0, less its
+      # old permit and underflowed, and the thread exercise panicked on
+      # arithmetic overflow once in eighty runs on eight threads.
       POOL_MARK_PERMITS = 832_u64
       POOL_FINISH = 896_u64
       NO_PERMIT = 0xFFFFFFFFFFFFFFFF_u64
 
       # A mark's permit, or NO_PERMIT: the slot is the order of taking,
-      # 0 for the first.
+      # 0 for the first, and it is the count of takers before this one.
       def self.take_mark_permit : UInt64
         word = pool_word(POOL_MARK_PERMITS)
         while true
           left = word.value.get
           return NO_PERMIT if left == 0_u64
-          return IyiHeap.read64(pool + POOL_ASKED) - left if word.value.compare_and_set(left, left - 1_u64)[1]
+          return pool_word(POOL_MARK_TAKEN).value.add(1_u64) if word.value.compare_and_set(left, left - 1_u64)[1]
         end
       end
 
       # How many helpers took a permit for the mark in flight.
       def self.mark_takers : UInt64
-        IyiHeap.read64(pool + POOL_ASKED) - pool_word(POOL_MARK_PERMITS).value.get
+        pool_word(POOL_MARK_TAKEN).value.get
       end
 
 
@@ -3170,7 +3182,7 @@ require "./file"
           helpers = @@helpers if @@helpers < helpers
         end
         @@workers = helpers + 1_u64
-        IyiHeap.write64(pool + POOL_ASKED, helpers)
+        pool_word(POOL_MARK_TAKEN).value.set(0_u64)
         pool_word(POOL_MARK_PERMITS).value.set(helpers)
         pool_word(POOL_FINISH).value.set(0_u64)
         @@helper_black = 0_u64
@@ -3832,8 +3844,8 @@ require "./file"
         # helper spins awake and the first SWEEP_HELPERS take one.
         def self.open_sweep_round : Nil
           return if @@helpers == 0_u64 || @@sweep_left == 0_u64
-          IyiHeap.write64(pool + POOL_ASKED, 0_u64)
           pool_word(POOL_MARK_PERMITS).value.set(0_u64)
+          pool_word(POOL_MARK_TAKEN).value.set(0_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
           pool_word(POOL_SWEEP_PERMITS).value.set(@@helpers < SWEEP_HELPERS ? @@helpers : SWEEP_HELPERS)
           pool_word(POOL_SWEEP).value.set(1_u64)
@@ -4473,8 +4485,8 @@ require "./file"
           # with the world still stopped: no barrier is needed for it,
           # nothing is running.
           @@workers = 1_u64
-          IyiHeap.write64(pool + POOL_ASKED, 0_u64)
           pool_word(POOL_MARK_PERMITS).value.set(0_u64)
+          pool_word(POOL_MARK_TAKEN).value.set(0_u64)
           pool_word(POOL_FINISH).value.set(0_u64)
           pool_word(POOL_ACTIVE).value.set(0_u64)
           pool_word(POOL_HELPERS_DONE).value.set(0_u64)
@@ -4512,7 +4524,7 @@ require "./file"
           # with all of them.
           helpers = @@helpers
           @@workers = helpers + 1_u64
-          IyiHeap.write64(pool + POOL_ASKED, helpers)
+          pool_word(POOL_MARK_TAKEN).value.set(0_u64)
           pool_word(POOL_MARK_PERMITS).value.set(helpers)
           pool_word(POOL_FINISH).value.set(1_u64)
           # Every helper counts itself in when it starts draining; the
@@ -4705,7 +4717,7 @@ require "./file"
           @@workers = helpers
           # This helper is inside the finish and drains below without a
           # permit; every other may take one.
-          IyiHeap.write64(pool + POOL_ASKED, helpers - 1_u64)
+          pool_word(POOL_MARK_TAKEN).value.set(0_u64)
           pool_word(POOL_MARK_PERMITS).value.set(helpers - 1_u64)
           pool_word(POOL_FINISH).value.set(0_u64)
           pool_word(POOL_ACTIVE).value.set(0_u64)
