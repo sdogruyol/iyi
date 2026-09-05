@@ -113,6 +113,89 @@
   raise "sweep: nothing was reclaimed, so no address came back" if reused == 0
   puts "    reclaimed: #{count(swept)} chunks swept and #{count(freed)} bytes freed, and #{count(reused)} of 300 new allocations came from addresses the sweep reclaimed"
 
+  # 1b. Whole pages of dead chunks outlive the pause. The sweep keeps a
+  # budget's worth of them warm on its batch and lists their pages; a
+  # second collection before anything takes the batch drops every list -
+  # and the listed pages become idle, warm, nobody's. The refill threads
+  # them into the cache's list ahead of any slice or slab, so the batch
+  # below comes from the first batch's pages, the class's high water does
+  # not move, and every chunk comes back cleared, because a warm page
+  # still holds what the dead object left. The class is its own: 64-byte
+  # requests, 72-byte chunks, four thousand of them across some seventy
+  # pages.
+  Seen.forget
+  retained_before = IyiHeap.pages_retained
+  rewarmed_before = IyiHeap.pages_rewarmed
+  batch = 0_u64
+  dirt = 0_u64
+  while batch < 4096_u64
+    block = fresh(64_u64)
+    index = 0_u64
+    while index < 64_u64
+      Pointer(UInt8).new(block + index).value = 0xAA_u8
+      index = index + 1_u64
+    end
+    # Read back, and reported below: a store nothing reads is a store
+    # the back end may drop, and then the pages hold nothing to clear.
+    dirt = dirt + Pointer(UInt8).new(block + (batch & 63_u64)).value.to_u64
+    Seen.add(block)
+    batch = batch + 1_u64
+  end
+  IyiMark.collect
+  warm_index = IyiHeap.class_index(64_u64)
+  while IyiHeap.sweep_left_of(warm_index) != 0_u64
+    IyiMark.sweep_one(72_u64)
+  end
+  retained = IyiHeap.pages_retained - retained_before
+  raise "warm: #{count(IyiMark.swept)} chunks swept and no page of them kept warm" if retained == 0
+  # The second pause: the batch nobody took is dropped, its pages idle.
+  IyiMark.collect
+  idle_warm = 0_u64
+  arena = IyiHeap.first_arena
+  while arena != 0
+    idle_warm = idle_warm + IyiHeap.read64(arena + IyiHeap::OFF_WARM) if IyiHeap.arena_chunk(arena) == 72_u64
+    arena = IyiHeap.arena_next(arena)
+  end
+  raise "warm: #{count(retained)} pages kept warm and none of them idle after a second pause, so the kept pages died with the lists" if idle_warm == 0
+  high_before = 0_u64
+  arena = IyiHeap.first_arena
+  while arena != 0
+    high_before = high_before + IyiHeap.arena_high(arena) - arena if IyiHeap.arena_chunk(arena) == 72_u64
+    arena = IyiHeap.arena_next(arena)
+  end
+  reused = 0_u64
+  batch = 0_u64
+  while batch < 4096_u64
+    # The allocator's own clearing entry, as a class instance reaches it:
+    # `Pointer.malloc` clears again on its own in codegen and would hide a
+    # chunk the allocator handed out dirty.
+    words = IyiHeap.alloc(64_u64)
+    reused = reused + 1_u64 if Seen.holds?(words.address)
+    index = 0_u64
+    while index < 64_u64
+      if Pointer(UInt8).new(words.address + index).value != 0_u8
+        raise "warm: a chunk from a warm page came back dirty at byte #{count(index)}"
+      end
+      index = index + 1_u64
+    end
+    if Pointer(UInt64).new(words.address - 8_u64).value & (0_u64 &- 1_u64 - IyiHeap::EPOCH_FLAG) != 0_u64
+      raise "warm: a chunk from a warm page carried a stale header word"
+    end
+    batch = batch + 1_u64
+  end
+  rewarmed = IyiHeap.pages_rewarmed - rewarmed_before
+  raise "warm: #{count(idle_warm)} pages idle and warm and #{count(rewarmed)} taken up again, so the refill is not taking them first" if rewarmed * 2_u64 < idle_warm
+  high_after = 0_u64
+  arena = IyiHeap.first_arena
+  while arena != 0
+    high_after = high_after + IyiHeap.arena_high(arena) - arena if IyiHeap.arena_chunk(arena) == 72_u64
+    arena = IyiHeap.arena_next(arena)
+  end
+  if high_after > high_before + 8_u64 * IyiHeap::PAGE
+    raise "warm: the class's high water moved #{count(high_after - high_before)} bytes with #{count(retained)} warm pages to take"
+  end
+  puts "    warm: #{count(retained)} pages of dead chunks kept warm, #{count(idle_warm)} still idle after a second pause, #{count(rewarmed)} taken up by the refill, #{count(reused)} of 4096 allocations on the first batch's addresses, all cleared of the #{count(dirt)} bytes' worth of 0xAA written, high water moved #{count(high_after - high_before)} bytes"
+
   # 2. A live object survives a collection, and its bytes are intact. This is
   # the direction that matters: a sweep that frees a live object is a corrupted
   # program, not a failed test.

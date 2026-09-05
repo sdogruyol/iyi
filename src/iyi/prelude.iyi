@@ -885,13 +885,20 @@ require "./file"
       # Chunks between the cursor and the region's end are not carved yet.
       OFF_HIGH = 56_u64
       OFF_BUMP_END = 64_u64
-      # Pages handed back and not yet taken up again, counted, and a bit
-      # each at `OFF_PAGES`: a chunk whose head is on such a page reads as
-      # zero and is nobody's - not free-listed, not an object - until the
-      # carve takes its run of pages up as a region.
-      OFF_RELEASED = 72_u64
-      # 1 while the bump region is a run of pages taken up again, 0 while
-      # it is a slab of the frontier.
+      # Idle pages: whole pages of dead chunks on no list, counted, and a
+      # bit each at `OFF_PAGES`. A chunk whose head is on such a page is
+      # nobody's - not free-listed, not an object - until a run of the
+      # pages is taken up again. An idle page is warm (kept resident, its
+      # stale bytes still there; the refill threads a run of them into a
+      # list) or cold (handed back to the kernel, reads as zero and
+      # faults on touch; the carve takes a run of them as its bump
+      # region): a bit each at `OFF_COLD`, and the warm ones counted at
+      # `OFF_WARM`.
+      OFF_IDLE = 72_u64
+      # REGION_SLAB while the bump region is a slab of the frontier,
+      # REGION_COLD while it is a run of cold pages taken up again,
+      # REGION_SLAB_STAY a slab to be carved to its end before the class's
+      # warm pages are looked for again (`reopen_pages`).
       OFF_REGION_REOPENED = 80_u64
       # The cache whose fill arena this is, or 0: a bump region is one
       # thread's, carved without a lock, so an arena is one cache's at a
@@ -910,7 +917,21 @@ require "./file"
       SWEEP_DONE = 0xFFFFFFFFFFFFFFFF_u64
       # The epoch whose finished sweep of this arena has been counted out.
       OFF_SWEEP_COUNTED = 112_u64
+      OFF_WARM = 120_u64
+      # A bit per page of the mapping, `MAP / PAGE / 8` bytes - 512 on a
+      # 4 KB page - for idle, and the same again for cold.
       OFF_PAGES = 128_u64
+      OFF_COLD = 640_u64
+      # Listed pages: whole pages of dead chunks this epoch's sweep kept
+      # warm and left on its batch, the batch being the fast way to hand
+      # them out. Counted here and a bit each at `OFF_LISTED_PAGES`. A
+      # refill that takes a batch unlists the batch's pages - their chunks
+      # are being allocated - and the pause, which drops every list, turns
+      # what is still listed into idle warm pages (`idle_listed`): the
+      # kept pages the program did not get to survive the pause that way,
+      # where a list does not.
+      OFF_LISTED = 1160_u64
+      OFF_LISTED_PAGES = 1168_u64
       # The frontier is carved a slab at a time, so that a run of pages
       # handed back below it is taken up before the slab after it: the
       # heap fills from its low addresses and the frontier stays cold. A
@@ -1100,6 +1121,23 @@ require "./file"
         centre[SWEEP_LEFT_AT + index] = (centre[SWEEP_LEFT_AT + index].to_i64 + delta).to_u64
       end
 
+      # How many warm idle pages the class's arenas hold, past the sweep
+      # counts: a refill that finds the centre empty reads it without the
+      # lock and, finding some, carves rather than sweeps - the pages are
+      # what the sweep already produced, and a slice taken for them would
+      # hand back their edges and nothing else. Added by the sweep outside
+      # the lock, so an atomic; a stale zero sweeps a slice it need not
+      # have, a stale nonzero finds the run gone and moves on.
+      WARM_AT = 384
+
+      def self.warm_word(index : Int32) : Pointer(Atomic(UInt64))
+        Pointer(Atomic(UInt64)).new(central.address + (WARM_AT + index).to_u64 * 8_u64)
+      end
+
+      def self.warm_of(index : Int32) : UInt64
+        warm_word(index).value.get
+      end
+
       def self.allocated_word : Pointer(Atomic(UInt64))
         Pointer(Atomic(UInt64)).new(central.address + CENTRAL_ALLOCATED)
       end
@@ -1235,19 +1273,25 @@ require "./file"
           clear_block(head + HEADER, payload(index)) if clear
           return head
         end
-        head = carve(table, index)
+        head = carve(table, index, clear)
         write64(head + OFF_MARK, ATOMIC_FLAG | IyiMark.epoch_flag) unless clear
         head
       end
 
       # The cache's list for this class is empty: take the centre's top
       # batch for it, under the lock — one arena's sweep, `free_batch`
-      # says why one. Answers the new head, 0 if the centre had nothing.
+      # says why one. Answers the new head, 0 if the centre had nothing
+      # and the carve is next.
       def self.refill(table : Pointer(UInt64), index : Int32) : UInt64
         centre = central
         if centre[index] == 0
-          # Nothing swept for this class yet: a slice of an arena of the
-          # class, and another, until a batch of the class appears or the
+          # Nothing swept for this class yet. A bump region of cold pages
+          # in hand, or a slab to be carved to its end, is carved. Warm
+          # idle pages of the class are the sweep's produce already,
+          # resident and nobody's: with any in reach, a run of them is
+          # threaded into the cache's list, no slice waited for. Otherwise
+          # a slice of an arena of the class, and another, until a batch
+          # of the class appears, warm pages come into reach, or the
           # class has nothing left to sweep - the sweep's cost lands on
           # the allocations that need its chunks rather than inside the
           # pause (GC_DESIGN.md), and a chunk swept is cheaper than one
@@ -1255,6 +1299,21 @@ require "./file"
           # helper inside a slice of the only arena of the class answers
           # busy: its batch is microseconds away, and the wait is for
           # that. With helpers at a round the class is named for them.
+          arena = table[FILL + index]
+          region = arena == 0 || read64(arena + OFF_LEFT) == 0 ? REGION_SLAB : read64(arena + OFF_REGION_REOPENED)
+          return 0_u64 if region != REGION_SLAB
+          if warm_of(index) != 0_u64
+            head = thread_warm_of(index)
+            if head != 0
+              table[index] = head
+              return head
+            end
+            # Warm pages out of reach - inside a slice, or none below its
+            # window - with a slab in hand: the slab is carved to its end
+            # before they are asked for again, or every allocation would
+            # take the lock to find them out of reach.
+            write64(arena + OFF_REGION_REOPENED, REGION_SLAB_STAY) if arena != 0 && read64(arena + OFF_LEFT) != 0
+          end
           IyiMark.sweep_wanted(index) if IyiMark.helpers_sweeping?
           chunk = payload(index) + HEADER
           while centre[index] == 0 && sweep_left_of(index) != 0_u64
@@ -1273,25 +1332,54 @@ require "./file"
                 spins = spins + 1
               end
             end
+            # A slice of this thread's or another's may have left warm
+            # pages in reach.
+            if centre[index] == 0 && warm_of(index) != 0_u64
+              head = thread_warm_of(index)
+              if head != 0
+                table[index] = head
+                return head
+              end
+            end
           end
           return 0_u64 if centre[index] == 0
         end
         lock
         head = centre[index]
+        # The batch's whole pages are being allocated from now: unlisted,
+        # or the pause would turn them idle with objects on them.
+        unlist_batch(head) if head != 0
         centre[index] = read64(head + BATCH_NEXT) if head != 0
         unlock
         table[index] = head
         head
       end
 
-      def self.carve(table : Pointer(UInt64), index : Int32) : UInt64
+      # The class's first warm run in reach, as a list: the arenas of the
+      # class walked under the lock, any of them - a list is the cache's
+      # and needs no claim on the arena. Answers the list's head, 0 for
+      # none in reach.
+      def self.thread_warm_of(index : Int32) : UInt64
+        chunk = payload(index) + HEADER
+        head = 0_u64
+        lock
+        candidate = @@arenas
+        while candidate != 0 && head == 0
+          head = thread_warm(candidate) if read64(candidate + OFF_CHUNK) == chunk && read64(candidate + OFF_WARM) != 0
+          candidate = read64(candidate + OFF_NEXT)
+        end
+        unlock
+        head
+      end
+
+      def self.carve(table : Pointer(UInt64), index : Int32, clear : Bool) : UInt64
         arena = table[FILL + index]
         if arena == 0 || read64(arena + OFF_LEFT) == 0 ||
-           (read64(arena + OFF_RELEASED) != 0 && read64(arena + OFF_REGION_REOPENED) == 0)
+           (read64(arena + OFF_REGION_REOPENED) == REGION_SLAB && read64(arena + OFF_IDLE) != read64(arena + OFF_WARM))
           # The region ran out, or it is a frontier slab and pages below
-          # it came back: the lowest run of pages the sweep handed back,
-          # in this arena or another of the class, then the frontier's
-          # next slab, then a fresh mapping.
+          # it went cold: the lowest run of cold pages in this arena or
+          # another of the class, then the frontier's next slab, then a
+          # fresh mapping. Warm pages are the refill's, as a list.
           arena = reopen_pages(table, arena, index)
           table[FILL + index] = arena
         end
@@ -1309,60 +1397,220 @@ require "./file"
         cursor
       end
 
-      # ── Pages handed back, and taken up again ──────────────────────────
+      # ── Pages gone idle, and taken up again ────────────────────────────
       #
       # A collector that frees chunks but never pages has a resident size
       # that is its high-water mark: binary trees held 6 MB live in 55 MB
-      # resident. The sweep hands runs of dead pages back to the kernel
-      # (`sweep_slice` below), and here the carve takes a run up again as
-      # its bump region before it maps anything new. A chunk is on a
-      # released page when its head is: such a chunk is on no list and is
-      # no object, it reads as zero, and the mark, the sweep and the root
-      # walk all refuse it by the bit. Taking a run up clears its bits
-      # under the lock the sweep holds, so a sweep sees a region whole.
-      def self.page_released?(arena : UInt64, address : UInt64) : Bool
+      # resident. The sweep finds runs of whole dead pages (`sweep_slice`
+      # below): a budget's worth stay warm - on the sweep's batch, the
+      # allocator's fast path, their pages listed - and the rest go back
+      # to the kernel cold, idle. A pause drops every list, and what was
+      # listed and not taken becomes idle too, warm: the refill threads a
+      # warm run into the cache's list before it sweeps a slice or carves
+      # a slab (`thread_warm`), and the carve takes a cold run up as its
+      # bump region before it touches the frontier (`reopen_in`). A chunk
+      # is on an idle page when its head is: such a chunk is on no list
+      # and is no object - a cold page reads as zero, a warm one still
+      # wears the free flag the sweep set - and the mark, the sweep and
+      # the root walk all refuse it by the bit.
+      #
+      # Idle rather than list chunks across the pause because the lists
+      # do not survive one and the bits do: a budget's worth of warm
+      # chunks kept on the lists was gone at the next collection, and the
+      # program carved the frontier while it waited for the sweep to hand
+      # the same pages back a second time. Kept as bump regions instead
+      # of lists within an epoch, the warm pages cost the carve's ordered
+      # cursor store and a refill's loads per allocation, and threading
+      # them into a list on the spot was a pass over memory the sweep had
+      # just made: churn ran 48 ms to 73 and to 67. The batch is the
+      # sweep's pass and the list's pop, and the bits are the pause's.
+      def self.page_bit?(arena : UInt64, table : UInt64, address : UInt64) : Bool
         page = (address - arena).unsafe_shr(PAGE_SHIFT)
-        word = read64(arena + OFF_PAGES + page.unsafe_shr(6_u64) * 8_u64)
+        word = read64(arena + table + page.unsafe_shr(6_u64) * 8_u64)
         word & 1_u64.unsafe_shl(page & 63_u64) != 0
       end
 
-      def self.set_released(arena : UInt64, low : UInt64, high : UInt64, on : Bool) : Nil
+      def self.page_idle?(arena : UInt64, address : UInt64) : Bool
+        page_bit?(arena, OFF_PAGES, address)
+      end
+
+      def self.page_cold?(arena : UInt64, address : UInt64) : Bool
+        page_bit?(arena, OFF_COLD, address)
+      end
+
+      # The bits of `[low, high)` in the table at `table`, set or cleared,
+      # a word at a time. The sweep sets bits of pages at and above its
+      # slice's cursor while the carve clears bits of pages below the
+      # sixty-four-page word that cursor is in (`reopen_in`), so the two
+      # never share a word and neither needs the other's lock.
+      def self.set_page_bits(arena : UInt64, table : UInt64, low : UInt64, high : UInt64, on : Bool) : Nil
         page = (low - arena).unsafe_shr(PAGE_SHIFT)
         stop = (high - arena).unsafe_shr(PAGE_SHIFT)
         while page < stop
-          slot = arena + OFF_PAGES + page.unsafe_shr(6_u64) * 8_u64
-          bit = 1_u64.unsafe_shl(page & 63_u64)
+          slot = arena + table + page.unsafe_shr(6_u64) * 8_u64
+          upto = (page | 63_u64) + 1_u64
+          upto = stop if upto > stop
+          # The bits from `page & 63` to `upto - 1 - (page & ~63)`, inclusive.
+          mask = upto - (page & 0xFFFFFFFFFFFFFFC0_u64) == 64_u64 ? 0xFFFFFFFFFFFFFFFF_u64 : 1_u64.unsafe_shl(upto & 63_u64) - 1_u64
+          mask = mask - (1_u64.unsafe_shl(page & 63_u64) - 1_u64)
           if on
-            write64(slot, read64(slot) | bit)
+            write64(slot, read64(slot) | mask)
           else
-            write64(slot, read64(slot) & (0xFFFFFFFFFFFFFFFF_u64 - bit))
+            write64(slot, read64(slot) & (0xFFFFFFFFFFFFFFFF_u64 - mask))
           end
-          page = page + 1_u64
+          page = upto
         end
       end
 
-      # `arena`'s own released pages first, then its frontier's next slab,
-      # then any other arena of the class with released pages or frontier
-      # left, then a fresh mapping. Answers the arena whose region the
-      # carve now bumps in.
+      def self.set_idle(arena : UInt64, low : UInt64, high : UInt64, on : Bool) : Nil
+        set_page_bits(arena, OFF_PAGES, low, high, on)
+      end
+
+      def self.set_cold(arena : UInt64, low : UInt64, high : UInt64, on : Bool) : Nil
+        set_page_bits(arena, OFF_COLD, low, high, on)
+      end
+
+      # The arena's idle and warm counts, and the class's warm count on
+      # the centre, moved together: the sweep adds outside the lock and
+      # the carve subtracts under it, so all three are atomic.
+      def self.idle_add(arena : UInt64, pages : UInt64, warm : Bool) : Nil
+        Pointer(Atomic(UInt64)).new(arena + OFF_IDLE).value.add(pages)
+        if warm
+          Pointer(Atomic(UInt64)).new(arena + OFF_WARM).value.add(pages)
+          warm_word(class_index(read64(arena + OFF_CHUNK) - HEADER)).value.add(pages)
+        end
+      end
+
+      def self.idle_sub(arena : UInt64, pages : UInt64, warm : Bool) : Nil
+        Pointer(Atomic(UInt64)).new(arena + OFF_IDLE).value.sub(pages)
+        warm_sub(arena, pages) if warm
+      end
+
+      def self.warm_sub(arena : UInt64, pages : UInt64) : Nil
+        Pointer(Atomic(UInt64)).new(arena + OFF_WARM).value.sub(pages)
+        warm_word(class_index(read64(arena + OFF_CHUNK) - HEADER)).value.sub(pages)
+      end
+
+      def self.page_listed?(arena : UInt64, address : UInt64) : Bool
+        page_bit?(arena, OFF_LISTED_PAGES, address)
+      end
+
+      # The listed bitmap's words are shared: a slice lists pages of one
+      # run while a refill unlists a batch of the slice before it, and
+      # two adjacent slices' pages sit in one sixty-four-page word. So
+      # the bits are set and cleared with a compare-and-set.
+      def self.set_listed(arena : UInt64, low : UInt64, high : UInt64, on : Bool) : Nil
+        page = (low - arena).unsafe_shr(PAGE_SHIFT)
+        stop = (high - arena).unsafe_shr(PAGE_SHIFT)
+        while page < stop
+          slot = Pointer(Atomic(UInt64)).new(arena + OFF_LISTED_PAGES + page.unsafe_shr(6_u64) * 8_u64)
+          upto = (page | 63_u64) + 1_u64
+          upto = stop if upto > stop
+          mask = upto - (page & 0xFFFFFFFFFFFFFFC0_u64) == 64_u64 ? 0xFFFFFFFFFFFFFFFF_u64 : 1_u64.unsafe_shl(upto & 63_u64) - 1_u64
+          mask = mask - (1_u64.unsafe_shl(page & 63_u64) - 1_u64)
+          while true
+            seen = slot.value.get
+            want = on ? seen | mask : seen & (0xFFFFFFFFFFFFFFFF_u64 - mask)
+            break if seen == want || slot.value.compare_and_set(seen, want)[1]
+          end
+          page = upto
+        end
+      end
+
+      # A run of whole pages of dead chunks kept warm on the sweep's batch:
+      # listed, its count up.
+      def self.list_pages(arena : UInt64, low : UInt64, high : UInt64) : Nil
+        set_listed(arena, low, high, true)
+        Pointer(Atomic(UInt64)).new(arena + OFF_LISTED).value.add((high - low).unsafe_shr(PAGE_SHIFT))
+      end
+
+      # A batch's page range, stashed in its head's header word above the
+      # flags - the half an object keeps its type id in, nobody's while
+      # the chunk is free and rewritten when the head is handed out: the
+      # first and last page of the slice's linked chunks, sixteen bits
+      # each.
+      def self.stash_batch_range(head : UInt64, arena : UInt64, low : UInt64, high : UInt64) : Nil
+        low_page = (low - arena).unsafe_shr(PAGE_SHIFT)
+        high_page = (high - arena).unsafe_shr(PAGE_SHIFT)
+        word = read64(head + OFF_MARK) & 0xFFFFFFFF_u64
+        write64(head + OFF_MARK, word | low_page.unsafe_shl(32_u64) | high_page.unsafe_shl(48_u64))
+      end
+
+      # A batch taken by a cache, under the lock: its pages are being
+      # allocated from and are nobody's whole pages any more - unlisted,
+      # so the pause does not turn them idle with objects on them.
+      def self.unlist_batch(head : UInt64) : Nil
+        arena = arena_of(head)
+        return if arena == 0 || read64(arena + OFF_LISTED) == 0
+        word = read64(head + OFF_MARK)
+        page = word.unsafe_shr(32_u64) & 0xFFFF_u64
+        last = word.unsafe_shr(48_u64) & 0xFFFF_u64
+        count = 0_u64
+        while page <= last
+          if page_listed?(arena, arena + page * PAGE)
+            set_listed(arena, arena + page * PAGE, arena + (page + 1_u64) * PAGE, false)
+            count = count + 1_u64
+          end
+          page = page + 1_u64
+        end
+        Pointer(Atomic(UInt64)).new(arena + OFF_LISTED).value.sub(count) if count != 0
+      end
+
+      # In the pause, every list dropped: what the sweep listed and no
+      # cache took is idle and warm from here - the bits moved, the
+      # counts with them - and the carve's refill threads it into a list
+      # again when the class needs it (`thread_warm`).
+      def self.idle_listed(arena : UInt64) : Nil
+        count = read64(arena + OFF_LISTED)
+        return if count == 0
+        words = read64(arena + OFF_MAP).unsafe_shr(PAGE_SHIFT + 6_u64)
+        slot = 0_u64
+        while slot < words
+          listed = read64(arena + OFF_LISTED_PAGES + slot * 8_u64)
+          if listed != 0
+            write64(arena + OFF_PAGES + slot * 8_u64, read64(arena + OFF_PAGES + slot * 8_u64) | listed)
+            write64(arena + OFF_LISTED_PAGES + slot * 8_u64, 0_u64)
+          end
+          slot = slot + 1_u64
+        end
+        write64(arena + OFF_LISTED, 0_u64)
+        idle_add(arena, count, true)
+      end
+
+      # `arena`'s own cold runs first, then its frontier's next slab, then
+      # any other arena of the class with cold runs or frontier left, then
+      # a fresh mapping. Answers the arena whose region the carve now
+      # bumps in. Warm runs are not the carve's: the refill threads them
+      # into the cache's list (`thread_warm`).
       # The whole choice is one take of the lock: the lock's spin parks
       # for a pause, whose scavenge hands arenas back, so an arena read
       # off the list outside the lock is not an arena to trust across a
       # take of it - the first cut walked the list between takes and
       # crashed reading an arena the pause had unmapped.
+      # A warm run inside a sweep's slice is out of reach for the slice,
+      # some ten microseconds: a slab taken with warm pages still out of
+      # reach is carved to its end before the class's warm pages are
+      # looked for again (`REGION_SLAB_STAY`), or every allocation would
+      # take the lock to find them out of reach again. The refill is
+      # where the waiting is done, by sweeping a slice of its own or
+      # spinning for a helper's, and it looks for warm pages after each.
+      REGION_SLAB = 0_u64
+      REGION_COLD = 1_u64
+      REGION_SLAB_STAY = 2_u64
+
       def self.reopen_pages(table : Pointer(UInt64), arena : UInt64, index : Int32) : UInt64
         owner = table.address
+        chunk = payload(index) + HEADER
         lock
         chosen = 0_u64
         if arena != 0
-          chosen = arena if read64(arena + OFF_RELEASED) != 0 && reopen_in(arena, owner)
+          chosen = arena if read64(arena + OFF_IDLE) != read64(arena + OFF_WARM) && reopen_in(arena, owner)
           chosen = arena if chosen == 0 && next_slab(arena, owner)
         end
-        chunk = payload(index) + HEADER
         candidate = @@arenas
         while candidate != 0 && chosen == 0
           if candidate != arena && read64(candidate + OFF_CHUNK) == chunk && read64(candidate + OFF_OWNER) == 0
-            if read64(candidate + OFF_RELEASED) != 0 && reopen_in(candidate, owner)
+            if read64(candidate + OFF_IDLE) != read64(candidate + OFF_WARM) && reopen_in(candidate, owner)
               chosen = candidate
             elsif next_slab(candidate, owner)
               chosen = candidate
@@ -1370,11 +1618,18 @@ require "./file"
           end
           candidate = read64(candidate + OFF_NEXT)
         end
+        # A slab taken while the class has warm pages: they were out of
+        # reach, and the slab is carved to its end before they are asked
+        # for again.
+        write64(chosen + OFF_REGION_REOPENED, REGION_SLAB_STAY) if chosen != 0 && read64(chosen + OFF_REGION_REOPENED) == REGION_SLAB && warm_of(index) != 0_u64
         # The old arena is nobody's from here, whatever was chosen: a
         # fresh mapping claims itself as it is made.
         write64(arena + OFF_OWNER, 0_u64) if arena != 0 && chosen != arena && read64(arena + OFF_OWNER) == owner
         unlock
-        chosen = map_arena(index, owner) if chosen == 0
+        if chosen == 0
+          chosen = map_arena(index, owner)
+          write64(chosen + OFF_REGION_REOPENED, REGION_SLAB_STAY) if warm_of(index) != 0_u64
+        end
         chosen
       end
 
@@ -1414,74 +1669,179 @@ require "./file"
         Pointer(Atomic(UInt64)).new(arena + OFF_CURSOR).value.set(high)
         write64(arena + OFF_BUMP_END, high + count * chunk)
         write64(arena + OFF_LEFT, count)
-        write64(arena + OFF_REGION_REOPENED, 0_u64)
+        write64(arena + OFF_REGION_REOPENED, REGION_SLAB)
         write64(arena + OFF_OWNER, owner)
         true
       end
 
-      # The first run of released pages in `arena` becomes its bump region,
-      # under the lock.
-      # The region's chunks are the grid chunks whose head is on its pages;
-      # the one straddling its start belongs to the page before, on a free
-      # list, and the one straddling its end is the region's, its tail on
-      # a page nobody released.
-      def self.reopen_in(arena : UInt64, owner : UInt64) : Bool
-        return false if read64(arena + OFF_SWEEPING) != 0 || !claimable?(arena, owner)
-        chunk = read64(arena + OFF_CHUNK)
+      # The first run of idle pages in `arena` - warm ones when `warm`,
+      # cold ones otherwise - taken: its bits cleared, its counts down,
+      # and its bounds answered as `{low, high}`, page-aligned, or
+      # `{0, 0}` for none. Under the lock.
+      # With a sweep's slice in flight on the arena the run is looked for
+      # below the slice only: the slice walks up from the arena's sweep
+      # cursor and sets bits at and above it, and this clears bits below
+      # the sixty-four-page word that cursor is in, so the two never
+      # share a bitmap word.
+      def self.take_run(arena : UInt64, warm : Bool) : Tuple(UInt64, UInt64)
         pages = read64(arena + OFF_MAP).unsafe_shr(PAGE_SHIFT)
-        page = 1_u64
-        while page < pages && !page_released?(arena, arena + page * PAGE)
-          page = page + 1_u64
+        if read64(arena + OFF_SWEEPING) != 0
+          cursor = read64(arena + OFF_SWEEP_CURSOR)
+          return {0_u64, 0_u64} if cursor == SWEEP_DONE || cursor < arena || cursor >= arena + read64(arena + OFF_MAP)
+          # Below the sixty-four-page word the slice's cursor is in, less
+          # one page more: a run's last chunk reaches into the page after
+          # it, and that page must be one the slice will not `madvise` -
+          # it releases pages from its cursor up, so a page below the
+          # cursor's is safe, and the word's first page is not below the
+          # cursor when the cursor begins it.
+          pages = (cursor - arena).unsafe_shr(PAGE_SHIFT) & 0xFFFFFFFFFFFFFFC0_u64
+          return {0_u64, 0_u64} if pages < 2_u64
+          pages = pages - 1_u64
         end
-        return false if page == pages
-        stop = page
-        while stop < pages && page_released?(arena, arena + stop * PAGE)
+        # Word by word: an idle bit whose cold bit is what `warm` asks.
+        slot = 0_u64
+        page = 0_u64
+        while slot * 64_u64 < pages
+          word = read64(arena + OFF_PAGES + slot * 8_u64)
+          cold = read64(arena + OFF_COLD + slot * 8_u64)
+          word = warm ? word & (0xFFFFFFFFFFFFFFFF_u64 - cold) : word & cold
+          if word != 0
+            page = slot * 64_u64
+            while word & 1_u64 == 0
+              word = word.unsafe_shr(1_u64)
+              page = page + 1_u64
+            end
+            break
+          end
+          slot = slot + 1_u64
+        end
+        return {0_u64, 0_u64} if slot * 64_u64 >= pages || page >= pages
+        stop = page + 1_u64
+        while stop < pages && page_idle?(arena, arena + stop * PAGE) && page_cold?(arena, arena + stop * PAGE) != warm
           stop = stop + 1_u64
         end
         low = arena + page * PAGE
         high = arena + stop * PAGE
-        set_released(arena, low, high, false)
-        write64(arena + OFF_RELEASED, read64(arena + OFF_RELEASED) - (stop - page))
+        set_idle(arena, low, high, false)
+        set_cold(arena, low, high, false) unless warm
+        idle_sub(arena, stop - page, warm)
+        @@pages_reopened = @@pages_reopened + (stop - page)
+        @@pages_rewarmed = @@pages_rewarmed + (stop - page) if warm
+        {low, high}
+      end
+
+      # The first run of cold pages in `arena` becomes its bump region,
+      # under the lock. The region's chunks are the grid chunks whose
+      # head is on its pages; the one straddling its start belongs to the
+      # page before - a list's, or an idle run's own - and the one
+      # straddling its end is the region's, its tail on a page nobody
+      # released. The slice read its region's bounds once, at its start;
+      # a region set here is below everything the slice walks, and the
+      # old region was either carved to its end or a frontier slab whose
+      # uncarved chunks are above the high water the slice read - a stale
+      # pair of bounds can only skip chunks the slice would otherwise
+      # have freed or repainted, and a chunk skipped is one the next
+      # epoch's sweep frees, one epoch late.
+      def self.reopen_in(arena : UInt64, owner : UInt64) : Bool
+        return false unless claimable?(arena, owner)
+        chunk = read64(arena + OFF_CHUNK)
+        run = take_run(arena, false)
+        low = run[0]
+        high = run[1]
+        return false if high == 0
         first = arena + HEAD
         head = first + (low - first + chunk - 1_u64).unsafe_div(chunk) * chunk
         count = head < high ? (high - head + chunk - 1_u64).unsafe_div(chunk) : 0_u64
         Pointer(Atomic(UInt64)).new(arena + OFF_CURSOR).value.set(head)
         write64(arena + OFF_BUMP_END, high)
         write64(arena + OFF_LEFT, count)
-        write64(arena + OFF_REGION_REOPENED, 1_u64)
+        write64(arena + OFF_REGION_REOPENED, REGION_COLD)
         write64(arena + OFF_OWNER, owner) if count != 0
-        @@pages_reopened = @@pages_reopened + (stop - page)
         count != 0
       end
 
-      @@pages_released : UInt64 = 0_u64
-      @@pages_reopened : UInt64 = 0_u64
+      # The first run of warm idle pages in `arena` becomes a free list,
+      # under the lock: its chunks linked head to tail, each stamped free
+      # and this epoch's, and the head answered - 0 for no run. A list
+      # rather than a bump region because the list's pop is the
+      # allocator's fast path and the carve is not: carving every warm
+      # chunk cost an ordered store of the cursor and a refill's worth of
+      # loads per allocation, and churn ran 48 ms to 73. Two stores per
+      # chunk here, on pages the last epoch's sweep listed and no cache
+      # took before the pause - the pass the sweep would otherwise make
+      # over them again, since the sweep steps over idle pages. The stamp
+      # is what tells the sweep the chunks are a list's: a free chunk of
+      # this epoch's parity is left where it is, one of the last epoch's
+      # is dead (`sweep_slice`). Whose list needs no claim on the arena -
+      # a list is the cache's, not the arena's - so a warm run is in
+      # reach from any thread.
+      def self.thread_warm(arena : UInt64) : UInt64
+        chunk = read64(arena + OFF_CHUNK)
+        run = take_run(arena, true)
+        low = run[0]
+        high = run[1]
+        return 0_u64 if high == 0
+        first = arena + HEAD
+        cursor = first + (low - first + chunk - 1_u64).unsafe_div(chunk) * chunk
+        return 0_u64 if cursor >= high
+        stamp = FREE_FLAG | IyiMark.epoch_flag
+        head = cursor
+        following = cursor + chunk
+        while following < high
+          write64(cursor + OFF_MARK, stamp)
+          write64(cursor + OFF_LINK, following)
+          cursor = following
+          following = cursor + chunk
+        end
+        write64(cursor + OFF_MARK, stamp)
+        write64(cursor + OFF_LINK, 0_u64)
+        head
+      end
 
-      # Pages the sweep handed back, and pages the carve took up again, in
-      # all: the exercises read both.
+      @@pages_released : UInt64 = 0_u64
+      @@pages_retained : UInt64 = 0_u64
+      @@pages_reopened : UInt64 = 0_u64
+      @@pages_rewarmed : UInt64 = 0_u64
+
+      # Pages the sweep handed back cold, pages it kept warm, pages the
+      # carve took up again and how many of those were warm, in all: the
+      # exercises and `bench/resident_probe.iyi` read them.
       def self.pages_released : UInt64
         @@pages_released
+      end
+
+      def self.pages_retained : UInt64
+        @@pages_retained
       end
 
       def self.pages_reopened : UInt64
         @@pages_reopened
       end
 
+      def self.pages_rewarmed : UInt64
+        @@pages_rewarmed
+      end
+
       def self.pages_released_add(count : UInt64) : Nil
         Pointer(Atomic(UInt64)).new(pointerof(@@pages_released).address).value.add(count)
       end
 
+      def self.pages_retained_add(count : UInt64) : Nil
+        Pointer(Atomic(UInt64)).new(pointerof(@@pages_retained).address).value.add(count)
+      end
+
       # A chunk nobody was handed, as a reader without the lock may ask -
       # the mark, from any thread, while a carve runs: above the frontier,
-      # or on a released page. The uncarved part of a taken-up region is
+      # or on an idle page. The uncarved part of a taken-up region is
       # not named here, because its bounds are two words a carve moves and
       # a reader could pair a new cursor with the old end and refuse a
       # live object above the region; a chunk of that part read as carved
-      # instead is a zero header the mark shades and scans as nothing,
+      # instead is a zero header the mark shades and scans as nothing (a
+      # cold run's), or a free-flagged one it refuses (a warm run's),
       # which the carve's own stamp then overwrites. Wrong in the safe
       # direction, and only for a stale word that happens to land there.
       def self.uncarved?(arena : UInt64, head : UInt64) : Bool
-        head >= read64(arena + OFF_HIGH) || page_released?(arena, head)
+        head >= read64(arena + OFF_HIGH) || page_idle?(arena, head)
       end
 
       # The same question under the lock, which the sweep holds and a
@@ -1490,7 +1850,7 @@ require "./file"
       def self.uncarved_held?(arena : UInt64, head : UInt64) : Bool
         return true if head >= read64(arena + OFF_HIGH)
         return true if head >= arena_cursor(arena) && head < read64(arena + OFF_BUMP_END)
-        page_released?(arena, head)
+        page_idle?(arena, head)
       end
 
       # Every arena is MAP-aligned, and a byte per MAP-sized slot of the
@@ -1539,6 +1899,12 @@ require "./file"
       # 48 MB live, ran 17% faster on them.
       HUGE_FROM = 8_u64
       @@arenas_mapped : UInt64 = 0_u64
+
+      # Mappings made, in all: with `IyiMark.arenas_released` the churn
+      # of arenas a program's classes went through.
+      def self.arenas_mapped : UInt64
+        @@arenas_mapped
+      end
 
       def self.map_arena(index : Int32, owner : UInt64) : UInt64
         base = map_aligned
@@ -1602,7 +1968,10 @@ require "./file"
         if arena != 0
           index = class_index(read64(arena + OFF_CHUNK) - HEADER)
           table = cache
-          write64(head + OFF_MARK, read64(head + OFF_MARK) | FREE_FLAG)
+          # Free, white, and this epoch's: on the cache's list until the
+          # next pause drops it, and the sweep of its arena leaves a free
+          # chunk of the current parity alone (`sweep_slice`).
+          write64(head + OFF_MARK, FREE_FLAG | IyiMark.epoch_flag)
           write64(head + OFF_LINK, table[index])
           table[index] = head
         else
@@ -1710,6 +2079,9 @@ require "./file"
         else
           write64(previous + OFF_NEXT, read64(arena + OFF_NEXT))
         end
+        # Its warm pages leave the class's count with it, or a refill
+        # would carve for pages no arena has.
+        warm_sub(arena, read64(arena + OFF_WARM)) if read64(arena + OFF_WARM) != 0
         Pointer(UInt8).new(arena_dir + arena.unsafe_shr(24_u64)).value = 0_u8
         # Off the heap's list and out of the directory inside the stop,
         # so nothing finds it; the unmap itself waits for the program to
@@ -3884,14 +4256,20 @@ require "./file"
         {% end %}
       end
 
-      # Dead chunks go on the class's list in one batch - except a run of
-      # them long enough to cover whole pages, RELEASE_PAGES or more, once
-      # the epoch's sweeps have kept a budget's worth of such runs
-      # resident: those pages go back to the kernel, and the chunks whose
-      # head is on them go on no list, to be carved again when the run is
-      # taken up. The run's chunks straddling its edges are the list's.
-      # Runs are found as the walk goes and released as they close, one
-      # `madvise` each.
+      # Dead chunks go on the class's list in one batch. A run of them long
+      # enough to cover whole pages, RELEASE_PAGES or more, is more than a
+      # batch's: the first budget's worth of such pages in an epoch stay
+      # warm - on the batch as they are, and listed, so that what no cache
+      # takes before the pause outlives it as idle pages
+      # (`IyiHeap.idle_listed`); the rest go cold - cut off the batch,
+      # handed back to the kernel, idle, to be carved again when the carve
+      # takes the run up as its region (`IyiHeap.reopen_in`). The run's
+      # chunks straddling its edges are the list's. Runs are found as the
+      # walk goes and closed as they end, one `madvise` per cold one. A
+      # warm run an earlier epoch left idle is met again by this epoch's
+      # walk and aged the same way: within the budget it stays, past it
+      # it goes cold - so a class the program stopped allocating keeps a
+      # budget's worth of its pages at most.
       #
       # The retention is the point. Released on sight, every page the
       # program churns through went back and came back each cycle - a
@@ -3899,9 +4277,13 @@ require "./file"
       # cost 220 ns where it had cost 21. What the program will allocate
       # before the next collection is the budget, and that much of the
       # free pages is kept warm; what is free beyond it is what a smaller
-      # program would never have touched, and it goes back.
+      # program would never have touched, and it goes back. Kept as list
+      # chunks alone, the warm pages the program had not got to were
+      # dropped with the lists at the next pause, and the sweep found and
+      # linked the same pages a second time while the program carved the
+      # frontier or waited (GC_DESIGN.md, the footprint section).
       RELEASE_PAGES = 2_u64
-      @@kept_pages : UInt64 = 0_u64
+      @@kept_warm : UInt64 = 0_u64
 
       # One slice: from the arena's cursor, `span` bytes or to its high
       # water, whichever is first; the cursor written back at the end,
@@ -3920,9 +4302,11 @@ require "./file"
         stop = high
         stop = cursor + span if stop - cursor > span
         @@bytes_walked = @@bytes_walked + (stop - cursor)
-        # The uncarved part of the bump region, read once: the cursor only
-        # rises, and a chunk carved past the value read here wears this
-        # epoch's parity and is left alone either way.
+        # The uncarved part of the bump region, read once. The cursor
+        # rises within a region, and a chunk carved past the value read
+        # here wears this epoch's parity and is left alone either way; a
+        # region set while the slice walks is below the slice
+        # (`IyiHeap.reopen_in`), and the stale pair can only skip chunks.
         region_low = IyiHeap.arena_cursor(arena)
         region_high = IyiHeap.read64(arena + IyiHeap::OFF_BUMP_END)
         # The run of dead chunks in progress: its first head, and what the
@@ -3932,6 +4316,7 @@ require "./file"
         # chunks are the batch's newest prefix.
         run_low = 0_u64
         run_batch = 0_u64
+        batch_low = 0_u64
         while cursor < stop
           if cursor >= region_low && cursor < region_high
             # Uncarved: past the region in one step, the run closed.
@@ -3942,20 +4327,29 @@ require "./file"
             cursor = first + (region_high - first + chunk - 1_u64).unsafe_div(chunk) * chunk
             next
           end
-          if IyiHeap.page_released?(arena, cursor)
-            # On a page handed back: past the page in one step, likewise.
+          if IyiHeap.page_idle?(arena, cursor)
+            # On an idle page: past the run of them in one step, likewise,
+            # the warm ones aged against this epoch's budget on the way.
             if run_low != 0
               batch_head = close_run(arena, chunk, run_low, cursor, batch_head, run_batch)
               run_low = 0_u64
             end
-            page_end = (cursor & (0_u64 &- IyiHeap::PAGE)) + IyiHeap::PAGE
+            page_low = cursor & (0_u64 &- IyiHeap::PAGE)
+            page_end = page_low + IyiHeap::PAGE
+            while page_end < high && IyiHeap.page_idle?(arena, page_end)
+              page_end = page_end + IyiHeap::PAGE
+            end
+            age_idle(arena, page_low, page_end)
             cursor = first + (page_end - first + chunk - 1_u64).unsafe_div(chunk) * chunk
             next
           end
           word = IyiHeap.read64(cursor + IyiHeap::OFF_MARK)
-          if word & IyiHeap::FREE_FLAG != 0 || (word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag)
-            # Free already, on a list the pause dropped, or unmarked and
-            # allocated before the mark: dead, and the run's.
+          if word & IyiHeap::EPOCH_FLAG != @@epoch_flag && (word & COLOUR == WHITE || word & IyiHeap::FREE_FLAG != 0)
+            # Unmarked and allocated before the mark, or free already on
+            # a list the pause dropped: dead, and the run's. A free chunk
+            # of this epoch's parity is on a live list - a warm run the
+            # refill threaded (`IyiHeap.thread_warm`), or a chunk the
+            # program handed back this epoch - and is left where it is.
             if word & IyiHeap::FREE_FLAG == 0
               @@bytes_freed = @@bytes_freed + chunk - IyiHeap::HEADER
               @@swept = @@swept + 1_u64
@@ -3964,6 +4358,7 @@ require "./file"
             if run_low == 0
               run_low = cursor
               run_batch = batch_head
+              batch_low = cursor if batch_low == 0
             end
             IyiHeap.write64(cursor + IyiHeap::OFF_LINK, batch_head)
             batch_head = cursor
@@ -3989,6 +4384,10 @@ require "./file"
         # cut. A run split at a slice's edge may keep a page it would
         # have released; the slices are sixteen pages, the edge one.
         batch_head = close_run(arena, chunk, run_low, cursor, batch_head, run_batch) if run_low != 0
+        # The batch's pages, for the refill that takes it to unlist
+        # (`IyiHeap.unlist_batch`): from the first chunk linked to where
+        # the slice ended, a range no wider than the slice.
+        IyiHeap.stash_batch_range(batch_head, arena, batch_low, cursor - chunk) if batch_head != 0
         # Past the high water the arena is done: what is carved after
         # this wears the epoch's parity and is alive by construction.
         IyiHeap.write64(arena + IyiHeap::OFF_SWEEP_CURSOR, cursor >= high ? IyiHeap::SWEEP_DONE : cursor)
@@ -3997,42 +4396,128 @@ require "./file"
 
       # A closed run of dead chunks, `[low, high)` in chunk heads, all of
       # them linked onto the batch already as its newest prefix, above
-      # `batch_before`. The whole pages inside the run are released when
-      # there are enough and the epoch's sweeps have kept a budget's
-      # worth: then the batch is cut back to `batch_before` and the run's
-      # chunks whose head is on no released page - the ones at its edges
-      # - are linked again. Answers the batch's head.
+      # `batch_before`. The whole pages inside the run, when there are
+      # enough of them: the first of them stay warm while the epoch's
+      # sweeps have kept less than a budget's worth - on the batch as they
+      # are, and listed, so that what no cache takes before the pause
+      # survives it as idle pages; the rest go cold - the batch cut back
+      # to the chunk below them, and the run's chunks above them, at its
+      # high edge, linked again. Answers the batch's head.
+      # The run's first page is the page its first chunk begins on when
+      # the chunk before it lies on an idle or a listed page - the run
+      # continues one a slice's end or an idle step cut, and the chunk
+      # straddling the page boundary is that run's, dead - and the page
+      # after otherwise, the straddler being live or a list's. Cut at
+      # every slice's end, the page a slice ended in was neither run's:
+      # one page in sixteen lost, and every warm run a slice long.
       def self.close_run(arena : UInt64, chunk : UInt64, low : UInt64, high : UInt64, batch_head : UInt64, batch_before : UInt64) : UInt64
-        page_low = (low + IyiHeap::PAGE - 1_u64) & (0_u64 &- IyiHeap::PAGE)
-        page_high = high & (0_u64 &- IyiHeap::PAGE)
-        return batch_head unless page_low < page_high && page_high - page_low >= RELEASE_PAGES * IyiHeap::PAGE
-        pages = (page_high - page_low).unsafe_shr(IyiHeap::PAGE_SHIFT)
-        kept = Pointer(Atomic(UInt64)).new(pointerof(@@kept_pages).address)
-        if kept.value.get * IyiHeap::PAGE < budget
-          kept.value.add(pages)
-          return batch_head
-        end
-        IyiHeap.set_released(arena, page_low, page_high, true)
-        IyiHeap.write64(arena + IyiHeap::OFF_RELEASED, IyiHeap.read64(arena + IyiHeap::OFF_RELEASED) + pages)
-        IyiHeap.pages_released_add(pages)
-        batch_head = batch_before
-        cursor = low
-        while cursor < page_low
-          IyiHeap.write64(cursor + IyiHeap::OFF_LINK, batch_head)
-          batch_head = cursor
-          cursor = cursor + chunk
-        end
         first = arena + IyiHeap::HEAD
-        cursor = first + (page_high - first + chunk - 1_u64).unsafe_div(chunk) * chunk
-        while cursor < high
-          IyiHeap.write64(cursor + IyiHeap::OFF_LINK, batch_head)
-          batch_head = cursor
-          cursor = cursor + chunk
+        page_low = (low + IyiHeap::PAGE - 1_u64) & (0_u64 &- IyiHeap::PAGE)
+        continuing = low > first && (IyiHeap.page_idle?(arena, low - chunk) || IyiHeap.page_listed?(arena, low - chunk))
+        page_low = low & (0_u64 &- IyiHeap::PAGE) if continuing
+        page_high = high & (0_u64 &- IyiHeap::PAGE)
+        return batch_head unless page_low < page_high && (continuing || page_high - page_low >= RELEASE_PAGES * IyiHeap::PAGE)
+        pages = (page_high - page_low).unsafe_shr(IyiHeap::PAGE_SHIFT)
+        # The run's first pages warm up to the budget, the rest cold: a
+        # run is an arena at a time when the arena is all dead, and a run
+        # kept or released whole overshot the budget by the run - 13 MB
+        # warm for a 4 MB budget.
+        warm = warm_pages(chunk, pages)
+        if continuing && warm == 0
+          # The straddler into the first page is a run's the carve may
+          # hand out before a cold page's release lands, and the release
+          # would zero its tail: the page stays the list's.
+          page_low = page_low + IyiHeap::PAGE
+          pages = pages - 1_u64
+          return batch_head if pages == 0
         end
-        # After the links: a released page written to would be resident
-        # again, and none is written to above.
-        __iyi_release_pages(page_low, page_high - page_low)
+        if warm != 0
+          IyiHeap.list_pages(arena, page_low, page_low + warm * IyiHeap::PAGE)
+          IyiHeap.pages_retained_add(warm)
+        end
+        if warm < pages
+          cold_low = page_low + warm * IyiHeap::PAGE
+          # The run's chunks are linked in address order, the newest the
+          # highest: the batch cut back to the chunk below the cold pages
+          # keeps the low edge and the warm pages, and the high edge is
+          # linked again on top.
+          head_cold = first + (cold_low - first + chunk - 1_u64).unsafe_div(chunk) * chunk
+          batch_head = head_cold > low ? head_cold - chunk : batch_before
+          cursor = first + (page_high - first + chunk - 1_u64).unsafe_div(chunk) * chunk
+          while cursor < high
+            IyiHeap.write64(cursor + IyiHeap::OFF_LINK, batch_head)
+            batch_head = cursor
+            cursor = cursor + chunk
+          end
+          IyiHeap.set_idle(arena, cold_low, page_high, true)
+          IyiHeap.set_cold(arena, cold_low, page_high, true)
+          # After the links: a released page written to would be resident
+          # again, and none is written to above.
+          __iyi_release_pages(cold_low, page_high - cold_low)
+          IyiHeap.pages_released_add(pages - warm)
+          # The counts last: a carve that reads an idle count takes the
+          # lock and looks for the run, and finds it whole.
+          IyiHeap.idle_add(arena, pages - warm, false)
+        end
         batch_head
+      end
+
+      # How many of a run of `pages` pages of `chunk`-byte chunks stay
+      # warm: as many as the epoch's warm pages have room for under a
+      # budget's worth of payload. A page's share of the payload is
+      # `PAGE * (chunk - HEADER) / chunk` - a class larger than a page has
+      # less than one chunk to a page; the budget is what the program will
+      # ask for, and headers are not what it asks for - counted in pages
+      # against the budget's bytes, the warm pages of a 64-byte class held
+      # an eighth less than the epoch's demand and the carve took the
+      # difference from the frontier every epoch.
+      def self.warm_pages(chunk : UInt64, pages : UInt64) : UInt64
+        kept = Pointer(Atomic(UInt64)).new(pointerof(@@kept_warm).address)
+        seen = kept.value.get
+        return 0_u64 if seen >= budget
+        per_page = (IyiHeap::PAGE * (chunk - IyiHeap::HEADER)).unsafe_div(chunk)
+        room = (budget - seen + per_page - 1_u64).unsafe_div(per_page)
+        take = pages < room ? pages : room
+        kept.value.add(take * per_page)
+        take
+      end
+
+      # A run of idle pages `[low, high)` the slice met, left by an earlier
+      # epoch: each warm page counts against this epoch's budget as a run
+      # closed today would, and past the budget it goes cold - the runs of
+      # them released in one `madvise` each. Cold pages stay as they are.
+      # The run's first page stays warm whatever the budget when a chunk
+      # of the page before reaches into it: that chunk was a list's when
+      # the run closed, or an idle run's own that the carve may take up
+      # at any moment, and may be an object by the time the `madvise`
+      # lands - which would zero its tail. A run closed today releases
+      # before its edge chunks can be handed out and its own straddlers
+      # are below every carve's reach (`close_run`, `IyiHeap.reopen_in`);
+      # a page aged later has no such order to lean on, so it leans on
+      # nothing.
+      def self.age_idle(arena : UInt64, low : UInt64, high : UInt64) : Nil
+        return if IyiHeap.read64(arena + IyiHeap::OFF_WARM) == 0
+        chunk = IyiHeap.arena_chunk(arena)
+        first = arena + IyiHeap::HEAD
+        cold_low = 0_u64
+        page = low
+        page = page + IyiHeap::PAGE if (low - first).unsafe_mod(chunk) != 0
+        while page <= high
+          # A warm page within the budget stays; past it, it is a cold
+          # run's from here.
+          cool = page < high && !IyiHeap.page_cold?(arena, page) && warm_pages(chunk, 1_u64) == 0
+          if cool
+            cold_low = page if cold_low == 0
+          elsif cold_low != 0
+            pages = (page - cold_low).unsafe_shr(IyiHeap::PAGE_SHIFT)
+            IyiHeap.set_cold(arena, cold_low, page, true)
+            __iyi_release_pages(cold_low, page - cold_low)
+            IyiHeap.pages_released_add(pages)
+            IyiHeap.warm_sub(arena, pages)
+            cold_low = 0_u64
+          end
+          page = page + IyiHeap::PAGE
+        end
       end
 
       # The scavenge, in the pause with every thread stopped: an arena the
@@ -4043,8 +4528,16 @@ require "./file"
       # pause's and not the lazy sweeper's: a sweeper on one thread cannot
       # edit another running thread's cache. Some cache's warm fill arena
       # is exempt, the cushion that keeps spike-then-idle from paying an
-      # mmap on its next allocation. Runs after the mark and before the
-      # epoch turns, so a released arena is never debt.
+      # mmap on its next allocation. Nothing else is: sparing an all-dead
+      # arena the epoch had allocated from, or one holding pages the sweep
+      # kept warm, was built and measured in 0.11.0's first cycle and
+      # bought nothing the probe could see - the resident-set probe read
+      # 140 MB median against 129 without the first, on two cores, the
+      # race table the same either way - because a churning class's dead
+      # arena is what the kernel should have back, and the pages it faults
+      # in again are a budget's worth an epoch (GC_DESIGN.md, the
+      # footprint section). Runs after the mark and before the epoch
+      # turns, so a released arena is never debt.
       def self.scavenge : Nil
         # Every free list dropped first - the centre's and each stopped
         # thread's cache's - which is what lets a mapping go back without
@@ -4055,6 +4548,9 @@ require "./file"
         arena = IyiHeap.first_arena
         while arena != 0
           following = IyiHeap.arena_next(arena)
+          # What the sweep listed and no cache took: idle and warm from
+          # here, the lists being gone.
+          IyiHeap.idle_listed(arena)
           if IyiHeap.arena_live(arena) == 0 && IyiHeap.release_arena(previous, arena)
             @@arenas_released = @@arenas_released + 1_u64
           else
@@ -4096,7 +4592,7 @@ require "./file"
       # sweep of their arena finds them where it finds the dead, and they
       # join whatever run they lie in.
       def self.begin_sweep : Nil
-        @@kept_pages = 0_u64
+        @@kept_warm = 0_u64
         @@epoch = @@epoch + 1_u64
         @@epoch_flag = (@@epoch & 1_u64) * IyiHeap::EPOCH_FLAG
         @@swept = 0_u64

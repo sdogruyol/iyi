@@ -1,0 +1,165 @@
+# The resident-set probe: a live list of 500,000 nodes under 384 MB of
+# churn, and the heap's own account of where the pages went. What
+# `bench/resident_probe.py` runs and reads; the driver adds the kernel's
+# peak RSS.
+#
+#   ./bin/iyi run --release bench/resident_probe.iyi
+#
+# Nothing is asserted here. The numbers this prints are the terms of the
+# footprint section of GC_DESIGN.md: the live set in chunks, the pages
+# every arena has touched (its high water less its header), the sweep's
+# page traffic - kept warm, handed back cold, taken up again - and the
+# last sweep's own account of dead against alive, which is where the
+# concurrent mark's floating garbage shows: the churn's blocks born
+# while the list is marked beside the program are alive until the next
+# sweep, and how many depends on where the mark falls, so the probe's
+# own number moves by a third between runs. A collector whose touched
+# pages are the live set plus a budget is the design; the gap this
+# probe names is that garbage and the edges runs lose to it.
+
+{% if !flag?(:gc_none) && !flag?(:gc_boehm) && ((flag?(:linux) && (flag?(:x86_64) || flag?(:aarch64))) || flag?(:darwin)) %}
+  def count(value : UInt64) : String
+    value.to_i64.to_s
+  end
+
+  def mb(value : UInt64) : String
+    whole = value.unsafe_div(1048576_u64)
+    tenth = (value - whole * 1048576_u64) * 10_u64.unsafe_div(1048576_u64)
+    "#{count(whole)}.#{count(tenth)} MB"
+  end
+
+  class Node
+    property next : Node?
+    property value : UInt64
+    property tag : UInt64
+    property pad0 : UInt64
+    property pad1 : UInt64
+
+    def initialize(@next : Node?, @value : UInt64)
+      @tag = @value * 3_u64
+      @pad0 = 0_u64
+      @pad1 = 0_u64
+    end
+  end
+
+  class Held
+    @@list : Node? = nil
+
+    def self.list : Node?
+      @@list
+    end
+
+    def self.list=(value : Node?) : Nil
+      @@list = value
+    end
+  end
+
+  @[NoInline]
+  def build(nodes : UInt64) : Nil
+    head = nil.as(Node?)
+    built = 0_u64
+    while built < nodes
+      head = Node.new(head, built)
+      built = built + 1_u64
+    end
+    Held.list = head
+  end
+
+  # The churn: 64-byte blocks, a class of their own beside the list's, so
+  # the churn's pages are the churn's to take up again and nothing the
+  # live set frees can stand in for them - the shape a program with more
+  # than one kind of object has, and the one that showed the gap widest.
+  @[NoInline]
+  def churn(bytes : UInt64) : UInt64
+    burned = 0_u64
+    sink = 0_u64
+    while burned < bytes
+      block = Pointer(UInt8).malloc(64_u64)
+      block.value = 1_u8
+      sink = sink &+ block.address
+      burned = burned + 64_u64
+    end
+    sink
+  end
+
+  def touched : UInt64
+    total = 0_u64
+    arena = IyiHeap.first_arena
+    while arena != 0
+      total = total + (IyiHeap.arena_high(arena) - arena - IyiHeap::HEAD)
+      arena = IyiHeap.arena_next(arena)
+    end
+    total
+  end
+
+  def arenas : UInt64
+    total = 0_u64
+    arena = IyiHeap.first_arena
+    while arena != 0
+      total = total + 1_u64
+      arena = IyiHeap.arena_next(arena)
+    end
+    total
+  end
+
+  def walk : UInt64
+    sum = 0_u64
+    node = Held.list
+    while node
+      sum = sum &+ node.value
+      node = node.next
+    end
+    sum
+  end
+
+  nodes = 500000_u64
+  started = IyiMark.now_ns
+  build(nodes)
+  built_ns = IyiMark.now_ns - started
+  live_chunks = 0_u64
+  node = Held.list
+  arena = 0_u64
+  while node
+    arena = IyiHeap.containing(node.as(Void*)) if arena == 0
+    node = node.next
+  end
+  chunk = IyiHeap.arena_chunk(arena)
+  live_chunks = nodes * chunk
+  after_build = touched
+  started = IyiMark.now_ns
+  sink = churn(402653184_u64)
+  IyiMark.settle
+  churn_ns = IyiMark.now_ns - started
+  peak_touched = touched
+  # The last epoch's sweep finished here, so its account is whole: what
+  # it found dead and alive in the churn's class, against the idle pages
+  # it left - the difference is what edges and the mark's floating
+  # garbage cost the retention.
+  index = 0
+  while index < IyiHeap::CLASSES
+    while IyiHeap.sweep_left_of(index) != 0_u64
+      IyiMark.sweep_one(IyiHeap.payload(index) + IyiHeap::HEADER)
+    end
+    index = index + 1
+  end
+  idle_pages = 0_u64
+  arena = IyiHeap.first_arena
+  while arena != 0
+    idle_pages = idle_pages + IyiHeap.read64(arena + IyiHeap::OFF_IDLE) if IyiHeap.arena_chunk(arena) == 72_u64
+    arena = IyiHeap.arena_next(arena)
+  end
+  raise "probe: the list lost nodes" if walk != (nodes * (nodes - 1_u64)).unsafe_div(2_u64)
+  puts "probe: live #{count(nodes)} nodes of #{count(chunk)}-byte chunks = #{mb(live_chunks)}; budget #{mb(IyiMark.budget)}"
+  puts "probe: touched after build #{mb(after_build)}, after churn #{mb(peak_touched)} in #{count(arenas)} arenas"
+  puts "probe: pages retained #{count(IyiHeap.pages_retained)}, released #{count(IyiHeap.pages_released)}, reopened #{count(IyiHeap.pages_reopened)} (warm #{count(IyiHeap.pages_rewarmed)}), collections #{count(IyiMark.collections)}, arenas mapped #{count(IyiHeap.arenas_mapped)} and unmapped #{count(IyiMark.arenas_released)}"
+  puts "probe: build #{count(built_ns.unsafe_div(1000000_u64))} ms, churn #{count(churn_ns.unsafe_div(1000000_u64))} ms; pauses #{count(IyiMark.pause_total_ns.unsafe_div(1000_u64))} us in all, longest #{count(IyiMark.pause_max_ns.unsafe_div(1000_u64))} us"
+  puts "probe: last sweep found #{mb(IyiMark.bytes_freed)} dead in #{count(IyiMark.swept)} chunks and #{mb(IyiMark.bytes_kept)} alive in #{count(IyiMark.kept)}; the churn's class holds #{mb(idle_pages * IyiHeap::PAGE)} idle"
+  arena = IyiHeap.first_arena
+  while arena != 0
+    puts "  arena of #{count(IyiHeap.arena_chunk(arena))}-byte chunks: touched #{mb(IyiHeap.arena_high(arena) - arena - IyiHeap::HEAD)}, idle #{count(IyiHeap.read64(arena + IyiHeap::OFF_IDLE))} pages of which warm #{count(IyiHeap.read64(arena + IyiHeap::OFF_WARM))}"
+    arena = IyiHeap.arena_next(arena)
+  end
+  puts "probe: touched_bytes=#{count(peak_touched)} released=#{count(IyiHeap.pages_released)} reopened=#{count(IyiHeap.pages_reopened)} sink=#{count(sink & 1023_u64)}"
+{% else %}
+  puts "probe: this build deselected the collector's allocator"
+{% end %}

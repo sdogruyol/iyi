@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+### Added
+
+- **The sweep's kept pages outlive the pause.** A budget's worth of
+  whole dead pages is kept warm each epoch, and it was kept as chunks on
+  the sweep's batch - a list, and a pause drops every list, so whatever
+  the program had not got to was gone at the next collection and the
+  next epoch's sweep found and linked the same pages again while the
+  program carved the frontier or waited on a slice. The sweep lists the
+  pages as well now (a bit per page in the arena's header), a refill
+  that takes a batch unlists the batch's pages, and the pause turns what
+  is still listed into idle warm pages the refill threads into the
+  cache's list before it sweeps a slice or carves a slab; the sweep
+  meets them as idle and ages them against the epoch's budget, so a
+  class the program stopped allocating keeps a budget's worth at most.
+  `bench/sweep_exercise.sh` gates it - four thousand chunks, two
+  collections, the next four thousand from the first's pages, cleared,
+  the class's high water where it was - and its two mutations fail by
+  name: warm runs never threaded, and a chunk handed out dirty.
+
+- **`bench/resident_probe.iyi` and `bench/resident_probe.py`.** A
+  500,000-node live list under 384 MB of churn in a class of its own,
+  and the driver reads peak RSS per process from `wait4`, the pages every
+  arena has touched and the sweep's page counters, building a second
+  prelude tree beside this one (`--tree`) and running the two
+  interleaved so a number is a min-of-N against its neighbour. The
+  finding it was built for is in GC_DESIGN.md's footprint section: the
+  gap between live set plus budget and what the process holds is the
+  concurrent mark's floating garbage - 10 to 17 MB allocated while the
+  22 MB list is marked beside the program, born black, dead only at the
+  next sweep - and the probe's own number moves by a third between runs
+  with where the mark falls.
+
+### Changed
+
+- **The warm budget is counted in payload and split at the line.** A run
+  of dead pages kept or released whole overshot the budget by the run,
+  and a run is an arena when the arena is all dead: 13 MB warm for a 4
+  MB budget. And the budget was counted in pages against the bytes the
+  program asks for, so a 64-byte class's warm pages held an eighth less
+  than the epoch's demand and the tail of every epoch's dead pages went
+  cold and was faulted in again - churn released and reopened 5,444
+  pages over its 122 collections, and releases none now. With the
+  sweep's loop testing the parity first, binary trees runs 0.180 s to
+  0.150 and churn 0.052 to 0.044 on `bench/gc_race.py`, the median of
+  four interleaved against the tree before; live churn is where it was.
+  Both are under Boehm's wall now, binary trees under Go's.
+
+- **A free chunk of the current epoch's parity is a list's.** The sweep
+  took every free-flagged chunk as dead; a chunk the program handed back
+  this epoch sits on the cache's list, and the sweep of its arena would
+  have put it in a run under the list. `IyiHeap.free` stamps the epoch's
+  parity, and the sweep leaves a free chunk of the current parity where
+  it is - the same stamp a threaded warm run wears.
+
+### Learned
+
+- **What the resident-set probe did not find, and what was measured out.**
+  The probe was built on the hypothesis that a budget's worth of pages
+  kept warm was never taken up by the carve, and 151 MB touched against
+  a 68 MB design would fall to 70. The kept pages were being consumed
+  every epoch; what was unmapping them was the scavenge, every pause,
+  because a churning class's arenas are all dead at every mark. Five
+  things were built and taken out with a number each (GC_DESIGN.md):
+  warm runs as bump regions the carve took first (churn 48 ms to 73 -
+  the carve became the fast path, and it is not one); warm runs threaded
+  into a list the moment the sweep closed them (67 - a pass over memory
+  the sweep had just made); a refill spinning for a helper's slice to
+  end; the scavenge sparing an arena the epoch had allocated from (the
+  probe 140 MB median against 129 without it, on two cores, the race
+  table unmoved - a dead arena is resident garbage until the sweep
+  reaches it); and the scavenge sparing an arena holding warm pages
+  (spared nothing a churn leaves). Found and kept on the way: a run that
+  continues one a slice's end cut begins on its own first page; and the
+  two places a page is released late leave the first page alone when a
+  chunk of the page before reaches into it, because that chunk may be an
+  object by the time the `madvise` lands, and the `madvise` would zero
+  its tail.
+
 ### Fixed
 
 - **The allocation gate was a number, and the number was one
@@ -3957,7 +4035,7 @@ the same flags.
 
 - **`samples/iyi/calc`: a language, in the language.** Three modules — a
   scanner, a parser and an evaluator — reading a program from standard input,
-  written against iyi's own 9,542-line library and nothing else. Every other
+  written against iyi's own 10,038-line library and nothing else. Every other
   sample is a page long, and a language that has only been used for pages has
   not been used.
 

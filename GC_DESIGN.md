@@ -609,6 +609,113 @@ and its allocation path is where it pays; at 100 binary trees traded a
 fifth of its wall time for a smaller peak. What remained was the wall
 time, and the next section measures where it went.
 
+**The resident set, measured, and what it was made of.** 0.11.0's first
+cycle began from a probe (`bench/resident_probe.iyi`, driven by
+`bench/resident_probe.py`: peak RSS per process from `wait4`, the pages
+every arena has touched, the sweep's page counters, one tree
+interleaved against another): a 500,000-node live list of 48-byte
+chunks, 22 MB, under 384 MB of churn in a class of its own, 64-byte
+blocks in 72-byte chunks. Where the design says live set plus a budget
+- 22 + 38 MB - the tree 0.10.0 shipped touched 55 to 151 MB of arenas
+from run to run and peaked at 103 to 225 MB resident, on two and on
+eight cores. The spread is the
+first finding: the churn class allocates 10 to 17 MB while a mark of
+the 22 MB list runs beside it, born black and dead only at the next
+sweep, and how much depends on where the mark falls, so the probe's
+own number moves by a third between runs of one tree. What was
+supposed to be the gap - a budget's worth of pages kept warm that the
+carve never took up - was not there: the kept pages were consumed
+every epoch, and where they went was three other places.
+
+The kept pages did not survive a pause. Whole pages of dead chunks were
+kept warm as chunks on the sweep's batch, and a pause drops every
+list, so whatever of a budget's worth the program had not got to was
+gone at the next collection: the next epoch's sweep found and linked
+the same pages again while the program carved the frontier or waited
+on a slice. Now the sweep lists their pages as well
+(`OFF_LISTED_PAGES`), a refill that takes a batch unlists the batch's
+pages, and the pause turns what is still listed into idle warm pages -
+a bit per page, which a pause does not drop. The refill threads a run
+of them into the cache's list before it sweeps a slice or carves a
+slab, and the sweep meets them as idle and ages them against the
+epoch's budget, so a class the program stopped allocating keeps a
+budget's worth at most. The sweep exercise's `warm` check is the gate:
+four thousand chunks, a collection, a second collection before
+anything takes the batch, and the next four thousand come from the
+first's pages, cleared, with the class's high water where it was.
+
+The budget was overshot by a run and undershot by the header. A run
+kept or released whole overshot the budget by the run, and a run is an
+arena when the arena is all dead: 13 MB warm for a 4 MB budget. The
+run is split at the budget now. And the budget was counted in pages
+against bytes the program asks for; a 64-byte class's page holds an
+eighth less payload than its bytes, so the warm pages held an eighth
+less than the epoch's demand and the carve took the difference from the
+frontier every epoch. The count is of payload.
+
+The scavenge unmapped a churning class's arenas every pause - every
+one of them is dead at every mark - and every epoch mapped fresh ones
+and faulted a budget's worth of pages in again: 9 to 14 arenas released
+over 11 collections, 21 to 27 mapped in all. This one stays as it is.
+Sparing an arena the epoch had allocated from (an epoch stamp per
+arena) kept the mappings and the faults away, and the trigger
+exercise's mappings from 5 to 2 on a churn two arenas wide - and the
+probe read 140 MB median against 129 without it, on two cores, with
+the race table the same either way: a churning class's dead arena is
+resident garbage until the sweep reaches it, and the kernel should have
+it back. Sparing only arenas holding warm pages spared nothing a churn
+leaves, since a churn consumes its kept pages. Both were built,
+measured and taken out.
+
+Three more things were built on the way and measured out. Warm runs as
+bump regions the carve took up first, no fault and no slice: the carve
+became the allocator's main path, and the carve's ordered cursor store
+and a refill's worth of loads per allocation ran churn 48 ms to 73.
+Warm runs threaded into a list the moment the sweep closed them: a
+pass over memory the sweep had just made, and churn ran 67. A refill
+that spun for a helper's slice to end when the warm pages it wanted
+were inside it: the wait is the refill's own slice, as it was. Kept:
+a run that continues one a slice's end cut begins on its own first
+page rather than the next, so the page a slice ended in is nobody's no
+longer; the two places a page is released late - a cold part of a run
+continuing another, and an idle page aged cold - leave the first page
+alone when a chunk of the page before reaches into it, because that
+chunk may be an object by the time the `madvise` lands and the
+`madvise` would zero its tail; a free chunk of the current epoch's
+parity is a live list's and the sweep leaves it where it is, which is
+also what makes a hand-freed chunk safe from the sweep of its own
+epoch; and the sweep's own loop tests the parity first, two tests for
+a dead chunk where it was three.
+
+What the probe reads now, interleaved against the tree before, nine
+runs each, on two cores: peak RSS 103 to 150 MB against 103 to 153,
+the medians 121 and 132 on two sittings against 131 and 118 - inside
+the probe's own spread, which is the mark's. The table, read the same
+way as the one above on the same machine, the median of four, with the
+tree before it read in the same sitting for reference:
+
+| program | iyi wall | RSS | pause max | paused | Boehm wall | RSS | paused | Go wall | RSS | pause max | paused |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| binary trees | 0.150 s | 25 MB | 0.60 ms | 5.5 ms | 0.184 s | 18 MB | 76 ms | 0.156 s | 16 MB | 0.12 ms | 1.6 ms |
+| live churn | 0.111 s | 214 MB | 0.09 ms | 0.3 ms | 0.160 s | 92 MB | 103 ms | 0.190 s | 131 MB | 0.07 ms | 0.2 ms |
+| churn | 0.044 s | 15 MB | 0.01 ms | 0.3 ms | 0.077 s | 15 MB | 39 ms | 0.064 s | 15 MB | 0.16 ms | 2.1 ms |
+
+The tree before, same sitting: binary trees 0.180 s and 26 MB, live
+churn 0.111 s and 205 MB, churn 0.052 s and 15 MB. Binary trees and
+churn run a sixth faster: the budget counted in pages fell short of
+the epoch's demand, so the tail of every epoch's dead pages went cold
+and was faulted in again - churn released and reopened 5,444 pages
+over its 122 collections, and releases none now - and the sweep's
+loop is two tests a dead chunk where it was three; taking the split, the continuation, the
+listing or the refill's early carve out one at a time moved neither
+program, so the gain is the two things every variant shared. Both are
+under Boehm's wall, binary trees under Go's; live churn is where it
+was, its resident set moving with where its last collection falls,
+194 to 234 MB across the eight runs of both trees. The resident set
+this cycle set out to cut is the mark's floating garbage and the edges
+runs lose to it, and the next cycles' terms - the pool region and the
+workers' stacks - are the heap's neighbours, not the heap.
+
 **Stage 8: the sweep beside the program, in slices.** Two
 measurements first, both on this tree's release builds. The barrier:
 a prelude with `__iyi_write_barrier_begin` renamed makes codegen emit

@@ -47,13 +47,13 @@ fi
 
 echo
 echo "== every check reported"
-for phrase in reclaimed survivor liveness large steady; do
+for phrase in reclaimed warm survivor liveness large steady; do
   grep -q "$phrase" "$WORK/sweep.out" 2>/dev/null || {
     echo "  MISSING: nothing reported for $phrase"
     status=1
   }
 done
-[ "$status" -eq 0 ] && echo "  reclaimed, survivor, liveness, large and steady all reported"
+[ "$status" -eq 0 ] && echo "  reclaimed, warm, survivor, liveness, large and steady all reported"
 
 echo
 echo "== the same program with optimisation on"
@@ -102,15 +102,29 @@ prove_fails() {
     "$(grep -m1 "$phrase" "$WORK/$dir/out" | sed 's/^iyi: panic: //')"
 }
 
-# The walk still counts and repaints, it just never closes a run of dead
-# chunks: nothing is linked, nothing handed back, nothing reused.
+# The walk still counts and repaints, it just never hands a dead chunk on:
+# nothing is linked onto the batch, and no run of them goes idle for the
+# carve to take up - the two ways a swept chunk comes back.
 
 prove_fails "sweep frees nothing" nofree "sweep:" \
-  '{ if (!done && $0 ~ /^            batch_head = cursor$/) { print "            # removed"; done = 1; next } print }'
+  '{ if (!done && $0 ~ /^            batch_head = cursor$/) { print "            # removed"; done = 1; next }
+     if ($0 ~ /^        return batch_head unless page_low < page_high && \(continuing \|\| /) { print "        return batch_head"; next }
+     print }'
 
 # The colour test stops mattering, so a live object goes on the free list.
 prove_fails "sweep frees the live" reckless "sweep:" \
-  '{ if ($0 ~ /^          if word & IyiHeap::FREE_FLAG != 0 \|\| \(word & COLOUR == WHITE && word & IyiHeap::EPOCH_FLAG != @@epoch_flag\)$/) { print "          if true"; next } print }'
+  '{ if ($0 ~ /^          if word & IyiHeap::EPOCH_FLAG != @@epoch_flag && \(word & COLOUR == WHITE \|\| word & IyiHeap::FREE_FLAG != 0\)$/) { print "          if true"; next } print }'
+
+# The refill stops threading idle warm runs: the pages stay idle, the
+# class carves its frontier, and the warm check names how many were left.
+prove_fails "warm pages never taken up" nowarm "warm:" \
+  '{ sub(/head = thread_warm\(candidate\) if /, "head = 0_u64 if "); print }'
+
+# A chunk popped off the list is handed out with the dead object's bytes
+# still in it - a warm page holds what the dead left - so the clearing
+# entry point lies, and the check reads it.
+prove_fails "warm chunks not cleared" dirtywarm "warm:" \
+  '{ if ($0 ~ /^          clear_block\(head \+ HEADER, payload\(index\)\) if clear$/) { print "          # removed"; next } print }'
 
 echo
 if [ "$status" -eq 0 ]; then
